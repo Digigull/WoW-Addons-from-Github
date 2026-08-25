@@ -326,6 +326,18 @@ class Releasing(unittest.TestCase):
     NOTES = ROOT / ".github" / "release-notes.md"
     WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 
+    def workflow_commands(self) -> str:
+        """The workflow with its comments stripped.
+
+        Comments here quote the very command shapes these tests forbid, so
+        matching the raw file finds the explanation as readily as the mistake --
+        which is exactly how the first version of the test below failed.
+        """
+        return "\n".join(
+            line for line in self.WORKFLOW.read_text().splitlines()
+            if not line.lstrip().startswith("#")
+        )
+
     def test_the_version_is_reportable(self):
         # A shipped binary that cannot say which build it is makes every bug
         # report start with a guessing game.
@@ -372,11 +384,34 @@ class Releasing(unittest.TestCase):
         self.assertIn("smartscreen", notes)
         self.assertIn("libfuse", notes)
 
+    def test_the_metadata_is_applied_even_when_the_release_exists(self):
+        """`view || create` silently drops the notes and the pre-release flag.
+
+        It reads as harmless idempotency. It is not: creating the tag through
+        "Draft a new release" in the web UI -- which is how most people make a
+        tag -- publishes the release before the workflow runs, so `view`
+        succeeds, `create` is skipped, and the title, notes and --prerelease go
+        with it. v0.3.0 published exactly that way: right assets, no title, no
+        notes, not a pre-release, and the step exited 0.
+        """
+        commands = self.workflow_commands()
+        self.assertIn("gh release edit", commands, "nothing applies metadata to an existing release")
+        self.assertNotIn("|| gh release create", commands, "the bug that shipped v0.3.0 is back")
+        # Both branches must set all three, or one route silently differs.
+        self.assertEqual(commands.count("--notes-file .github/release-notes.md"), 2)
+        self.assertEqual(commands.count("--prerelease"), 2)
+
+    def test_the_publish_verifies_what_it_published(self):
+        # The failing step exited 0. Checking the exit codes was not enough,
+        # so the step now reads the release back and fails on wrong metadata.
+        commands = self.workflow_commands()
+        self.assertIn("the release published without its metadata", commands)
+        self.assertIn("isPrerelease", commands)
+
     def test_the_publish_waits_for_the_version_check(self):
         # Otherwise a mismatched tag still publishes; the check would just go
         # red beside it.
-        workflow = self.WORKFLOW.read_text()
-        self.assertIn("needs: [appimage, windows, version-matches-tag]", workflow)
+        self.assertIn("needs: [appimage, windows, version-matches-tag]", self.workflow_commands())
 
 
 class Scripts(unittest.TestCase):
