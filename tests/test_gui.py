@@ -131,6 +131,39 @@ class WindowTests(unittest.TestCase):
         finally:
             core.update_addon = real
 
+    def test_checking_reports_without_installing(self):
+        """The Check button must not write anything to AddOns.
+
+        A check that quietly installed would be the worst kind of surprise on a
+        slow connection, and the Installed column would contradict the status.
+        """
+        seen = {}
+
+        def fake(name, entry, root, **kw):
+            seen.update(kw)
+            return core.Result(name, core.CHANGED, "v1 -> v2", version="v2")
+
+        real = core.update_addon
+        core.update_addon = fake
+        try:
+            self.app.start(["Bound"], check=True)
+            for _ in range(200):
+                self.pump(1)
+                if self.app.worker is None:
+                    break
+        finally:
+            core.update_addon = real
+
+        self.assertTrue(seen.get("check"), "check was not passed through to core")
+        self.assertEqual(self.app.tree.set("Bound", "latest"), "v2")
+        self.assertEqual(self.app.tree.set("Bound", "installed"), "v1", "a check must not change Installed")
+        self.assertIn("update available", self.app.tree.set("Bound", "status"))
+        self.assertIn("Nothing was downloaded", self.app.status.cget("text"))
+
+    def test_the_latest_column_exists_beside_installed(self):
+        headings = [self.app.tree.heading(c)["text"] for c in self.app.tree["columns"]]
+        self.assertEqual(headings, ["Source", "Installed", "Latest", "Status"])
+
     def test_a_result_reaches_its_row(self):
         def fake(name, entry, root, **kw):
             entry["installed"] = "v2"
@@ -293,8 +326,90 @@ class WindowTests(unittest.TestCase):
         # Widget bindings can fire once more while a dialog is being torn down.
         dlg = self.dialog("Bound")
         dlg.destroy()
-        dlg._sync()          # must not raise on released variables
-        self.assertIsNone(dlg._displaced())
+        dlg._sync()            # must not raise on released variables
+        dlg._show_caution()    # nor this, which the same bindings drive
+
+    def test_a_pasted_url_is_accepted_and_shown_back(self):
+        # Reported from a real install: pasting the repo URL was refused and
+        # demanded owner/repo.
+        dlg = self.dialog("Bound")
+        dlg.choice.set("github")
+        dlg.repo.set("https://github.com/tullamods/Bagnon")
+        dlg._absorb_url()
+        self.assertIn("tullamods/Bagnon", dlg.repo_hint.cget("text"))
+        dlg._save()
+        self.assertEqual(dlg.result, ("github:tullamods/Bagnon", False))
+
+    def test_a_pasted_branch_url_ticks_track_branch(self):
+        # Otherwise the branch they were looking at is silently dropped.
+        dlg = self.dialog("Bound")
+        dlg.choice.set("github")
+        dlg.repo.set("https://github.com/Questie/Questie/tree/develop")
+        dlg._absorb_url()
+        self.assertTrue(dlg.track.get())
+        self.assertEqual(dlg.branch.get(), "develop")
+        dlg._save()
+        self.assertEqual(dlg.result, ("github:Questie/Questie@develop", False))
+
+    def test_something_that_is_not_a_repo_is_still_refused(self):
+        dlg = self.dialog("Bound")
+        dlg.choice.set("github")
+        dlg.repo.set("https://curseforge.com/wow/addons/bagnon")
+        real = gui.messagebox.showerror
+        gui.messagebox.showerror = lambda *a, **k: None
+        try:
+            dlg._save()
+        finally:
+            gui.messagebox.showerror = real
+        self.assertIsNone(dlg.result)
+        dlg.destroy()
+
+    def test_the_warning_says_kept_or_deleted_to_match_what_happens(self):
+        """The bug that started this: it promised a backup that never happened.
+
+        The dialog now asks core the same questions core asks itself, so the
+        two cannot disagree again.
+        """
+        (self.addons / "Bound").mkdir()
+        self.app.entries()["Bound"]["installed"] = None   # the user's own files
+        dlg = self.dialog("Bound")
+        dlg.choice.set("github")
+        dlg._sync()
+        kept = dlg.caution.cget("text")
+        self.assertIn("Bound.replaced", kept)
+        self.assertIn("once", kept, "it must say the copy is not made every update")
+
+        dlg.backup.set(False)
+        dlg._show_caution()
+        deleted = dlg.caution.cget("text")
+        self.assertIn("DELETED", deleted)
+        self.assertNotIn("Bound.replaced", deleted, "it must not name a copy it will not make")
+        dlg.destroy()
+
+    def test_no_warning_once_the_tool_owns_the_folder(self):
+        # A folder with a recorded version came from the source, so replacing it
+        # loses nothing. A red line on every routine update is how people learn
+        # to ignore the warning that matters.
+        (self.addons / "Bound").mkdir()
+        self.app.entries()["Bound"]["installed"] = "v1"
+        for backup in (True, False):
+            with self.subTest(backup=backup):
+                dlg = self.dialog("Bound")
+                dlg.choice.set("github")
+                dlg.backup.set(backup)
+                dlg._sync()
+                self.assertEqual(dlg.caution.cget("text"), "")
+                dlg.destroy()
+
+    def test_the_backup_choice_is_saved(self):
+        dlg = self.dialog("Bound")
+        dlg.choice.set("github")
+        dlg.repo.set("o/r")
+        dlg.backup.set(False)
+        dlg._save()
+        self.assertFalse(dlg.keep_backup)
+        core.set_source(self.app.state, "Bound", dlg.result[0], backup=dlg.keep_backup)
+        self.assertIs(self.app.entries()["Bound"]["backup"], False)
 
     def test_no_caution_for_a_folder_that_is_only_a_link(self):
         core.make_link(self.addons, self.addons / "Loose")
