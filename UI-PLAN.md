@@ -166,6 +166,29 @@ Cancellation: a `threading.Event` the worker checks between addons. Mid-download
 cancellation is not worth the complexity — cancelling between addons is enough, and it
 leaves the manifest consistent.
 
+> **That rule is too narrow, and the missing half cost two separate bugs.** "Never touch a
+> widget from the worker" is necessary but not sufficient. Anything that calls into Tcl
+> when it is **garbage collected** is just as dangerous, because collection happens at an
+> arbitrary moment on whatever thread happens to be allocating — and this program has a
+> worker thread.
+>
+> Two things in Tkinter do exactly that, both were written the obvious way here, and both
+> had to be undone:
+>
+> | Written as | Finalises into Tcl | Now |
+> |---|---|---|
+> | `StringVar` on the dialog | `Variable.__del__` | released in `destroy()`, on the main thread |
+> | `trace_add` on the path field | the trace outlives the widget | a widget binding, which dies with it |
+>
+> Collected on a worker thread, Tcl raises `main thread is not in main loop`; on Windows it
+> escalates to aborting the process with `Tcl_AsyncDelete: async handler deleted by the
+> wrong thread`. A user sees the app vanish part-way through an update, having closed a
+> dialog minutes earlier, with nothing connecting the two.
+>
+> Windows CI found the second one. Linux had been running the same tests and passing all
+> along, because the timing never happened to land the collection on a worker — which is
+> the entire argument for keeping `windows-latest` in the matrix.
+
 ## 5. Windows prerequisites — **done**
 
 These were bugs independent of the UI, and blocked a credible Windows build:
