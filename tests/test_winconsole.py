@@ -107,21 +107,74 @@ class AcquiringOne(unittest.TestCase):
             self.assertIs(sys.stdout, handle, "redirection was overridden")
 
     def test_a_missing_stderr_is_not_treated_as_fine(self):
-        # Every warning and every failure message in the CLI goes to stderr. A
-        # stderr left as None turns the first warning into an AttributeError,
-        # so "stdout works" is not enough to answer this question.
+        """Every warning and failure message in the CLI goes to stderr.
+
+        A stderr left as None turns the first warning into an AttributeError, so
+        "stdout works" cannot be the whole answer.
+
+        What is asserted is the contract, not an outcome: whether a console can
+        actually be obtained depends on where the process was started, and on a
+        CI runner the answer is no. So -- if it claims success, stderr really
+        works; either way a working stdout is left alone and stderr is safe to
+        write to.
+        """
+        import tempfile
+
+        if os.name != "nt":
+            # Off Windows the streams are always real, so a None stderr is a
+            # state that cannot arise and ensure_output is a documented no-op.
+            self.assertTrue(winconsole.ensure_output())
+            return
+
+        with tempfile.TemporaryFile("w") as handle:
+            sys.stdout, sys.stderr = handle, None
+            try:
+                if winconsole.ensure_output():
+                    self.assertTrue(winconsole.usable(sys.stderr),
+                                    "it reported success with stderr still broken")
+                self.assertIs(sys.stdout, handle, "a working stdout was replaced")
+                print("", file=sys.stderr)  # must not raise, whatever happened
+            finally:
+                sys.stdout, sys.stderr = sys.__stdout__, sys.__stderr__
+
+    def test_giving_up_still_leaves_the_streams_writable(self):
+        """False from ensure_output must not mean "the next print crashes".
+
+        Windows CI is the real example: no console to attach to and no session
+        to allocate one in. A crash nobody can see is worse than a message
+        nobody can see -- the crash also loses the exit code.
+        """
+        if os.name != "nt":
+            self.skipTest("_silence is only reached on the Windows path")
+        sys.stdout = sys.stderr = None
+        try:
+            winconsole.ensure_output()
+            print("this must not raise")
+            print("nor this", file=sys.stderr)
+        finally:
+            sys.stdout, sys.stderr = sys.__stdout__, sys.__stderr__
+
+    def test_the_null_fallback_makes_broken_streams_writable(self):
+        # _silence itself is platform-independent, so its behaviour is checked
+        # everywhere even though only Windows can reach it.
+        sys.stdout = sys.stderr = None
+        try:
+            winconsole._silence()
+            self.assertTrue(winconsole.usable(sys.stdout))
+            self.assertTrue(winconsole.usable(sys.stderr))
+            print("writable", file=sys.stderr)
+        finally:
+            sys.stdout, sys.stderr = sys.__stdout__, sys.__stderr__
+
+    def test_the_null_fallback_leaves_a_working_stream_alone(self):
         import tempfile
 
         with tempfile.TemporaryFile("w") as handle:
             sys.stdout, sys.stderr = handle, None
             try:
-                if os.name == "nt":
-                    # It has a real console, so it can repair the missing half.
-                    self.assertTrue(winconsole.ensure_output())
-                    self.assertTrue(winconsole.usable(sys.stderr))
-                else:
-                    # Off Windows there is nothing to repair and nothing broken.
-                    self.assertTrue(winconsole.ensure_output())
+                winconsole._silence()
+                self.assertIs(sys.stdout, handle)
+                self.assertTrue(winconsole.usable(sys.stderr))
             finally:
                 sys.stdout, sys.stderr = sys.__stdout__, sys.__stderr__
 

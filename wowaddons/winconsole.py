@@ -88,8 +88,26 @@ def _reopen() -> None:
             pass
 
 
+def _silence() -> None:
+    """Last resort: point whatever is still unusable at the null device.
+
+    Reached when no console could be had at all -- a service, a scheduled task,
+    a CI runner. Writing into nothing is not good, but the alternative is that
+    the first `print` raises `AttributeError: 'NoneType' object has no attribute
+    'write'`, and a crash nobody can see is strictly worse than a message nobody
+    can see: the crash also loses the exit code that says whether the run
+    worked.
+    """
+    for name in ("stdout", "stderr"):
+        if not usable(getattr(sys, name, None)):
+            try:
+                setattr(sys, name, open(os.devnull, "w"))
+            except OSError:
+                pass
+
+
 def ensure_output(*, allocate: bool = True) -> bool:
-    """Make sure printing goes somewhere a person can see. True if it will.
+    """Make sure printing goes somewhere. True if it goes somewhere VISIBLE.
 
     A no-op everywhere except a Windows build that has no console, which means
     this can be called unconditionally from the launcher without the launcher
@@ -98,6 +116,11 @@ def ensure_output(*, allocate: bool = True) -> bool:
     Both streams are checked, not just stdout: every warning and every failure
     message in the CLI goes to stderr, so a stderr left as None turns the first
     warning into `AttributeError: 'NoneType' object has no attribute 'write'`.
+
+    A False return means no console could be obtained -- but the streams are
+    still left safe to write to, so callers do not have to check. Windows CI is
+    a real example of that environment: the runner's shell has no console to
+    attach to and no session to allocate one in.
     """
     if os.name != "nt":
         return True
@@ -109,6 +132,10 @@ def ensure_output(*, allocate: bool = True) -> bool:
 
         kernel32 = ctypes.windll.kernel32
     except Exception:
+        # No way to ask for a console at all. Same outcome as asking and being
+        # refused, so take the same fallback rather than returning with the
+        # streams still unwritable.
+        _silence()
         return False
 
     if kernel32.AttachConsole(ATTACH_PARENT_PROCESS):  # case 2
@@ -117,4 +144,6 @@ def ensure_output(*, allocate: bool = True) -> bool:
     if allocate and kernel32.AllocConsole():  # case 3
         _reopen()
         return usable(sys.stdout) and usable(sys.stderr)
+
+    _silence()  # nowhere to show it; at least do not crash trying
     return False
