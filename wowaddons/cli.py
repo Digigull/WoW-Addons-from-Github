@@ -18,6 +18,7 @@ EPILOG = """\
     addons.py scan
     addons.py set GnomeWorks local:.
     addons.py set SomeAddon github:owner/repo
+    addons.py set OneOfMany github:owner/repo#OneOfMany
     addons.py update
 
     addons.py            (no arguments) opens the window instead
@@ -48,7 +49,15 @@ Sources:
   github:owner/repo   latest GitHub release, preferring an attached .zip and
                       falling back to the source archive
   github:owner/repo@branch   that branch's current head instead of a release
+  github:owner/repo#Folder   ONE addon out of a repository that holds several.
+                      Only that folder is installed, and its version is the
+                      last commit that touched it -- so the other addons in the
+                      repo neither get installed nor make this one look out of
+                      date. `@branch#Folder` combines with the above.
   unmanaged           leave it alone
+
+A github.com link works anywhere owner/repo does, including a link to a folder:
+https://github.com/owner/repo/tree/main/MyAddon means that addon, on that branch.
 
 The manifest lives outside this repo, in
 $XDG_CONFIG_HOME/wow-addons/manifest.json, because it holds your disk paths and

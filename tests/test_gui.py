@@ -217,6 +217,48 @@ class WindowTests(unittest.TestCase):
         dlg._save()
         self.assertEqual(dlg.result, ("github:o/r@dev", False))
 
+    def test_the_dialog_writes_a_folder_source(self):
+        # A repository holding several addons: this addon tracks one folder.
+        dlg = self.dialog("Bound")
+        dlg.folder.set("HonorTracker")
+        dlg._save()
+        self.assertEqual(dlg.result, ("github:o/r#HonorTracker", False))
+
+    def test_a_pasted_folder_url_fills_the_folder_in(self):
+        # Clicking into one addon of several on github.com and copying the
+        # address is the plainest way anybody says which addon they mean.
+        dlg = self.dialog("Bound")
+        dlg.repo.set("https://github.com/o/r/tree/main/HonorTracker")
+        dlg._absorb_url()
+        self.assertEqual(dlg.folder.get(), "HonorTracker")
+        self.assertTrue(dlg.track.get(), "the branch in the URL should be taken too")
+        self.assertIn("HonorTracker", dlg.repo_hint.cget("text"))
+        dlg._save()
+        self.assertEqual(dlg.result, ("github:o/r@main#HonorTracker", False))
+
+    def test_the_dialog_reads_back_a_folder_source(self):
+        entry = {"source": "github:o/r@main#HonorTracker", "installed": None, "folders": []}
+        dlg = gui.SourceDialog(self.root, "Bound", entry, self.addons)
+        self.assertEqual(dlg.repo.get(), "o/r")
+        self.assertEqual(dlg.branch.get(), "main")
+        self.assertEqual(dlg.folder.get(), "HonorTracker")
+        dlg.destroy()
+
+    def test_the_caution_names_the_folder_the_repo_will_land(self):
+        """For a mono-repo the folder installed is not the addon's own name.
+
+        Cautioning about `Bound` while `HonorTracker` is the directory actually
+        about to be replaced is the same class of mistake as promising a backup
+        that never happened: a true-sounding sentence about the wrong file.
+        """
+        (self.addons / "HonorTracker").mkdir()
+        (self.addons / "HonorTracker" / "mine.lua").write_text("x")
+        dlg = self.dialog("Bound")
+        dlg.folder.set("HonorTracker")
+        dlg._show_caution()
+        self.assertIn("HonorTracker", dlg.caution.cget("text"))
+        dlg.destroy()
+
     def test_the_dialog_refuses_something_that_is_not_owner_slash_repo(self):
         dlg = self.dialog("Bound")
         dlg.repo.set("not-a-repo")

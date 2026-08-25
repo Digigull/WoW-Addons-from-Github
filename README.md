@@ -121,8 +121,28 @@ existing folder outright instead of keeping one copy of it).
 | `local:<path>` | A folder on disk. Installed as a **symlink** by default, so `git pull` in that checkout *is* the update — nothing to reinstall, and the client cannot be running something other than what is checked out. `--copy` for real files instead. |
 | `github:owner/repo` | Latest release, preferring an attached `.zip` and falling back to the source archive. |
 | `github:owner/repo@branch` | That branch's current head, for an addon that does not cut releases. |
-| `https://github.com/owner/repo` | A pasted link works too — the page URL, the clone URL, the SSH one, or a link to a branch, which is taken as `@branch`. |
+| `github:owner/repo#Folder` | **One addon out of a repository that holds several.** Only that folder is installed, and its version is the last commit that touched *it*. Combines with a branch: `github:owner/repo@main#Folder`. |
+| `https://github.com/owner/repo` | A pasted link works too — the page URL, the clone URL, the SSH one, a link to a branch (taken as `@branch`), or a link to a folder (taken as `#Folder`). |
 | `unmanaged` | Left alone. The default for anything `scan` finds and cannot place. |
+
+### A repository that holds several addons
+
+Some people keep every addon they have written in one repository. Bound as a whole, such a
+repo installs **all** of it, and since the repo has one commit history, every addon in it
+reports an update whenever any one of them changes.
+
+Naming the folder fixes both. The simplest way is to click into that addon on github.com
+and paste the address you end up at:
+
+```
+https://github.com/owner/repo/tree/main/MyAddon
+```
+
+The window fills in the repository, the branch and the folder from that link. Each addon in
+the repo can be bound separately, and each then updates — and reports updates — on its own.
+
+Bind the repository as a whole and the tool says so once, in the run log, rather than
+leaving it to be discovered as strange behaviour later.
 
 `scan` reads each `.toc` for an `X-Website` or `X-Repository` header and *suggests* a GitHub
 source where it finds one. Suggestions are never applied on their own — a header is the
@@ -135,8 +155,14 @@ repository whose root *is* the addon (`repo-1a2b3c/MyAddon.toc`) all end up corr
 `AddOns/MyAddon/MyAddon.toc`.
 
 > Pointing a `github:` source at a repository containing **several** addon folders installs
-> all of them. That is intended for multi-addon repositories, but it will surprise you if you
-> expected one.
+> all of them — which is right for an addon that ships its own library, and wrong for a
+> repository of unrelated addons. Add `#Folder` to take just one; see
+> [A repository that holds several addons](#a-repository-that-holds-several-addons).
+
+Addons are found wherever they sit in the archive: at the top, under GitHub's wrapper
+directory, laid out as `src/MyAddon/MyAddon.toc` beside a `docs/` folder, or as a repository
+whose root *is* the addon. An addon's own bundled libraries are never mistaken for the addon
+itself.
 
 ## The window
 
@@ -145,7 +171,8 @@ repository whose root *is* the addon (`repo-1a2b3c/MyAddon.toc`) all end up corr
 Everything the terminal does, in one window:
 
 - **Set source…** opens a dialog over the selected addon: a local folder (with Browse),
-  a GitHub repo, an optional branch to track, or unmanaged.
+  a GitHub repo, an optional branch to track, an optional folder inside the repo, or
+  unmanaged. Pasting a github.com link to a folder fills all three in.
 - **Accept suggestion** takes what an addon's `.toc` suggested — for the rows you pick,
   on a click you make. It is shown in the Status column and never applied on its own,
   for the same reason `accept` is a separate command in the terminal.
@@ -167,7 +194,9 @@ Everything the terminal does, in one window:
   it yourself once you are satisfied.
 
   **Once, not every update.** After the first install the folder is one this tool wrote,
-  so later updates replace it directly — no `<Name>.replaced2` piling up. Turn the copy
+  so later updates replace it directly — no `<Name>.replaced2` piling up. The question is
+  asked **per folder**: an archive landing several folders keeps each one that this tool did
+  not write, whatever it recorded about the addon you bound. Turn the copy
   off entirely with `--no-backup`, or the checkbox in the Set-source dialog, and an
   existing folder is replaced outright.
 - **One failed source does not sink the run.** An unreachable, private or renamed repository

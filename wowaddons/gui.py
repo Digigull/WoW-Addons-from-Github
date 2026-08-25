@@ -98,7 +98,7 @@ class SourceDialog(tk.Toplevel):
 
     # Every tk variable this dialog owns. Named once, so destroy() cannot drift
     # out of step with __init__.
-    VARIABLES = ("choice", "local", "repo", "branch", "track", "copy", "backup")
+    VARIABLES = ("choice", "local", "repo", "branch", "track", "copy", "backup", "folder")
 
     def __init__(self, parent, addon: str, entry: dict, root: Path):
         super().__init__(parent)
@@ -121,20 +121,20 @@ class SourceDialog(tk.Toplevel):
         self.track = tk.BooleanVar(value=False)
         self.copy = tk.BooleanVar(value=entry.get("mode") == "copy")
         self.backup = tk.BooleanVar(value=entry.get("backup", True))
+        self.folder = tk.StringVar()
 
         if source.startswith("local:"):
             self.choice.set("local")
             self.local.set(source[len("local:"):])
         elif source.startswith("github:"):
             self.choice.set("github")
-            rest = source[len("github:"):]
-            if "@" in rest:
-                repo, branch = rest.split("@", 1)
-                self.repo.set(repo)
+            repo, branch, folder = core.split_repo_spec(source[len("github:"):])
+            self.repo.set(repo)
+            if branch:
                 self.branch.set(branch)
                 self.track.set(True)
-            else:
-                self.repo.set(rest)
+            if folder:
+                self.folder.set(folder)
         elif suggested and suggested.startswith("github:"):
             # A suggestion is offered pre-filled but never pre-selected: the
             # .toc header is the author's claim about where the code lives, not
@@ -201,6 +201,18 @@ class SourceDialog(tk.Toplevel):
         self.branch_entry = ttk.Entry(track, textvariable=self.branch, width=18)
         self.branch_entry.grid(row=0, column=1, sticky="w", padx=(6, 0))
 
+        # For a repository holding several addons. Blank means "whatever the
+        # archive contains", which is right for the ordinary one-addon repo and
+        # is what every existing source keeps meaning.
+        folder_row = ttk.Frame(body)
+        folder_row.grid(row=9, column=1, sticky="ew", **pad)
+        ttk.Label(folder_row, text="folder in repo:").grid(row=0, column=0, sticky="w")
+        self.folder_entry = ttk.Entry(folder_row, textvariable=self.folder, width=26)
+        self.folder_entry.grid(row=0, column=1, sticky="w", padx=(6, 0))
+        self.folder_entry.bind("<KeyRelease>", self._show_caution)
+        ttk.Label(folder_row, text="(only if the repo holds several addons)",
+                  foreground="grey").grid(row=0, column=2, sticky="w", padx=(6, 0))
+
         ttk.Radiobutton(body, text="Leave unmanaged", value="unmanaged", variable=self.choice,
                         command=self._sync).grid(row=4, column=0, sticky="w", **pad)
 
@@ -239,13 +251,22 @@ class SourceDialog(tk.Toplevel):
         if found is None:
             self.repo_hint.configure(text="not a GitHub repository" if text.strip() else "")
             return
-        repo, branch = found
+        repo, branch, folder = found
         if branch and not self.track.get():
             # The URL named a branch; reflect that rather than dropping it.
             self.track.set(True)
             self.branch.set(branch)
             self._sync()
-        self.repo_hint.configure(text=f"→ {repo}" + (f" @ {branch}" if branch else ""))
+        if folder and not self.folder.get().strip():
+            # Clicking into one addon of several and copying the address is the
+            # clearest way anybody states which addon they mean. Keep it.
+            self.folder.set(folder)
+        shown = f"→ {repo}"
+        if branch:
+            shown += f" @ {branch}"
+        if folder:
+            shown += f" · {folder}"
+        self.repo_hint.configure(text=shown)
 
     def _sync(self, *_a) -> None:
         """Grey out whatever the current choice does not use."""
@@ -260,6 +281,7 @@ class SourceDialog(tk.Toplevel):
         self.repo_entry.configure(state=github)
         self.track_box.configure(state=github)
         self.branch_entry.configure(state="normal" if choice == "github" and self.track.get() else "disabled")
+        self.folder_entry.configure(state=github)
         self._show_caution()
 
     def _provisional(self) -> dict:
@@ -269,15 +291,20 @@ class SourceDialog(tk.Toplevel):
             path = self.local.get().strip()
             source = f"local:{path}" if path else "unmanaged"
         elif choice == "github":
-            source = "github:owner/repo"  # only the scheme matters here
+            # Only the scheme matters, except for the folder: for a repo of
+            # several addons the folder is what lands in AddOns, and naming the
+            # addon instead would caution about the wrong directory.
+            folder = self.folder.get().strip("/ ") if self.folder is not None else ""
+            source = f"github:owner/repo#{folder}" if folder else "github:owner/repo"
         else:
             source = "unmanaged"
         return {
             "source": source,
             "backup": bool(self.backup.get()) if self.backup is not None else True,
-            # Carried through, because it is what decides whether a folder is
+            # Both carried through: together they decide whether a folder is
             # this tool's to replace or the user's to keep.
             "installed": self.entry.get("installed"),
+            "folders": self.entry.get("folders", []),
         }
 
     def _show_caution(self, *_a) -> None:
@@ -296,15 +323,20 @@ class SourceDialog(tk.Toplevel):
             self.caution.configure(text="")
             return
 
-        if entry.get("installed"):
-            # This tool wrote that folder, so replacing it loses nothing the
+        if entry.get("installed") and doomed.name in (entry.get("folders") or []):
+            # A folder this tool wrote itself: replacing it loses nothing the
             # source cannot fetch again. Warning here would put a red line on
             # every routine update, which is how people learn to ignore the
             # warning that matters.
+            #
+            # The folder has to be checked, not just the version. Asking only
+            # "has this addon been installed?" goes quiet for a mono-repo whose
+            # bound folder is a directory this tool has never touched -- silence
+            # about the wrong folder, which is how the last one went wrong.
             self.caution.configure(text="")
             return
 
-        if core.should_backup(entry):
+        if core.should_backup_folder(entry, doomed.name):
             kept = core.backup_name(doomed)
             self.caution.configure(
                 foreground="#a05000",
@@ -351,11 +383,17 @@ class SourceDialog(tk.Toplevel):
                     parent=self,
                 )
                 return
-            repo, url_branch = found
+            repo, url_branch, url_folder = found
             typed = self.branch.get().strip()
             # A branch in the pasted URL counts as asking to track it.
             branch = typed if (self.track.get() and typed) else (url_branch or "")
-            self.result = (f"github:{repo}@{branch}" if branch else f"github:{repo}", False)
+            folder = (self.folder.get().strip() or url_folder or "").strip("/")
+            source = f"github:{repo}"
+            if branch:
+                source += f"@{branch}"
+            if folder:
+                source += f"#{folder}"
+            self.result = (source, False)
         self.destroy()
 
     def _cancel(self) -> None:

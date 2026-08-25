@@ -644,15 +644,22 @@ class PastingARepoAddress(unittest.TestCase):
 
     def test_the_shapes_people_actually_paste(self):
         for text, expected in [
-            ("tullamods/Bagnon", ("tullamods/Bagnon", None)),
-            ("https://github.com/tullamods/Bagnon", ("tullamods/Bagnon", None)),
-            ("https://github.com/tullamods/Bagnon/", ("tullamods/Bagnon", None)),
-            ("https://github.com/tullamods/Bagnon.git", ("tullamods/Bagnon", None)),
-            ("http://www.github.com/tullamods/Bagnon", ("tullamods/Bagnon", None)),
-            ("github.com/tullamods/Bagnon", ("tullamods/Bagnon", None)),
-            ("git@github.com:tullamods/Bagnon.git", ("tullamods/Bagnon", None)),
-            ("  https://github.com/tullamods/Bagnon  ", ("tullamods/Bagnon", None)),
-            ("https://github.com/tullamods/Bagnon#readme", ("tullamods/Bagnon", None)),
+            ("tullamods/Bagnon", ("tullamods/Bagnon", None, None)),
+            ("https://github.com/tullamods/Bagnon", ("tullamods/Bagnon", None, None)),
+            ("https://github.com/tullamods/Bagnon/", ("tullamods/Bagnon", None, None)),
+            ("https://github.com/tullamods/Bagnon.git", ("tullamods/Bagnon", None, None)),
+            ("http://www.github.com/tullamods/Bagnon", ("tullamods/Bagnon", None, None)),
+            ("github.com/tullamods/Bagnon", ("tullamods/Bagnon", None, None)),
+            ("git@github.com:tullamods/Bagnon.git", ("tullamods/Bagnon", None, None)),
+            ("  https://github.com/tullamods/Bagnon  ", ("tullamods/Bagnon", None, None)),
+            ("https://github.com/tullamods/Bagnon#readme", ("tullamods/Bagnon", None, None)),
+            # A repo of several addons: the folder you clicked into IS the
+            # statement of which addon you mean, and it is what gets pasted.
+            ("https://github.com/Digigull/Ascension-Custom-Addons/tree/main/AscensionHonorTracker",
+             ("Digigull/Ascension-Custom-Addons", "main", "AscensionHonorTracker")),
+            ("https://github.com/o/r/tree/main/Nested/Deep/Addon/",
+             ("o/r", "main", "Nested/Deep/Addon")),
+            ("o/r#OneAddon", ("o/r", None, "OneAddon")),
         ]:
             with self.subTest(text=text):
                 self.assertEqual(addons.parse_repo(text), expected)
@@ -660,8 +667,8 @@ class PastingARepoAddress(unittest.TestCase):
     def test_a_branch_in_the_url_is_kept(self):
         # Somebody browsing a branch and copying the address means that branch.
         self.assertEqual(addons.parse_repo("https://github.com/Questie/Questie/tree/develop"),
-                         ("Questie/Questie", "develop"))
-        self.assertEqual(addons.parse_repo("https://github.com/o/r/blob/main"), ("o/r", "main"))
+                         ("Questie/Questie", "develop", None))
+        self.assertEqual(addons.parse_repo("https://github.com/o/r/blob/main"), ("o/r", "main", None))
 
     def test_things_that_are_not_a_github_repo_are_refused(self):
         # Refused, not mangled: storing a CurseForge page as owner/repo would
@@ -684,3 +691,265 @@ class PastingARepoAddress(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# A repository holding several unrelated addons -- one commit history, nine
+# addons, no releases. Every assumption below was checked against a real one:
+# Digigull/Ascension-Custom-Addons, which is where these bugs were found.
+MONOREPO = {
+    "Ascension-Custom-Addons-1a2b3c/AscensionHonorTracker/AscensionHonorTracker.toc": "a",
+    "Ascension-Custom-Addons-1a2b3c/GnomeWorks/GnomeWorks.toc": "b",
+    "Ascension-Custom-Addons-1a2b3c/TurboPlates/TurboPlates.toc": "c",
+    "Ascension-Custom-Addons-1a2b3c/README.md": "docs",
+}
+
+
+class OneAddonOutOfMany(unittest.TestCase):
+    """Binding an addon to one folder of a repository that holds several.
+
+    Without this, binding a single addon to such a repo installs all of them,
+    and the entry then claims every one of their folders as its own. Both
+    halves cause damage, and the second one destroyed a file during testing.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_only_the_bound_folder_is_installed(self):
+        written = addons.install_zip(mkzip(MONOREPO), self.root, dry_run=False,
+                                     only="AscensionHonorTracker")
+        self.assertEqual(written, ["AscensionHonorTracker"])
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()),
+                         ["AscensionHonorTracker"])
+
+    def test_without_a_folder_the_whole_lot_still_installs(self):
+        # The existing behaviour, kept: an addon that ships its own library
+        # depends on it, and most repos hold exactly one addon anyway.
+        written = addons.install_zip(mkzip(MONOREPO), self.root, dry_run=False)
+        self.assertEqual(written,
+                         ["AscensionHonorTracker", "GnomeWorks", "TurboPlates"])
+
+    def test_a_folder_that_is_not_there_is_refused_by_name(self):
+        with self.assertRaises(addons.Fail) as caught:
+            addons.install_zip(mkzip(MONOREPO), self.root, False, only="Nonexistent")
+        self.assertIn("Nonexistent", str(caught.exception))
+
+    def test_a_folder_this_tool_did_not_write_is_kept(self):
+        """The bug that deleted a file, reduced to its shape.
+
+        Bind one addon of a repo that holds three. The entry records the folder
+        it installed. A different addon from that same repo is then put there by
+        hand -- and the next update must not treat it as one of ours just
+        because the same archive happens to contain a folder by that name.
+
+        This used to decide once, from the entry, and apply that answer to every
+        folder the archive landed.
+        """
+        entry = {"backup": True, "installed": "v1", "folders": ["AscensionHonorTracker"]}
+        mine = self.root / "GnomeWorks"
+        mine.mkdir()
+        (mine / "GnomeWorks.toc").write_text("mine")
+        (mine / "my_edit.lua").write_text("an afternoon's work")
+
+        addons.install_zip(mkzip(MONOREPO), self.root, False, backup=True, entry=entry)
+
+        kept = self.root / "GnomeWorks.replaced" / "my_edit.lua"
+        self.assertTrue(kept.is_file(), "a folder this tool never installed was destroyed")
+        self.assertEqual(kept.read_text(), "an afternoon's work")
+
+    def test_a_folder_this_tool_did_write_is_replaced_without_piling_up(self):
+        # The other half of the same rule: our own folder is replaced directly,
+        # or .replaced2, .replaced3 accumulate on every update.
+        entry = {"backup": True, "installed": "v1", "folders": ["AscensionHonorTracker"]}
+        addons.install_zip(mkzip(MONOREPO), self.root, False, backup=True, entry=entry,
+                           only="AscensionHonorTracker")
+        addons.install_zip(mkzip(MONOREPO), self.root, False, backup=True, entry=entry,
+                           only="AscensionHonorTracker")
+        self.assertEqual([p.name for p in self.root.glob("*.replaced*")], [])
+
+    def test_should_backup_folder_answers_per_folder(self):
+        entry = {"backup": True, "installed": "v1", "folders": ["Mine"]}
+        self.assertFalse(addons.should_backup_folder(entry, "Mine"))
+        self.assertTrue(addons.should_backup_folder(entry, "Theirs"))
+        # Nothing installed yet: the folder is the user's whatever it is called.
+        self.assertTrue(addons.should_backup_folder({"folders": ["Mine"]}, "Mine"))
+        # And an explicit no still means no.
+        self.assertFalse(addons.should_backup_folder({"backup": False}, "Anything"))
+
+
+class VersionFollowsTheFolder(unittest.TestCase):
+    """A mono-repo's HEAD moves when any addon in it changes.
+
+    Versioning an addon by the repository reports an update for all nine every
+    time one of them is touched. An "update available" that is usually wrong is
+    worse than no column at all, because people stop reading it.
+    """
+
+    def setUp(self):
+        self.responses = {}
+        self._real = addons.http_json
+        addons.http_json = lambda url: self.responses.get(url)
+        self.addCleanup(lambda: setattr(addons, "http_json", self._real))
+        self.repo = "https://api.github.com/repos/o/r"
+
+    def test_the_version_is_the_last_commit_touching_that_folder(self):
+        self.responses[self.repo] = {"default_branch": "main"}
+        self.responses[f"{self.repo}/commits?sha=main&path=HonorTracker&per_page=1"] = [
+            {"sha": "9ba7d5f00000000"}
+        ]
+        version, url = addons.latest_github("o/r#HonorTracker")
+        self.assertEqual(version, "9ba7d5f00000")
+        self.assertIn("/zipball/main", url)
+
+    def test_two_folders_in_one_repo_get_different_versions(self):
+        self.responses[self.repo] = {"default_branch": "main"}
+        self.responses[f"{self.repo}/commits?sha=main&path=A&per_page=1"] = [{"sha": "aaaaaaaaaaaa"}]
+        self.responses[f"{self.repo}/commits?sha=main&path=B&per_page=1"] = [{"sha": "bbbbbbbbbbbb"}]
+        self.assertNotEqual(addons.latest_github("o/r#A")[0], addons.latest_github("o/r#B")[0])
+
+    def test_a_named_folder_is_not_overruled_by_a_release(self):
+        # A release asset is packaged for one addon; nothing says its contents
+        # line up with a path in the source tree, so honouring both would mean
+        # guessing which the user meant.
+        self.responses[f"{self.repo}/releases/latest"] = {
+            "tag_name": "v9.9", "zipball_url": "z", "assets": [],
+        }
+        self.responses[self.repo] = {"default_branch": "main"}
+        self.responses[f"{self.repo}/commits?sha=main&path=A&per_page=1"] = [{"sha": "cccccccccccc"}]
+        self.assertEqual(addons.latest_github("o/r#A")[0], "cccccccccccc")
+
+    def test_a_branch_and_a_folder_together(self):
+        self.responses[f"{self.repo}/commits?sha=dev&path=A&per_page=1"] = [{"sha": "dddddddddddd"}]
+        version, url = addons.latest_github("o/r@dev#A")
+        self.assertEqual(version, "dddddddddddd")
+        self.assertIn("/zipball/dev", url)
+
+    def test_a_folder_nothing_ever_touched_is_reported(self):
+        self.responses[self.repo] = {"default_branch": "main"}
+        self.responses[f"{self.repo}/commits?sha=main&path=Typo&per_page=1"] = []
+        with self.assertRaises(addons.Fail) as caught:
+            addons.latest_github("o/r#Typo")
+        self.assertIn("Typo", str(caught.exception))
+
+
+class RepoLayoutsThatUsedToBeMissed(unittest.TestCase):
+    """Addons are not always at the top of the tree."""
+
+    def install(self, files, **kw):
+        with tempfile.TemporaryDirectory() as tmp:
+            return addons.install_zip(mkzip(files), pathlib.Path(tmp), dry_run=True, **kw)
+
+    def test_an_addon_under_src_beside_docs(self):
+        # Nothing recognisable at the top and more than one way down, so the
+        # old search gave up and reported "no addon folder found".
+        self.assertEqual(
+            self.install({"r-1a2b/src/MyAddon/MyAddon.toc": "x", "r-1a2b/docs/readme.md": "y"}),
+            ["MyAddon"],
+        )
+
+    def test_a_dot_directory_is_not_searched(self):
+        self.assertEqual(
+            self.install({"r-1a2b/MyAddon/MyAddon.toc": "x",
+                          "r-1a2b/.github/workflows/ci.yml": "y"}),
+            ["MyAddon"],
+        )
+
+    def test_bundled_libraries_do_not_become_the_addon(self):
+        # An addon shipping Libs/AceGUI-3.0/AceGUI-3.0.toc must install as
+        # MyAddon, not as its own libraries. This is why the deeper search is
+        # a last resort and bounded rather than a full walk.
+        self.assertEqual(
+            self.install({"r-1a2b/MyAddon/MyAddon.toc": "x",
+                          "r-1a2b/MyAddon/Libs/AceGUI-3.0/AceGUI-3.0.toc": "y"}),
+            ["MyAddon"],
+        )
+
+
+class SourcesNamingAFolder(unittest.TestCase):
+    def test_a_folder_url_is_what_people_will_paste(self):
+        # Clicking into one addon of several on github.com and copying the
+        # address is the clearest statement of which addon is meant.
+        self.assertEqual(
+            addons.parse_repo("https://github.com/o/r/tree/main/HonorTracker"),
+            ("o/r", "main", "HonorTracker"),
+        )
+
+    def test_it_round_trips_through_set_source(self):
+        state = {"addons": {}}
+        entry, _ = addons.set_source(
+            state, "HonorTracker",
+            "github:https://github.com/o/r/tree/main/HonorTracker",
+        )
+        self.assertEqual(entry["source"], "github:o/r@main#HonorTracker")
+        self.assertEqual(addons.split_repo_spec("o/r@main#HonorTracker"),
+                         ("o/r", "main", "HonorTracker"))
+
+    def test_an_ssh_url_is_not_split_on_its_own_at_sign(self):
+        # git@github.com:o/r used to split into repo "git", branch
+        # "github.com:o/r", because the "@" was taken before the URL was read.
+        state = {"addons": {}}
+        entry, _ = addons.set_source(state, "Bagnon", "git@github.com:tullamods/Bagnon.git")
+        self.assertEqual(entry["source"], "github:tullamods/Bagnon")
+
+    def test_the_folder_is_split_before_the_branch(self):
+        # A branch may not contain "#", but a path may well contain "@".
+        self.assertEqual(addons.split_repo_spec("o/r#weird@name"), ("o/r", None, "weird@name"))
+
+
+class UpdatingOneAddonOfManyEndToEnd(unittest.TestCase):
+    """The whole chain, because the bug lived in how the parts were joined.
+
+    Each piece was defensible on its own: `should_backup` correctly said "this
+    tool installed this addon, replacing it loses nothing", and `install_zip`
+    correctly applied the flag it was given. The damage was that one answer
+    about one addon was handed to a loop over nine folders.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self._latest, self._download = addons.latest_github, addons.download
+        addons.latest_github = lambda spec: ("v2", "http://x/a.zip")
+        addons.download = lambda url: mkzip(MONOREPO)
+        self.addCleanup(lambda: (setattr(addons, "latest_github", self._latest),
+                                 setattr(addons, "download", self._download)))
+
+    def test_a_hand_installed_addon_survives_updating_a_neighbour(self):
+        entry = {
+            "source": "github:o/r",          # the whole repo, as it was bound
+            "installed": "v1",               # and updated once already
+            "folders": ["AscensionHonorTracker"],
+            "backup": True,
+        }
+        mine = self.root / "GnomeWorks"
+        mine.mkdir()
+        (mine / "GnomeWorks.toc").write_text("mine")
+        (mine / "my_edit.lua").write_text("an afternoon's work")
+
+        result = addons.update_addon("AscensionHonorTracker", entry, self.root)
+
+        self.assertEqual(result.outcome, addons.CHANGED, result.detail)
+        kept = self.root / "GnomeWorks.replaced" / "my_edit.lua"
+        self.assertTrue(kept.is_file(),
+                        "updating one addon destroyed a folder this tool never installed")
+
+    def test_binding_the_whole_repo_says_that_it_holds_several(self):
+        # It works, but every addon in the repo will now report an update
+        # whenever any one of them changes. Better said once than discovered.
+        entry = {"source": "github:o/r", "installed": None, "folders": [], "backup": True}
+        result = addons.update_addon("AscensionHonorTracker", entry, self.root)
+        notes = " ".join(message for _level, message in result.notes)
+        self.assertIn("3 addons", notes)
+        self.assertIn("#FolderName", notes)
+
+    def test_bound_to_a_folder_it_touches_nothing_else(self):
+        entry = {"source": "github:o/r#AscensionHonorTracker", "installed": None,
+                 "folders": [], "backup": True}
+        result = addons.update_addon("AscensionHonorTracker", entry, self.root)
+        self.assertEqual(result.folders, ["AscensionHonorTracker"])
+        self.assertEqual(entry["folders"], ["AscensionHonorTracker"])
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()),
+                         ["AscensionHonorTracker"])

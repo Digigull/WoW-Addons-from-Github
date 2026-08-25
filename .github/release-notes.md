@@ -2,7 +2,35 @@ Update your World of Warcraft addons from repositories **you** choose. No catalo
 account, and no telemetry of any kind — it contacts exactly the hosts named in your own
 manifest and nothing else.
 
-## Fixed since v0.3.0
+## New since v0.3.1
+
+**One addon out of a repository that holds several.** Some people keep every addon they
+have written in one repository. Binding an addon to such a repo used to install all of
+them, and — because the repo has a single commit history — made every addon in it report
+an update whenever any one of them changed. Naming the folder fixes both:
+
+```
+github:owner/repo#MyAddon
+```
+
+The plainest way to say it is to click into that addon on github.com and paste the address
+you land on; the window reads the repository, the branch and the folder straight out of it.
+Each addon in the repo then updates, and reports updates, on its own.
+
+**A folder this tool did not install is never deleted, even in the same archive.** The
+decision to keep a copy was taken once from the addon you bound and then applied to every
+folder the archive landed. Updating one addon of nine could therefore delete the other
+eight without keeping anything, on the strength of a record that described only the first.
+It is now asked separately for every folder.
+
+**Addons are found in more layouts.** `src/MyAddon/MyAddon.toc` beside a `docs/` folder
+used to report "no addon folder found". An addon's own bundled libraries are still never
+mistaken for the addon itself.
+
+Also: an SSH clone URL (`git@github.com:owner/repo.git`) set as a source no longer splits
+on its own `@` into a repository called `git`.
+
+## Fixed in v0.3.1
 
 **If you used v0.3.0, please read this one.** Updating an addon from a GitHub source
 **deleted** the folder that was already there instead of keeping a copy of it — even
