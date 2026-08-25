@@ -2,7 +2,7 @@ name: release
 
 # Deliberately separate from tests.yml, and deliberately not on every push: a
 # slow build on every commit is how people stop watching CI. It runs on a tag,
-# on demand, and on changes to the things that can break the build itself.
+# on demand, and on changes to the things that can break the builds themselves.
 on:
   push:
     tags: ["v*"]
@@ -42,25 +42,68 @@ jobs:
         run: packaging/appimage/smoke-test.sh dist/WoW-Addons-from-GitHub-x86_64.AppImage
 
       - name: What went in it
-        run: |
-          ls -lh dist/
-          sha256sum dist/*.AppImage | tee dist/SHA256SUMS.txt
+        run: ls -lh dist/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: WoW-Addons-from-GitHub-x86_64.AppImage
-          path: dist/
+          name: appimage
+          path: dist/WoW-Addons-from-GitHub-x86_64.AppImage
           if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        run: python packaging/windows/build.py
+
+      # The .exe is built --windowed, so it has no console and no stdout until
+      # it makes one. The smoke test runs every command through a pipe, which
+      # is the case that must NOT grab a console: get it wrong and
+      # `app.exe list > out.txt` leaves the file empty.
+      - name: Smoke test
+        run: python packaging/windows/smoke-test.py "dist/WoW Addons from GitHub"
+
+      - name: What went in it
+        run: Get-ChildItem dist | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/WoW-Addons-from-GitHub-windows-x64.zip
+          if-no-files-found: error
+
+  publish:
+    # One job creates the release, after both builds have proved themselves.
+    # Attaching from each build job instead would race: two jobs would find no
+    # release and both try to create it, and one of them would lose.
+    needs: [appimage, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect and checksum
+        run: |
+          mkdir -p dist
+          find artifacts -type f -exec mv {} dist/ \;
+          cd dist && sha256sum * | tee SHA256SUMS.txt
 
       # `gh` is already on the runner, so the release needs no third-party
       # action -- which suits a project whose selling point is a small trust
       # surface.
-      - name: Attach to the release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Create the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 \
             || gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes
-          gh release upload "${GITHUB_REF_NAME}" \
-            dist/WoW-Addons-from-GitHub-x86_64.AppImage dist/SHA256SUMS.txt --clobber
+          gh release upload "${GITHUB_REF_NAME}" dist/* --clobber

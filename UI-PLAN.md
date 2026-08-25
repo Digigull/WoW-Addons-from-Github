@@ -1,9 +1,10 @@
 # A desktop UI, shipped as a Windows .exe and a Linux AppImage
 
-**Status: Milestones 1, 2, 3 and 5 are done. The Linux AppImage is built, and the two
-Windows bugs that gate a credible `.exe` are fixed. Milestone 4 — PyInstaller and a
-Windows release job — is what remains.** Everything below is kept as written except where
-a decision has since been settled by contact with reality; those places say so.
+**Status: all six milestones' worth of code is done. Both downloads — the Linux AppImage
+and the Windows zip — are built and smoke-tested by CI on every tag.** What is left is not
+code: nobody has run either build on real hardware against an actual WoW install.
+Everything below is kept as written except where a decision has since been settled by
+contact with reality; those places say so.
 
 The target: a user downloads one file, double-clicks it, points it at their WoW folder,
 sees their addons in a list, picks a source for each, and clicks Update. No Python, no
@@ -205,15 +206,35 @@ the junction paths are actually executed there rather than reasoned about.
 
 ## 6. Packaging
 
-### Windows — PyInstaller
+### Windows — PyInstaller — **done**
 
 ```
-pyinstaller --noconfirm --windowed --name "WoW Addons from GitHub" addons.py
+python packaging/windows/build.py
 ```
 
 - `--windowed` suppresses the console window for the GUI. **The CLI still needs a console**,
   so either ship two binaries or (better) build windowed and have the launcher allocate a
   console when it detects command-line arguments.
+
+  > **Built the second way, and there is a third case the plan did not mention.**
+  > `wowaddons/winconsole.py` handles all three: stdout already redirected to a file or
+  > pipe (do nothing — attaching a console here would send output to a window instead of
+  > the file the user asked for), launched from `cmd` (borrow the parent's console), and
+  > double-clicked with arguments (allocate one).
+  >
+  > The redirected case is the one worth care, because getting it wrong is silent:
+  > `app.exe list > out.txt` would leave the file empty and no exit code would say so.
+  >
+  > The known wart: `cmd` does not wait for a GUI-subsystem process, so the prompt returns
+  > before the output arrives. Fixing that needs a second console-subsystem binary, which
+  > costs more than it buys.
+
+  > **Also not mentioned in the plan, and it would have shipped a broken build.**
+  > `wowaddons.gui` is imported inside a function inside a try/except, so a missing Tk
+  > degrades to a message instead of a traceback. PyInstaller's static analysis does not
+  > reliably follow that, and without an explicit `--hidden-import` the build *succeeds*
+  > and the `.exe` simply has no window. `packaging/windows/build.py` names it, and a test
+  > fails if that ever stops being true.
 - Prefer **`--onedir` in a zip over `--onefile`.** One-file binaries are self-extracting
   archives, which is also what a lot of malware looks like, and they draw heuristic
   antivirus flags far more often. One-dir also starts faster.
@@ -276,9 +297,9 @@ once there are enough Windows users for it to be worth it.
 | 1 | Split into `core` / `cli` / `gui` packages; extract `update_addon`; tests still green | **done** |
 | 2 | Windows junctions + `%APPDATA%`, with tests on the existing Windows CI | **done** |
 | 3 | Tkinter window: folder picker, addon table, Set-source dialog, threaded update with progress | **done** |
-| 4 | PyInstaller Windows build + release workflow | next |
+| 4 | PyInstaller Windows build + release workflow | **done** |
 | 5 | AppImage build + release workflow | **done** |
-| 6 | Real-hardware testing both platforms; README rewrite for non-technical users | Linux README done; hardware testing outstanding |
+| 6 | Real-hardware testing both platforms; README rewrite for non-technical users | README done; **hardware testing outstanding** |
 
 Milestone 2 was the gate on the Windows `.exe` and is done: a packaged build that needed
 administrator rights to bind a `local:` source, or that hid its manifest under
