@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline tests for addons.py.
+"""Offline tests for the engine in wowaddons.core.
 
     python3 -m unittest discover -s tests -t .
 
@@ -17,17 +17,17 @@ whose failure would be silent:
     you off to wait an hour for nothing
 """
 
-import importlib.util
 import io
 import pathlib
+import sys
 import tempfile
 import unittest
 import urllib.error
 import zipfile
 
-SPEC = importlib.util.spec_from_file_location("addons", pathlib.Path(__file__).resolve().parent.parent / "addons.py")
-addons = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(addons)
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+from wowaddons import core as addons  # noqa: E402
 
 
 def mkzip(files: dict) -> bytes:
@@ -184,6 +184,140 @@ class TocReading(unittest.TestCase):
 
     def test_a_non_github_website_suggests_nothing(self):
         self.assertIsNone(addons.guess_source({"x-website": "https://curseforge.com/wow/x"}))
+
+
+class UpdatingOneAddon(unittest.TestCase):
+    """`update_addon` is what both front ends call, so its contract is the API.
+
+    The rule worth pinning is the one the whole tool rests on: a failure comes
+    back as a FAILED result, never as an exception, because an exception here
+    would abort the run and discard every manifest change made before it.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self._latest = addons.latest_github
+        self._download = addons.download
+        addons.latest_github = lambda spec: ("v2", "http://x/a.zip")
+        addons.download = lambda url: mkzip({"MyAddon/MyAddon.toc": "a"})
+
+    def tearDown(self):
+        addons.latest_github = self._latest
+        addons.download = self._download
+        self.tmp.cleanup()
+
+    def entry(self, **over):
+        base = {"source": "github:o/r", "mode": "link", "installed": None, "folders": []}
+        base.update(over)
+        return base
+
+    def test_unmanaged_is_skipped_not_failed(self):
+        result = addons.update_addon("A", self.entry(source="unmanaged"), self.root)
+        self.assertEqual(result.outcome, addons.UNMANAGED)
+
+    def test_a_new_version_installs_and_records_itself(self):
+        entry = self.entry()
+        result = addons.update_addon("MyAddon", entry, self.root)
+        self.assertEqual(result.outcome, addons.CHANGED)
+        self.assertEqual(entry["installed"], "v2")
+        self.assertTrue((self.root / "MyAddon" / "MyAddon.toc").is_file())
+
+    def test_matching_version_is_left_alone(self):
+        entry = self.entry(installed="v2")
+        result = addons.update_addon("MyAddon", entry, self.root)
+        self.assertEqual(result.outcome, addons.UP_TO_DATE)
+        self.assertFalse((self.root / "MyAddon").exists())
+
+    def test_force_reinstalls_a_matching_version(self):
+        entry = self.entry(installed="v2")
+        self.assertEqual(addons.update_addon("MyAddon", entry, self.root, force=True).outcome, addons.CHANGED)
+        self.assertTrue((self.root / "MyAddon").is_dir())
+
+    def test_check_reports_without_downloading(self):
+        addons.download = lambda url: self.fail("check must not download")
+        entry = self.entry()
+        result = addons.update_addon("MyAddon", entry, self.root, check=True)
+        self.assertEqual(result.outcome, addons.CHANGED)
+        self.assertIsNone(entry["installed"], "check must not record an install")
+
+    def test_dry_run_writes_nothing(self):
+        entry = self.entry()
+        result = addons.update_addon("MyAddon", entry, self.root, dry_run=True)
+        self.assertEqual(result.folders, ["MyAddon"], "it should still say what it would install")
+        self.assertFalse((self.root / "MyAddon").exists())
+        self.assertIsNone(entry["installed"])
+
+    def test_a_failure_is_a_result_not_an_exception(self):
+        # The regression this guards: raising here aborted the whole update and
+        # dropped the manifest changes made by the addons ahead of this one.
+        def unreachable(spec):
+            addons.die("could not reach GitHub: connection refused")
+
+        addons.latest_github = unreachable
+        entry = self.entry(installed="v1")
+        result = addons.update_addon("MyAddon", entry, self.root)
+        self.assertEqual(result.outcome, addons.FAILED)
+        self.assertIn("connection refused", result.detail)
+        self.assertEqual(entry["installed"], "v1", "a failed update must not rewrite the entry")
+
+    def test_a_local_source_links_and_survives_a_second_run(self):
+        source = pathlib.Path(self.tmp.name) / "src" / "MyAddon"
+        source.mkdir(parents=True)
+        (source / "MyAddon.toc").write_text("## Title: x")
+        entry = self.entry(source=f"local:{source}")
+
+        for _ in range(2):
+            result = addons.update_addon("MyAddon", entry, self.root)
+            self.assertEqual(result.outcome, addons.CHANGED)
+            self.assertTrue((self.root / "MyAddon").is_symlink())
+        self.assertEqual(entry["installed"], "linked")
+
+
+class DisplacingRealFiles(unittest.TestCase):
+    """Binding over a real folder moves it aside, and the GUI has to say so first.
+
+    In a terminal you read the log afterwards. In a window you are told in the
+    confirm step or you never find out, so the name has to be computable before
+    anything is moved.
+    """
+
+    def test_the_backup_name_does_not_collide(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = pathlib.Path(tmp) / "MyAddon"
+            target.mkdir()
+            self.assertEqual(addons.backup_name(target).name, "MyAddon.replaced")
+            (pathlib.Path(tmp) / "MyAddon.replaced").mkdir()
+            self.assertEqual(addons.backup_name(target).name, "MyAddon.replaced2")
+
+    def test_a_real_folder_is_reported_as_displaced_and_then_moved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "AddOns"
+            root.mkdir()
+            (root / "MyAddon").mkdir()
+            (root / "MyAddon" / "old.lua").write_text("old")
+            source = pathlib.Path(tmp) / "src" / "MyAddon"
+            source.mkdir(parents=True)
+            (source / "MyAddon.toc").write_text("## Title: x")
+
+            entry = {"source": f"local:{source}", "mode": "link", "installed": None, "folders": []}
+            warned = addons.will_displace(entry, root)
+            self.assertEqual(warned.name, "MyAddon.replaced")
+
+            addons.update_addon("MyAddon", entry, root)
+            self.assertTrue((root / "MyAddon.replaced" / "old.lua").is_file(), "the old files must survive")
+            self.assertTrue((root / "MyAddon").is_symlink())
+
+    def test_a_symlink_is_not_reported_as_displaced(self):
+        # Replacing a link destroys nothing, so warning about it would be noise.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "AddOns"
+            root.mkdir()
+            source = pathlib.Path(tmp) / "src" / "MyAddon"
+            source.mkdir(parents=True)
+            (root / "MyAddon").symlink_to(source, target_is_directory=True)
+            entry = {"source": f"local:{source}", "mode": "link"}
+            self.assertIsNone(addons.will_displace(entry, root))
 
 
 if __name__ == "__main__":
