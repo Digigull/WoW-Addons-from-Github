@@ -96,6 +96,10 @@ class SourceDialog(tk.Toplevel):
     afterwards; in a window there is no log, so it has to be said in advance.
     """
 
+    # Every tk variable this dialog owns. Named once, so destroy() cannot drift
+    # out of step with __init__.
+    VARIABLES = ("choice", "local", "repo", "branch", "track", "copy")
+
     def __init__(self, parent, addon: str, entry: dict, root: Path):
         super().__init__(parent)
         self.title(f'Source for "{addon}"')
@@ -207,6 +211,8 @@ class SourceDialog(tk.Toplevel):
 
     def _sync(self, *_a) -> None:
         """Grey out whatever the current choice does not use."""
+        if self.choice is None:
+            return  # a queued event arriving after the dialog was closed
         choice = self.choice.get()
         local = "normal" if choice == "local" else "disabled"
         github = "normal" if choice == "github" else "disabled"
@@ -227,6 +233,8 @@ class SourceDialog(tk.Toplevel):
         .toc inside and renaming on the way in would break it. Warning about
         the wrong folder would be worse than not warning at all.
         """
+        if self.choice is None:
+            return None
         choice = self.choice.get()
         if choice == "unmanaged":
             return None
@@ -283,6 +291,27 @@ class SourceDialog(tk.Toplevel):
     def _cancel(self) -> None:
         self.result = None
         self.destroy()
+
+    def destroy(self) -> None:
+        """Close, and let go of the tk variables while it is still safe to.
+
+        A tkinter Variable calls into the interpreter when it is garbage
+        collected. Left to the collector that happens at an arbitrary moment on
+        whatever thread happened to be allocating -- and this program has a
+        worker thread. Collected there, Tcl raises "main thread is not in main
+        loop", and on Windows it escalates to aborting the whole process with
+        "Tcl_AsyncDelete: async handler deleted by the wrong thread". A user
+        would see that as the app vanishing part-way through an update, having
+        closed this dialog some time earlier.
+
+        Releasing them here pins that moment to the main thread, during close,
+        which is the only point at which it is certainly safe.
+        """
+        held = [getattr(self, name, None) for name in self.VARIABLES]
+        for name in self.VARIABLES:
+            setattr(self, name, None)
+        super().destroy()
+        held.clear()  # __del__ runs now, on this thread, with Tcl still up
 
 
 # ── the window ───────────────────────────────────────────────────────────────

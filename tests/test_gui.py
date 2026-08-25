@@ -14,6 +14,7 @@ under test is the queue-to-widget path, not the engine -- the engine has its
 own tests and does not need a window to exercise it.
 """
 
+import gc
 import json
 import os
 import pathlib
@@ -70,6 +71,10 @@ class WindowTests(unittest.TestCase):
     def tearDown(self):
         core.CONFIG_DIR, core.MANIFEST = self._config, self._manifest
         self.app.stop()
+        # Collect while the interpreter is still up. A tk variable finalised
+        # after root.destroy(), or on a worker thread, calls into a Tcl that is
+        # gone or foreign -- see test_a_closed_dialog_releases_its_tk_variables.
+        gc.collect()
         self.root.destroy()
         self.tmp.cleanup()
 
@@ -245,6 +250,51 @@ class WindowTests(unittest.TestCase):
         dlg.local_entry.event_generate("<KeyRelease>", when="now")
         self.assertIn("Loose.replaced", dlg.caution.cget("text"))
         dlg.destroy()
+
+    def test_a_closed_dialog_releases_its_tk_variables(self):
+        """The dialog must not leave tk variables for the collector to find.
+
+        A tkinter Variable calls into the interpreter from __del__. Left to the
+        garbage collector that happens whenever, on whatever thread happens to
+        be allocating -- and this program runs a worker thread. Collected there,
+        Tcl raises "main thread is not in main loop"; on Windows it escalates to
+        aborting the process outright, which a user would experience as the app
+        vanishing mid-update having closed this dialog minutes earlier.
+
+        Windows CI is where this surfaced, and it took the whole run down.
+        """
+        dlg = self.dialog("Bound")
+        variables = [getattr(dlg, name) for name in dlg.VARIABLES]
+        self.assertTrue(all(v is not None for v in variables), "nothing to release?")
+
+        dlg.destroy()
+        for name in dlg.VARIABLES:
+            self.assertIsNone(getattr(dlg, name), f"{name} outlived the dialog")
+
+        # And releasing them from another thread must now be inert, because the
+        # dialog no longer holds the only references keeping them alive.
+        import threading
+
+        failures = []
+
+        def collect():
+            try:
+                del variables[:]
+                gc.collect()
+            except Exception as exc:  # pragma: no cover - the thing being ruled out
+                failures.append(exc)
+
+        thread = threading.Thread(target=collect)
+        thread.start()
+        thread.join()
+        self.assertEqual(failures, [])
+
+    def test_events_arriving_after_close_are_harmless(self):
+        # Widget bindings can fire once more while a dialog is being torn down.
+        dlg = self.dialog("Bound")
+        dlg.destroy()
+        dlg._sync()          # must not raise on released variables
+        self.assertIsNone(dlg._displaced())
 
     def test_no_caution_for_a_folder_that_is_only_a_link(self):
         core.make_link(self.addons, self.addons / "Loose")
