@@ -89,7 +89,7 @@ class WhatCountsAsSomewhereToWrite(unittest.TestCase):
 
 class AcquiringOne(unittest.TestCase):
     def tearDown(self):
-        sys.stdout = sys.__stdout__
+        sys.stdout, sys.stderr = sys.__stdout__, sys.__stderr__
 
     @unittest.skipIf(os.name == "nt", "off-Windows behaviour")
     def test_it_is_a_no_op_off_windows(self):
@@ -105,6 +105,40 @@ class AcquiringOne(unittest.TestCase):
             sys.stdout = handle
             self.assertTrue(winconsole.ensure_output())
             self.assertIs(sys.stdout, handle, "redirection was overridden")
+
+    def test_a_missing_stderr_is_not_treated_as_fine(self):
+        # Every warning and every failure message in the CLI goes to stderr. A
+        # stderr left as None turns the first warning into an AttributeError,
+        # so "stdout works" is not enough to answer this question.
+        import tempfile
+
+        with tempfile.TemporaryFile("w") as handle:
+            sys.stdout, sys.stderr = handle, None
+            try:
+                if os.name == "nt":
+                    # It has a real console, so it can repair the missing half.
+                    self.assertTrue(winconsole.ensure_output())
+                    self.assertTrue(winconsole.usable(sys.stderr))
+                else:
+                    # Off Windows there is nothing to repair and nothing broken.
+                    self.assertTrue(winconsole.ensure_output())
+            finally:
+                sys.stdout, sys.stderr = sys.__stdout__, sys.__stderr__
+
+    def test_reopening_keeps_a_stream_that_already_works(self):
+        # _reopen must replace only what is broken. Clobbering a working
+        # redirected stdout would defeat the point of the whole module.
+        import tempfile
+
+        with tempfile.TemporaryFile("w") as handle:
+            sys.stdout, sys.stderr = handle, None
+            try:
+                winconsole._reopen()
+                self.assertIs(sys.stdout, handle, "a working stdout was replaced")
+            except OSError:
+                pass  # no console to open CONOUT$ on; the assertion above is the point
+            finally:
+                sys.stdout, sys.stderr = sys.__stdout__, sys.__stderr__
 
     @unittest.skipUnless(os.name == "nt", "Windows-only path")
     def test_a_windows_process_with_a_console_needs_nothing(self):

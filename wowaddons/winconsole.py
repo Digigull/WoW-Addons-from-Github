@@ -57,17 +57,25 @@ def usable(stream) -> bool:
 
 
 def _reopen() -> None:
-    """Point the standard streams at the console we just acquired."""
-    try:
-        sys.stdout = open("CONOUT$", "w", buffering=1, errors="replace")
-        sys.stderr = open("CONOUT$", "w", buffering=1, errors="replace")
-    except OSError:
-        return
-    try:
-        sys.stdin = open("CONIN$", "r")
-    except OSError:
-        # Nothing here reads from stdin; losing it is not worth failing over.
-        pass
+    """Point the standard streams at the console we just acquired.
+
+    Only the ones that need it. A caller can perfectly well redirect stdout and
+    leave stderr behind -- `app.exe list > out.txt` run by a parent that passes
+    a pipe for one and nothing for the other -- and replacing the working half
+    would throw away the redirection this whole module exists to respect.
+    """
+    for name in ("stdout", "stderr"):
+        if not usable(getattr(sys, name, None)):
+            try:
+                setattr(sys, name, open("CONOUT$", "w", buffering=1, errors="replace"))
+            except OSError:
+                pass
+    if not usable(getattr(sys, "stdin", None)):
+        try:
+            sys.stdin = open("CONIN$", "r")
+        except OSError:
+            # Nothing here reads from stdin; losing it is not worth failing over.
+            pass
 
 
 def ensure_output(*, allocate: bool = True) -> bool:
@@ -76,10 +84,14 @@ def ensure_output(*, allocate: bool = True) -> bool:
     A no-op everywhere except a Windows build that has no console, which means
     this can be called unconditionally from the launcher without the launcher
     needing to know how it was packaged.
+
+    Both streams are checked, not just stdout: every warning and every failure
+    message in the CLI goes to stderr, so a stderr left as None turns the first
+    warning into `AttributeError: 'NoneType' object has no attribute 'write'`.
     """
     if os.name != "nt":
         return True
-    if usable(sys.stdout):
+    if usable(sys.stdout) and usable(sys.stderr):
         return True  # case 1: redirected, and redirection must be respected
 
     try:
@@ -91,8 +103,8 @@ def ensure_output(*, allocate: bool = True) -> bool:
 
     if kernel32.AttachConsole(ATTACH_PARENT_PROCESS):  # case 2
         _reopen()
-        return usable(sys.stdout)
+        return usable(sys.stdout) and usable(sys.stderr)
     if allocate and kernel32.AllocConsole():  # case 3
         _reopen()
-        return usable(sys.stdout)
+        return usable(sys.stdout) and usable(sys.stderr)
     return False
