@@ -306,16 +306,77 @@ def rescan(state: dict, root: Path) -> tuple[int, int]:
 # ── sources ──────────────────────────────────────────────────────────────────
 
 
+# What people actually have on the clipboard when they mean "this addon".
+# Ordinary browsing URLs, the clone URLs GitHub offers, and the SSH form.
+REPO_URL = re.compile(
+    r"""^(?:https?://|git@|ssh://git@)?              # scheme, or none at all
+         (?:www\.)?github\.com[/:]                    # the host
+         (?P<owner>[\w.-]+)/(?P<repo>[\w.-]+?)         # the part that matters
+         (?:\.git)?                                    # clone URLs end this way
+         (?:/(?:tree|blob)/(?P<branch>[^/#?]+))?       # browsing a branch
+         /*(?:[#?].*)?$                                # trailing slash, anchor, query
+      """,
+    re.I | re.X,
+)
+BARE_REPO = re.compile(r"^(?P<owner>[\w.-]+)/(?P<repo>[\w.-]+?)(?:\.git)?$")
+
+
+def parse_repo(text: str) -> tuple[str, str | None] | None:
+    """Pull (owner/repo, branch) out of whatever the user pasted.
+
+    Accepts `owner/repo` and every shape of GitHub URL somebody is likely to
+    have copied: the page they were looking at, the green Code button's HTTPS
+    and SSH URLs, and a link to a specific branch. Returns None if it is not a
+    GitHub repository at all -- a CurseForge page, say -- so the caller can say
+    so rather than storing something that will never resolve.
+
+    Telling somebody who just pasted a working URL to retype it as owner/repo is
+    a small insult that this tool has no reason to offer.
+    """
+    text = text.strip()
+    if not text:
+        return None
+    for pattern in (REPO_URL, BARE_REPO):
+        match = pattern.match(text)
+        if match:
+            found = match.groupdict()
+            return f"{found['owner']}/{found['repo']}", found.get("branch")
+    return None
+
+
+def looks_like_a_repo(source: str) -> bool:
+    """Is this a GitHub repository rather than a path, with no prefix to say so?
+
+    `owner/repo` and `some/folder` are the same shape, so the answer cannot come
+    from the text alone. A github.com URL is never a path and is always taken as
+    one. A bare `a/b` is taken as a repo only when it cannot be a path: not
+    rooted, not relative, and not something that exists on this disk.
+
+    When in doubt this says no, and the user gets the "expected local: or
+    github:" message rather than a source that silently means the wrong thing.
+    """
+    if "github.com" in source.lower():
+        return True
+    if source.startswith((".", "/", "~", "\\")) or Path(source).expanduser().exists():
+        return False
+    return BARE_REPO.match(source) is not None
+
+
 def parse_source(source: str) -> tuple[str, str]:
     """'github:owner/repo@branch' -> ('github', 'owner/repo@branch')."""
+    source = source.strip()
     if source == "unmanaged":
         return "unmanaged", ""
+    # A pasted URL has its own colon, so this has to come before the split.
+    if not source.startswith(("local:", "github:")) and looks_like_a_repo(source):
+        return "github", source
     if ":" not in source:
         die(
             f"cannot read source '{source}'. Expected one of:\n"
             "     local:/path/to/folder\n"
             "     github:owner/repo\n"
             "     github:owner/repo@branch\n"
+            "     https://github.com/owner/repo\n"
             "     unmanaged"
         )
     kind, rest = source.split(":", 1)
@@ -337,6 +398,17 @@ def resolve_source(addon: str, source: str) -> tuple[str, str, Path | None]:
     cannot disagree about what a path means.
     """
     kind, rest = parse_source(source)
+    if kind == "github":
+        # `set X github:https://github.com/o/r` is a natural thing to type once
+        # the window accepts a pasted URL, so the CLI should not be pickier.
+        spec, branch = rest.split("@", 1) if "@" in rest else (rest, None)
+        found = parse_repo(spec)
+        if found is None:
+            die(f"cannot see a GitHub repository in '{spec}'.\n"
+                "     Expected owner/repo, or a github.com URL.")
+        repo, url_branch = found
+        branch = branch or url_branch
+        return f"github:{repo}@{branch}" if branch else f"github:{repo}", kind, None
     if kind != "local":
         return source, kind, None
 
@@ -350,7 +422,9 @@ def resolve_source(addon: str, source: str) -> tuple[str, str, Path | None]:
     return f"local:{local_path}", kind, local_path
 
 
-def set_source(state: dict, addon: str, source: str, *, copy: bool = False) -> tuple[dict, Path | None]:
+def set_source(
+    state: dict, addon: str, source: str, *, copy: bool = False, backup: bool | None = None
+) -> tuple[dict, Path | None]:
     """Bind one addon to a source. Returns (entry, local_path)."""
     entries = state.setdefault("addons", {})
     source, kind, local_path = resolve_source(addon, source)
@@ -358,6 +432,8 @@ def set_source(state: dict, addon: str, source: str, *, copy: bool = False) -> t
     entry = entries.setdefault(addon, new_entry(addon))
     entry["source"] = source
     entry["mode"] = "copy" if copy else entry.get("mode", "link")
+    if backup is not None:
+        entry["backup"] = bool(backup)
     entry.pop("suggested", None)
     return entry, local_path
 
@@ -497,13 +573,21 @@ def addon_dirs_in(tree: Path) -> list[tuple[Path, str]]:
     return []
 
 
-def install_zip(blob: bytes, target: Path, dry_run: bool) -> list[str]:
+def install_zip(blob: bytes, target: Path, dry_run: bool, *, backup: bool = False, report=None) -> list[str]:
     """Unpack an addon archive into AddOns. Returns the folder names written.
 
     Under `dry_run` nothing is written but the names are still returned, so a
     caller can report exactly what it would have installed without this needing
     to know how that report is displayed.
+
+    `backup` moves an existing real folder aside instead of deleting it. It is
+    the caller's decision because only the caller knows whether the folder is
+    the user's own or one this tool put there -- see `should_backup`.
+
+    This used to delete unconditionally while the window promised a backup, and
+    somebody lost a hand-installed addon to it. Do not make that true again.
     """
+    report = report or _nothing
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
         try:
@@ -533,13 +617,50 @@ def install_zip(blob: bytes, target: Path, dry_run: bool) -> list[str]:
                 if is_link(destination):
                     remove_link(destination)
                 elif destination.exists():
-                    shutil.rmtree(destination)
+                    displace(destination, backup=backup, report=report)
                 shutil.copytree(folder, destination)
             written.append(name)
         return written
 
 
-def install_local(source_path: Path, target: Path, mode: str, dry_run: bool, *, report=None) -> list[str]:
+def displace(destination: Path, *, backup: bool, report=None) -> None:
+    """Clear a real folder out of the way, keeping it if asked.
+
+    One implementation for both install paths. They used to differ -- a local
+    source moved the folder aside, an archive deleted it outright -- which meant
+    the answer to "will this destroy my addon?" depended on which kind of source
+    you happened to pick, and the window gave the same answer for both.
+    """
+    report = report or _nothing
+    if not backup:
+        report("note", f"replacing {destination.name}")
+        shutil.rmtree(destination)
+        return
+    moved = backup_name(destination)
+    report("note", f"moving existing folder aside -> {moved.name}")
+    destination.rename(moved)
+
+
+def should_backup(entry: dict) -> bool:
+    """Whether this addon's next install should keep what is already there.
+
+    Two rules, and the second is the one that stops `.replaced2`, `.replaced3`
+    piling up in an AddOns folder:
+
+      a user who turned backups off never gets one
+      otherwise, back up only what this tool did not install itself
+
+    Anything with a recorded `installed` version is a folder this tool wrote,
+    so replacing it loses nothing that was not already fetched from the source.
+    A folder with no recorded version is the user's own -- installed by hand,
+    or there before they ever ran this -- and that is worth keeping, once.
+    """
+    if not entry.get("backup", True):
+        return False
+    return not entry.get("installed")
+
+
+def install_local(source_path: Path, target: Path, mode: str, dry_run: bool, *, backup: bool = True, report=None) -> list[str]:
     """Link (or copy) a folder from this disk into AddOns."""
     report = report or _nothing
     if not source_path.is_dir():
@@ -554,11 +675,7 @@ def install_local(source_path: Path, target: Path, mode: str, dry_run: bool, *, 
     if is_link(destination):
         remove_link(destination)
     elif destination.exists():
-        # A real folder here is almost always an older manual copy. Move it
-        # aside rather than delete it: this is the one step that cannot be undone.
-        backup = backup_name(destination)
-        report("note", f"moving existing folder aside -> {backup.name}")
-        destination.rename(backup)
+        displace(destination, backup=backup, report=report)
 
     if mode == "copy":
         shutil.copytree(source_path, destination)
@@ -582,20 +699,40 @@ def backup_name(destination: Path) -> Path:
     return backup
 
 
-def will_displace(entry: dict, root: Path) -> Path | None:
-    """The real folder that binding this entry would move aside, if any.
+def displaced_folder(entry: dict, addon: str, root: Path) -> Path | None:
+    """The real folder this entry's next install would replace, if any.
 
-    A symlink is replaced silently -- it holds no files of its own. A real
-    directory is somebody's manual install and moving it is the one step in
-    this tool that cannot be undone.
+    A link is replaced silently -- it holds no files of its own. A real
+    directory is either somebody's manual install or one this tool wrote, and
+    telling them apart is `should_backup`'s job, not this one's.
+
+    For a `local:` source the folder is named after the SOURCE, because that is
+    what lands in AddOns. For `github:` the archive's contents are unknowable
+    until it is downloaded, so the addon's own name is the best guess.
     """
     source = entry.get("source", "unmanaged")
-    if not source.startswith("local:"):
+    if source.startswith("local:"):
+        destination = root / Path(source[len("local:"):]).name
+    elif source.startswith("github:"):
+        destination = root / addon
+    else:
         return None
-    destination = root / Path(source[len("local:"):]).name
     if destination.exists() and not is_link(destination):
-        return backup_name(destination)
+        return destination
     return None
+
+
+def will_displace(entry: dict, root: Path, addon: str = "") -> Path | None:
+    """Where the displaced folder would be moved to, or None if nothing is kept.
+
+    None now means two different things -- nothing is at risk, or it is about to
+    be deleted rather than kept -- so callers that need to warn should ask
+    `displaced_folder` as well.
+    """
+    destination = displaced_folder(entry, addon, root)
+    if destination is None or not should_backup(entry):
+        return None
+    return backup_name(destination)
 
 
 # ── updating one addon ───────────────────────────────────────────────────────
@@ -665,7 +802,9 @@ def update_addon(
             # straight from disk.
             mode = entry.get("mode", "link")
             progress("installing", rest)
-            result.folders = install_local(Path(rest), root, mode, dry_run, report=report)
+            result.folders = install_local(
+                Path(rest), root, mode, dry_run, backup=should_backup(entry), report=report
+            )
             result.version = "linked" if mode == "link" else "copied"
             result.detail = (f"would {mode} from {rest}" if dry_run else f"{mode}ed from {rest}")
             if not dry_run:
@@ -687,7 +826,7 @@ def update_addon(
         progress("downloading", f"{rest} {version}")
         blob = download(url)
         progress("installing", rest)
-        result.folders = install_zip(blob, root, dry_run)
+        result.folders = install_zip(blob, root, dry_run, backup=should_backup(entry), report=report)
         if not dry_run:
             entry["folders"] = result.folders
             entry["installed"] = version

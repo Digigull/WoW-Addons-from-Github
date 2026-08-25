@@ -115,6 +115,9 @@ def cmd_list(args, state: dict) -> None:
         entry = entries[name]
         source = entry.get("source", "unmanaged")
         installed = entry.get("installed") or entry.get("toc_version") or ""
+        latest = entry.get("latest")
+        if latest and latest != entry.get("installed"):
+            installed = f"{installed} -> {latest}"
         flags = []
         if entry.get("missing"):
             flags.append("NOT INSTALLED")
@@ -125,7 +128,10 @@ def cmd_list(args, state: dict) -> None:
 
 
 def cmd_set(args, state: dict) -> None:
-    entry, local_path = core.set_source(state, args.addon, args.source, copy=args.copy)
+    backup = False if args.no_backup else (True if args.backup else None)
+    entry, local_path = core.set_source(
+        state, args.addon, args.source, copy=args.copy, backup=backup
+    )
     core.save(state)
 
     step(f"{args.addon} -> {core.tilde(entry['source'])}")
@@ -135,6 +141,8 @@ def cmd_set(args, state: dict) -> None:
         warn(f"that folder is named {local_path.name}, so it installs as that, not as {args.addon}.")
     if local_path is not None and entry["mode"] == "link":
         note("linked, so `git pull` in that folder is the whole update.")
+    if not entry.get("backup", True):
+        note("backups off: an existing folder is replaced outright.")
     note("Run:  addons.py update " + args.addon)
 
 
@@ -242,6 +250,12 @@ def build_parser(prog: str = "addons.py", epilog: str | None = None) -> argparse
     p.add_argument("addon")
     p.add_argument("source", help="local:/path | github:owner/repo | github:owner/repo@branch | unmanaged")
     p.add_argument("--copy", action="store_true", help="copy real files instead of symlinking (local: only)")
+    # A folder this tool installed is replaced without a copy either way; these
+    # only decide what happens to files it did not put there.
+    p.add_argument("--no-backup", action="store_true",
+                   help="replace an existing folder outright instead of keeping a copy")
+    p.add_argument("--backup", action="store_true",
+                   help="keep a copy of an existing folder as <Name>.replaced (the default)")
     p.set_defaults(func=cmd_set)
 
     p = sub.add_parser("accept", help="take every source that scan suggested")

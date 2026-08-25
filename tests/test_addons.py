@@ -20,6 +20,7 @@ whose failure would be silent:
 import io
 import os
 import pathlib
+import shutil
 import sys
 import tempfile
 import unittest
@@ -504,6 +505,181 @@ class WhereTheManifestLives(unittest.TestCase):
                 self.assertIsNone(addons.load(windows=False)["addons_dir"])
             finally:
                 addons.MANIFEST, addons.LEGACY_WINDOWS_MANIFEST = new, old_legacy
+
+
+class ReplacingWhatIsAlreadyThere(unittest.TestCase):
+    """What happens to files that are already in AddOns, for BOTH source kinds.
+
+    Reported from a real Debian install: the user bound an addon to a GitHub
+    repo, the window told them the folder would be moved to `<Name>.replaced`,
+    they updated, and there was no such folder anywhere. There never had been.
+
+    install_zip deleted with shutil.rmtree and install_local renamed, so the
+    answer to "will this destroy my addon?" depended on which kind of source you
+    happened to pick -- while the window gave the same answer for both. These
+    tests exist so that can never diverge again.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name) / "AddOns"
+        self.root.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def hand_installed(self, name="MyAddon"):
+        """A folder the user put there themselves, with something worth keeping."""
+        folder = self.root / name
+        folder.mkdir()
+        (folder / f"{name}.toc").write_text("## Title: mine")
+        (folder / "settings.lua").write_text("years of config")
+        return folder
+
+    def source_checkout(self, name="MyAddon"):
+        checkout = pathlib.Path(self.tmp.name) / "src" / name
+        checkout.mkdir(parents=True)
+        (checkout / f"{name}.toc").write_text("## Title: from the repo")
+        return checkout
+
+    # -- the bug ------------------------------------------------------------
+
+    def test_an_archive_install_keeps_what_it_replaces(self):
+        # The regression. This used to rmtree the folder outright.
+        self.hand_installed()
+        entry = {"source": "github:o/r", "mode": "link", "installed": None, "folders": []}
+        addons.install_zip(
+            mkzip({"MyAddon/MyAddon.toc": "new"}), self.root, dry_run=False,
+            backup=addons.should_backup(entry),
+        )
+        kept = self.root / "MyAddon.replaced"
+        self.assertTrue(kept.is_dir(), "the user's folder was deleted, not kept")
+        self.assertEqual((kept / "settings.lua").read_text(), "years of config")
+        self.assertTrue((self.root / "MyAddon" / "MyAddon.toc").is_file())
+
+    def test_both_source_kinds_agree_about_keeping_files(self):
+        # The point is not that each is right in isolation; it is that they
+        # answer the same question the same way.
+        for kind in ("archive", "local"):
+            with self.subTest(kind=kind):
+                for stale in self.root.iterdir():
+                    shutil.rmtree(stale) if stale.is_dir() and not stale.is_symlink() else stale.unlink()
+                self.hand_installed()
+                entry = {"installed": None, "backup": True}
+                if kind == "archive":
+                    addons.install_zip(mkzip({"MyAddon/MyAddon.toc": "new"}), self.root,
+                                       dry_run=False, backup=addons.should_backup(entry))
+                else:
+                    addons.install_local(self.source_checkout(), self.root, "copy",
+                                         dry_run=False, backup=addons.should_backup(entry))
+                self.assertTrue((self.root / "MyAddon.replaced" / "settings.lua").is_file(),
+                                f"{kind} did not keep the user's files")
+
+    # -- backing up once, not every time ------------------------------------
+
+    def test_a_folder_this_tool_installed_is_replaced_without_a_copy(self):
+        # The complaint that started this: .replaced2, .replaced3 piling up.
+        # Anything with a recorded version came from the source, so there is
+        # nothing of the user's in it to keep.
+        self.assertFalse(addons.should_backup({"installed": "v1"}))
+        self.assertTrue(addons.should_backup({"installed": None}))
+
+    def test_repeated_copy_updates_do_not_accumulate_backups(self):
+        self.hand_installed()
+        checkout = self.source_checkout()
+        entry = {"source": f"local:{checkout}", "mode": "copy", "installed": None, "folders": []}
+
+        for _ in range(4):
+            addons.update_addon("MyAddon", entry, self.root)
+
+        kept = sorted(p.name for p in self.root.iterdir() if ".replaced" in p.name)
+        self.assertEqual(kept, ["MyAddon.replaced"], f"backups accumulated: {kept}")
+        self.assertEqual((self.root / "MyAddon.replaced" / "settings.lua").read_text(),
+                         "years of config", "the ONE kept copy must be the user's original")
+
+    def test_turning_the_backup_off_replaces_outright(self):
+        self.hand_installed()
+        entry = {"source": "github:o/r", "mode": "link", "installed": None,
+                 "folders": [], "backup": False}
+        self.assertFalse(addons.should_backup(entry))
+        addons.install_zip(mkzip({"MyAddon/MyAddon.toc": "new"}), self.root,
+                           dry_run=False, backup=addons.should_backup(entry))
+        self.assertEqual([p.name for p in self.root.iterdir() if "replaced" in p.name], [])
+        self.assertTrue((self.root / "MyAddon" / "MyAddon.toc").is_file())
+
+    # -- what the window is told --------------------------------------------
+
+    def test_the_warning_matches_what_actually_happens(self):
+        """displaced_folder and should_backup are what the dialog asks.
+
+        The original bug was the window promising one thing while core did
+        another, so these must be answered from the same place the install is.
+        """
+        self.hand_installed()
+        for source in ("github:o/r", None):
+            entry = {"source": source or f"local:{self.source_checkout()}", "installed": None}
+            with self.subTest(source=entry["source"]):
+                doomed = addons.displaced_folder(entry, "MyAddon", self.root)
+                self.assertIsNotNone(doomed, "the window would have shown no warning")
+                self.assertEqual(doomed.name, "MyAddon")
+                self.assertEqual(addons.will_displace(entry, self.root, "MyAddon").name,
+                                 "MyAddon.replaced")
+
+    def test_nothing_is_promised_when_nothing_will_be_kept(self):
+        self.hand_installed()
+        entry = {"source": "github:o/r", "installed": None, "backup": False}
+        self.assertIsNotNone(addons.displaced_folder(entry, "MyAddon", self.root),
+                             "a folder IS about to be destroyed")
+        self.assertIsNone(addons.will_displace(entry, self.root, "MyAddon"),
+                          "but nothing is kept, so nothing may be promised")
+
+
+class PastingARepoAddress(unittest.TestCase):
+    """Whatever is on the clipboard when somebody means "this addon".
+
+    Reported from a real install: pasting the repository URL was refused and
+    demanded owner/repo. Telling somebody who just pasted a working link to
+    retype it by hand is a small insult with no reason behind it.
+    """
+
+    def test_the_shapes_people_actually_paste(self):
+        for text, expected in [
+            ("tullamods/Bagnon", ("tullamods/Bagnon", None)),
+            ("https://github.com/tullamods/Bagnon", ("tullamods/Bagnon", None)),
+            ("https://github.com/tullamods/Bagnon/", ("tullamods/Bagnon", None)),
+            ("https://github.com/tullamods/Bagnon.git", ("tullamods/Bagnon", None)),
+            ("http://www.github.com/tullamods/Bagnon", ("tullamods/Bagnon", None)),
+            ("github.com/tullamods/Bagnon", ("tullamods/Bagnon", None)),
+            ("git@github.com:tullamods/Bagnon.git", ("tullamods/Bagnon", None)),
+            ("  https://github.com/tullamods/Bagnon  ", ("tullamods/Bagnon", None)),
+            ("https://github.com/tullamods/Bagnon#readme", ("tullamods/Bagnon", None)),
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(addons.parse_repo(text), expected)
+
+    def test_a_branch_in_the_url_is_kept(self):
+        # Somebody browsing a branch and copying the address means that branch.
+        self.assertEqual(addons.parse_repo("https://github.com/Questie/Questie/tree/develop"),
+                         ("Questie/Questie", "develop"))
+        self.assertEqual(addons.parse_repo("https://github.com/o/r/blob/main"), ("o/r", "main"))
+
+    def test_things_that_are_not_a_github_repo_are_refused(self):
+        # Refused, not mangled: storing a CurseForge page as owner/repo would
+        # produce a source that can never resolve, and a confusing 404 later.
+        for text in ("https://curseforge.com/wow/addons/bagnon", "not a repo",
+                     "https://gitlab.com/o/r", "", "   "):
+            with self.subTest(text=text):
+                self.assertIsNone(addons.parse_repo(text))
+
+    def test_a_pasted_url_survives_being_set_as_a_source(self):
+        state = {"addons": {}}
+        entry, _ = addons.set_source(state, "Bagnon", "github:https://github.com/tullamods/Bagnon")
+        self.assertEqual(entry["source"], "github:tullamods/Bagnon")
+
+    def test_a_pasted_branch_url_survives_too(self):
+        state = {"addons": {}}
+        entry, _ = addons.set_source(state, "Questie", "github:https://github.com/Questie/Questie/tree/develop")
+        self.assertEqual(entry["source"], "github:Questie/Questie@develop")
 
 
 if __name__ == "__main__":

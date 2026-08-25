@@ -98,14 +98,16 @@ class SourceDialog(tk.Toplevel):
 
     # Every tk variable this dialog owns. Named once, so destroy() cannot drift
     # out of step with __init__.
-    VARIABLES = ("choice", "local", "repo", "branch", "track", "copy")
+    VARIABLES = ("choice", "local", "repo", "branch", "track", "copy", "backup")
 
     def __init__(self, parent, addon: str, entry: dict, root: Path):
         super().__init__(parent)
         self.title(f'Source for "{addon}"')
         self.addon = addon
         self.addons_root = root
+        self.entry = entry
         self.result: tuple[str, bool] | None = None
+        self.keep_backup = entry.get("backup", True)
         self.transient(parent)
         self.resizable(False, False)
 
@@ -118,6 +120,7 @@ class SourceDialog(tk.Toplevel):
         self.branch = tk.StringVar()
         self.track = tk.BooleanVar(value=False)
         self.copy = tk.BooleanVar(value=entry.get("mode") == "copy")
+        self.backup = tk.BooleanVar(value=entry.get("backup", True))
 
         if source.startswith("local:"):
             self.choice.set("local")
@@ -184,7 +187,12 @@ class SourceDialog(tk.Toplevel):
                         command=self._sync).grid(row=2, column=0, sticky="w", **pad)
         self.repo_entry = ttk.Entry(body, textvariable=self.repo, width=44)
         self.repo_entry.grid(row=2, column=1, sticky="ew", **pad)
-        ttk.Label(body, text="owner/repo", foreground="grey").grid(row=2, column=2, sticky="w", **pad)
+        self.repo_entry.bind("<KeyRelease>", self._absorb_url)
+        ttk.Label(body, text="or a github.com link", foreground="grey").grid(
+            row=2, column=2, sticky="w", **pad)
+
+        self.repo_hint = ttk.Label(body, text="", foreground="grey")
+        self.repo_hint.grid(row=3, column=2, sticky="w", **pad)
 
         track = ttk.Frame(body)
         track.grid(row=3, column=1, sticky="w", **pad)
@@ -196,18 +204,48 @@ class SourceDialog(tk.Toplevel):
         ttk.Radiobutton(body, text="Leave unmanaged", value="unmanaged", variable=self.choice,
                         command=self._sync).grid(row=4, column=0, sticky="w", **pad)
 
+        # Applies to both source types, so it sits outside the radio group.
+        self.backup_box = ttk.Checkbutton(
+            body,
+            text="keep a copy of files I installed myself, the first time they are replaced",
+            variable=self.backup,
+            command=self._show_caution,
+        )
+        self.backup_box.grid(row=5, column=0, columnspan=3, sticky="w", **pad)
+
         if suggested:
             ttk.Label(body, text=f"This addon's .toc suggests {suggested}", foreground="grey").grid(
-                row=5, column=0, columnspan=3, sticky="w", **pad)
+                row=6, column=0, columnspan=3, sticky="w", **pad)
 
-        self.caution = ttk.Label(body, text="", foreground="#a05000", wraplength=460, justify="left")
-        self.caution.grid(row=6, column=0, columnspan=3, sticky="w", **pad)
+        self.caution = ttk.Label(body, text="", foreground="#a05000", wraplength=480, justify="left")
+        self.caution.grid(row=7, column=0, columnspan=3, sticky="w", **pad)
 
         buttons = ttk.Frame(body)
-        buttons.grid(row=7, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        buttons.grid(row=8, column=0, columnspan=3, sticky="e", pady=(10, 0))
         ttk.Button(buttons, text="Cancel", command=self._cancel).grid(row=0, column=0, padx=4)
         ttk.Button(buttons, text="Save", command=self._save).grid(row=0, column=1, padx=4)
         body.columnconfigure(1, weight=1)
+
+    def _absorb_url(self, *_a) -> None:
+        """Show what a pasted URL was understood as, while it is being pasted.
+
+        Silently accepting a URL and only revealing the interpretation after
+        Save leaves somebody guessing whether it took the branch they meant.
+        """
+        if self.repo is None:
+            return
+        text = self.repo.get()
+        found = core.parse_repo(text)
+        if found is None:
+            self.repo_hint.configure(text="not a GitHub repository" if text.strip() else "")
+            return
+        repo, branch = found
+        if branch and not self.track.get():
+            # The URL named a branch; reflect that rather than dropping it.
+            self.track.set(True)
+            self.branch.set(branch)
+            self._sync()
+        self.repo_hint.configure(text=f"→ {repo}" + (f" @ {branch}" if branch else ""))
 
     def _sync(self, *_a) -> None:
         """Grey out whatever the current choice does not use."""
@@ -224,44 +262,62 @@ class SourceDialog(tk.Toplevel):
         self.branch_entry.configure(state="normal" if choice == "github" and self.track.get() else "disabled")
         self._show_caution()
 
-    def _displaced(self) -> tuple[str, Path] | None:
-        """(folder name, where it would be moved to), or None if nothing is at risk.
-
-        The folder that actually gets displaced is named after the SOURCE, not
-        after the addon: binding "OldThing" to a checkout called OldThing-fork
-        installs OldThing-fork, because the client matches folder name to the
-        .toc inside and renaming on the way in would break it. Warning about
-        the wrong folder would be worse than not warning at all.
-        """
-        if self.choice is None:
-            return None
-        choice = self.choice.get()
-        if choice == "unmanaged":
-            return None
+    def _provisional(self) -> dict:
+        """The entry this dialog would save, for asking core what it would do."""
+        choice = self.choice.get() if self.choice is not None else "unmanaged"
         if choice == "local":
             path = self.local.get().strip()
-            if not path:
-                return None
-            backup = core.will_displace({"source": f"local:{path}"}, self.addons_root)
-            return (Path(path).name, backup) if backup else None
-
-        # github: which folders the archive contains is not knowable until it
-        # has been downloaded, so the addon's own name is the best guess going.
-        existing = self.addons_root / self.addon
-        if existing.exists() and not core.is_link(existing):
-            return self.addon, core.backup_name(existing)
-        return None
+            source = f"local:{path}" if path else "unmanaged"
+        elif choice == "github":
+            source = "github:owner/repo"  # only the scheme matters here
+        else:
+            source = "unmanaged"
+        return {
+            "source": source,
+            "backup": bool(self.backup.get()) if self.backup is not None else True,
+            # Carried through, because it is what decides whether a folder is
+            # this tool's to replace or the user's to keep.
+            "installed": self.entry.get("installed"),
+        }
 
     def _show_caution(self, *_a) -> None:
-        displaced = self._displaced()
-        if displaced is None:
+        """Say what will happen to files that are already there -- accurately.
+
+        Accurately is the whole point. This used to promise a backup for every
+        source type while archive installs deleted outright, and somebody lost
+        a hand-installed addon to the difference. It now asks core the same
+        questions core will ask itself.
+        """
+        if self.choice is None:
+            return
+        entry = self._provisional()
+        doomed = core.displaced_folder(entry, self.addon, self.addons_root)
+        if doomed is None:
             self.caution.configure(text="")
             return
-        name, backup = displaced
-        self.caution.configure(
-            text=f"⚠  {name} is real files in your AddOns folder right now. "
-                 f"Updating it will move that folder aside to {backup.name} rather than delete it."
-        )
+
+        if entry.get("installed"):
+            # This tool wrote that folder, so replacing it loses nothing the
+            # source cannot fetch again. Warning here would put a red line on
+            # every routine update, which is how people learn to ignore the
+            # warning that matters.
+            self.caution.configure(text="")
+            return
+
+        if core.should_backup(entry):
+            kept = core.backup_name(doomed)
+            self.caution.configure(
+                foreground="#a05000",
+                text=f"⚠  {doomed.name} is real files in your AddOns folder right now, and "
+                     f"this tool did not put them there. They will be moved aside to "
+                     f"{kept.name} — once. Later updates replace it without another copy.",
+            )
+        else:
+            self.caution.configure(
+                foreground="#b00020",
+                text=f"⚠  {doomed.name} is real files this tool did not install, and the "
+                     f"backup is switched off — they will be DELETED, not kept.",
+            )
 
     def _browse(self) -> None:
         chosen = filedialog.askdirectory(title=f"Folder holding {self.addon}", parent=self)
@@ -271,6 +327,7 @@ class SourceDialog(tk.Toplevel):
 
     def _save(self) -> None:
         choice = self.choice.get()
+        self.keep_backup = bool(self.backup.get())
         if choice == "unmanaged":
             self.result = ("unmanaged", False)
         elif choice == "local":
@@ -280,12 +337,25 @@ class SourceDialog(tk.Toplevel):
                 return
             self.result = (f"local:{path}", self.copy.get())
         else:
-            repo = self.repo.get().strip().strip("/")
-            if repo.count("/") != 1 or not all(repo.split("/")):
-                messagebox.showerror("Not a repo", "Write the repo as owner/repo.", parent=self)
+            # Whatever they pasted: owner/repo, the page URL, the clone URL, the
+            # SSH one, or a link to a branch. Telling somebody who just pasted a
+            # working URL to retype it by hand is a small insult.
+            found = core.parse_repo(self.repo.get())
+            if found is None:
+                messagebox.showerror(
+                    "Not a GitHub repository",
+                    "Paste a github.com link, or write it as owner/repo.\n\n"
+                    "Both of these work:\n"
+                    "    tullamods/Bagnon\n"
+                    "    https://github.com/tullamods/Bagnon",
+                    parent=self,
+                )
                 return
-            branch = self.branch.get().strip()
-            self.result = (f"github:{repo}@{branch}" if self.track.get() and branch else f"github:{repo}", False)
+            repo, url_branch = found
+            typed = self.branch.get().strip()
+            # A branch in the pasted URL counts as asking to track it.
+            branch = typed if (self.track.get() and typed) else (url_branch or "")
+            self.result = (f"github:{repo}@{branch}" if branch else f"github:{repo}", False)
         self.destroy()
 
     def _cancel(self) -> None:
@@ -318,7 +388,7 @@ class SourceDialog(tk.Toplevel):
 
 
 class App(ttk.Frame):
-    COLUMNS = ("source", "installed", "status")
+    COLUMNS = ("source", "installed", "latest", "status")
 
     def __init__(self, master: tk.Tk):
         super().__init__(master, padding=10)
@@ -326,7 +396,8 @@ class App(ttk.Frame):
         self.state = core.load()
         self.outbox: queue.Queue = queue.Queue()
         self.worker: _Worker | None = None
-        self.failures = self.updated = 0
+        self.failures = self.updated = self.outdated = 0
+        self.checking = False
 
         # The version belongs where a user can read it off without hunting: a
         # GUI has no --version, and "which build are you running?" is the first
@@ -396,11 +467,13 @@ class App(ttk.Frame):
         self.tree.heading("#0", text="Addon", anchor="w")
         self.tree.heading("source", text="Source", anchor="w")
         self.tree.heading("installed", text="Installed", anchor="w")
+        self.tree.heading("latest", text="Latest", anchor="w")
         self.tree.heading("status", text="Status", anchor="w")
         self.tree.column("#0", width=200, minwidth=120)
         self.tree.column("source", width=280, minwidth=140)
         self.tree.column("installed", width=100, minwidth=70, anchor="w")
-        self.tree.column("status", width=180, minwidth=100)
+        self.tree.column("latest", width=100, minwidth=70, anchor="w")
+        self.tree.column("status", width=170, minwidth=100)
         self.tree.grid(row=0, column=0, sticky="nsew")
         self.tree.bind("<Double-1>", lambda _e: self.set_source())
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self._sync_buttons())
@@ -424,12 +497,14 @@ class App(ttk.Frame):
         self.source_button.grid(row=0, column=1, padx=4)
         self.accept_button = ttk.Button(buttons, text="Accept suggestion", command=self.accept_suggestion)
         self.accept_button.grid(row=0, column=2, padx=4)
+        self.check_button = ttk.Button(buttons, text="Check for updates", command=self.check_all)
+        self.check_button.grid(row=0, column=3, padx=4)
         self.update_button = ttk.Button(buttons, text="Update selected", command=self.update_selected)
-        self.update_button.grid(row=0, column=3, padx=4)
+        self.update_button.grid(row=0, column=4, padx=4)
         self.update_all_button = ttk.Button(buttons, text="Update all", command=self.update_all)
-        self.update_all_button.grid(row=0, column=4, padx=4)
+        self.update_all_button.grid(row=0, column=5, padx=4)
         self.cancel_button = ttk.Button(buttons, text="Stop", command=self.cancel, state="disabled")
-        self.cancel_button.grid(row=0, column=5, padx=4)
+        self.cancel_button.grid(row=0, column=6, padx=4)
 
         status = ttk.Frame(self)
         status.grid(row=3, column=0, sticky="ew")
@@ -488,6 +563,9 @@ class App(ttk.Frame):
                 values=(
                     UNMANAGED_LABEL if source == "unmanaged" else core.tilde(source),
                     entry.get("installed") or entry.get("toc_version") or "",
+                    # Remembered from the last check, so the column is not blank
+                    # every time the window opens.
+                    entry.get("latest") or "",
                     status,
                 ),
                 tags=tags,
@@ -504,6 +582,7 @@ class App(ttk.Frame):
         suggests = any(entries.get(n, {}).get("suggested") for n in self.tree.selection())
         for button, state in (
             (self.rescan_button, "disabled" if running else "normal"),
+            (self.check_button, "disabled" if running else "normal"),
             (self.source_button, one),
             (self.accept_button, "normal" if suggests and not running else "disabled"),
             (self.update_button, one),
@@ -566,7 +645,8 @@ class App(ttk.Frame):
         if dialog.result is None:
             return
         source, copy = dialog.result
-        if self.guard(lambda: core.set_source(self.state, name, source, copy=copy)) is None:
+        keep = dialog.keep_backup
+        if self.guard(lambda: core.set_source(self.state, name, source, copy=copy, backup=keep)) is None:
             return
         core.save(self.state)
         self.refresh()
@@ -596,7 +676,16 @@ class App(ttk.Frame):
     def update_all(self) -> None:
         self.start(sorted(self.entries(), key=str.lower))
 
-    def start(self, names: list[str]) -> None:
+    def check_all(self) -> None:
+        """Ask every bound addon what the latest version is. Download nothing.
+
+        The point of a separate button: seeing what is out of date should not
+        commit you to installing it, and on a slow connection an unwanted
+        `Update all` is not something you can take back.
+        """
+        self.start(sorted(self.entries(), key=str.lower), check=True)
+
+    def start(self, names: list[str], *, check: bool = False) -> None:
         if self.worker is not None and self.worker.is_alive():
             return
         root = self.root_dir()
@@ -616,11 +705,13 @@ class App(ttk.Frame):
                 self.tree.item(name, tags=["busy"])
         self.failures = 0
         self.updated = 0
+        self.checking = check
+        self.outdated = 0
         self.progress.configure(maximum=len(names), value=0)
         self.counter.configure(text=f"0/{len(names)}")
-        self.say("Working…")
+        self.say("Checking…" if check else "Working…")
 
-        self.worker = _Worker(names, self.entries(), root, self.outbox)
+        self.worker = _Worker(names, self.entries(), root, self.outbox, check=check)
         self.worker.start()
         self._sync_buttons()
 
@@ -661,9 +752,15 @@ class App(ttk.Frame):
     def _show_result(self, result: core.Result) -> None:
         self.progress.configure(value=self.progress["value"] + 1)
         entry = self.entries().get(result.name, {})
+
+        # Remember what the source said, so Latest survives closing the window.
+        if result.version and not result.failed:
+            entry["latest"] = result.version
+
         if self.tree.exists(result.name):
             self.tree.set(result.name, "source", core.tilde(entry.get("source", "unmanaged")))
             self.tree.set(result.name, "installed", entry.get("installed") or "")
+            self.tree.set(result.name, "latest", entry.get("latest") or "")
             if result.failed:
                 # Per-row failures stay on their row.
                 self.tree.set(result.name, "status", result.detail.splitlines()[0])
@@ -671,23 +768,39 @@ class App(ttk.Frame):
             elif result.outcome == core.UP_TO_DATE:
                 self.tree.set(result.name, "status", "up to date")
                 self.tree.item(result.name, tags=[])
+            elif self.checking:
+                # A check reports; it does not install. Saying "updated" here
+                # would be a lie the Installed column immediately contradicts.
+                self.tree.set(result.name, "status", f"update available: {result.version}")
+                self.tree.item(result.name, tags=["suggested"])
             else:
                 note = "; ".join(m for _l, m in result.notes)
                 self.tree.set(result.name, "status", note or "updated")
                 self.tree.item(result.name, tags=[])
+
         if result.failed:
             self.failures += 1
         elif result.outcome == core.CHANGED:
-            self.updated += 1
+            if self.checking:
+                self.outdated += 1
+            else:
+                self.updated += 1
 
     def _finished(self) -> None:
+        # Saved either way: a check writes no addon files, but the versions it
+        # learned are worth keeping so the Latest column is not blank next time.
         core.save(self.state)
         self.worker = None
         self.counter.configure(text="")
         self.progress.configure(value=0)
         tail = f", {self.failures} failed" if self.failures else ""
-        done = f"Done — {self.updated} updated{tail}."
-        self.say(done + (" Restart the client, or /reload." if self.updated else ""))
+
+        if self.checking:
+            found = f"{self.outdated} update(s) available" if self.outdated else "everything is up to date"
+            self.say(f"Checked — {found}{tail}. Nothing was downloaded.")
+        else:
+            done = f"Done — {self.updated} updated{tail}."
+            self.say(done + (" Restart the client, or /reload." if self.updated else ""))
         self._sync_buttons()
 
 

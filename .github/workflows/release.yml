@@ -117,18 +117,51 @@ jobs:
       # `gh` is already on the runner, so the release needs no third-party
       # action -- which suits a project whose selling point is a small trust
       # surface.
+      # The title, the notes and the pre-release flag are applied whether or not
+      # a release already exists for this tag -- and it usually WILL already
+      # exist, because "Draft a new release" in the web UI is how most people
+      # create the tag in the first place, and that publishes a release the
+      # moment the tag appears.
+      #
+      # This step used to be `gh release view || gh release create`. That reads
+      # as harmless idempotency and is not: when the release was pre-created,
+      # `view` succeeded, `create` was skipped, and the flag and the notes went
+      # with it. v0.3.0 published that way -- assets correct, but untitled, with
+      # no notes, and not marked a pre-release. The assets were the easy part.
+      #
       # --prerelease, deliberately. Both downloads are verified by CI on every
       # build, but neither has been run on real hardware against an actual WoW
       # install. GitHub's "Pre-release" label says exactly that, and it is one
-      # click to promote once somebody has. Drop the flag when that is true.
-      - name: Create the release
+      # click to promote once somebody has. Drop the flag here when that is
+      # true -- and note that re-running this workflow re-asserts it, so a
+      # release promoted by hand would be demoted again.
+      - name: Publish the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 \
-            || gh release create "${GITHUB_REF_NAME}" \
-                 --title "${GITHUB_REF_NAME}" \
-                 --prerelease \
-                 --notes-file .github/release-notes.md
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "release already exists; applying title, notes and pre-release flag"
+            gh release edit "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --prerelease \
+              --notes-file .github/release-notes.md
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --prerelease \
+              --notes-file .github/release-notes.md
+          fi
           gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+
+          # Prove it, rather than trusting the exit codes above. A release with
+          # the right files and none of the right metadata is exactly the
+          # failure this step just had, and it exited 0 at the time.
+          gh release view "${GITHUB_REF_NAME}" --json name,isPrerelease,body \
+            --jq '"title=\(.name) prerelease=\(.isPrerelease) notes=\(.body|length) chars"'
+          published=$(gh release view "${GITHUB_REF_NAME}" --json isPrerelease --jq .isPrerelease)
+          notes=$(gh release view "${GITHUB_REF_NAME}" --json body --jq '.body|length')
+          if [ "$published" != "true" ] || [ "$notes" -lt 100 ]; then
+            echo "::error::the release published without its metadata"
+            exit 1
+          fi

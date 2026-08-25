@@ -9,7 +9,8 @@ There are two ways to use it, over the same engine — a window, or the terminal
 
 ### The window (Linux)
 
-Download the AppImage from [Releases](../../releases), make it executable, and open it.
+Download the AppImage from [the latest release](../../releases/latest), make it executable,
+and open it.
 
 ```
 chmod +x WoW-Addons-from-GitHub-x86_64.AppImage
@@ -31,7 +32,7 @@ anyone is realistically running.
 
 ### The window (Windows)
 
-Download the zip from [Releases](../../releases), unzip it anywhere, and run
+Download the zip from [the latest release](../../releases/latest), unzip it anywhere, and run
 **WoW Addons from GitHub.exe** inside.
 
 No Python, no installer, no registry entries — delete the folder and it is gone. The same
@@ -107,7 +108,11 @@ Running from a checkout instead needs **Python 3.9 or newer**, and that is the w
 `--version` prints the version and exits; the window shows it in the title bar.
 
 Useful flags on `update`: `--check` (report what is out of date, download nothing),
-`--dry-run`, `--force` (reinstall even when the version matches).
+`--dry-run`, `--force` (reinstall even when the version matches). In the window, **Check
+for updates** does the same thing and fills in the **Latest** column without downloading.
+
+Flags on `set`: `--copy` (real files instead of a link), `--no-backup` (replace an
+existing folder outright instead of keeping one copy of it).
 
 ## Sources
 
@@ -116,6 +121,7 @@ Useful flags on `update`: `--check` (report what is out of date, download nothin
 | `local:<path>` | A folder on disk. Installed as a **symlink** by default, so `git pull` in that checkout *is* the update — nothing to reinstall, and the client cannot be running something other than what is checked out. `--copy` for real files instead. |
 | `github:owner/repo` | Latest release, preferring an attached `.zip` and falling back to the source archive. |
 | `github:owner/repo@branch` | That branch's current head, for an addon that does not cut releases. |
+| `https://github.com/owner/repo` | A pasted link works too — the page URL, the clone URL, the SSH one, or a link to a branch, which is taken as `@branch`. |
 | `unmanaged` | Left alone. The default for anything `scan` finds and cannot place. |
 
 `scan` reads each `.toc` for an `X-Website` or `X-Repository` header and *suggests* a GitHub
@@ -143,6 +149,8 @@ Everything the terminal does, in one window:
 - **Accept suggestion** takes what an addon's `.toc` suggested — for the rows you pick,
   on a click you make. It is shown in the Status column and never applied on its own,
   for the same reason `accept` is a separate command in the terminal.
+- **Check for updates** fills the **Latest** column and downloads nothing, so seeing what
+  is out of date does not commit you to installing it.
 - **Update selected** / **Update all** run in the background, so the window stays
   responsive while things download. **Stop** ends the run after the addon in flight
   rather than mid-download, which leaves the manifest agreeing with the disk.
@@ -153,9 +161,15 @@ Everything the terminal does, in one window:
 
 ## Things it will not do to your client
 
-- **It never deletes an addon you already had.** Binding an addon that exists as real files
-  moves the old folder to `<Name>.replaced` first. Nothing inside it matches that name, so
-  the client ignores it; delete it yourself once you are satisfied.
+- **It keeps the first copy of anything you installed yourself.** Binding an addon that
+  exists as real files moves that folder to `<Name>.replaced`, in your AddOns folder,
+  beside the addon. Nothing inside it matches that name, so the client ignores it; delete
+  it yourself once you are satisfied.
+
+  **Once, not every update.** After the first install the folder is one this tool wrote,
+  so later updates replace it directly — no `<Name>.replaced2` piling up. Turn the copy
+  off entirely with `--no-backup`, or the checkbox in the Set-source dialog, and an
+  existing folder is replaced outright.
 - **One failed source does not sink the run.** An unreachable, private or renamed repository
   is reported and skipped — everything else still updates, and the manifest still saves.
 - **Archives containing `../` paths are refused.** This unpacks zips published by third
