@@ -7,3 +7,9 @@ dist/
 
 # The build script's own virtualenv for python-appimage.
 .build-venv/
+
+# Console devices on Windows, ordinary filenames everywhere else. Created by
+# accident, they are reserved names that make `git checkout` refuse the whole
+# repository on Windows.
+CONOUT$
+CONIN$

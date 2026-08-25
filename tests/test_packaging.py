@@ -14,6 +14,7 @@ not. Calling the latter produces an AppImage that starts, prints help, passes a
 CLI smoke test -- and then cannot open a window.
 """
 
+import ast
 import os
 import pathlib
 import re
@@ -23,6 +24,49 @@ import xml.dom.minidom
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 RECIPE = ROOT / "packaging" / "appimage" / "WoW-Addons-from-GitHub"
+
+
+def pyinstaller_flags():
+    """The strings actually passed to PyInstaller, read out of build.py's AST.
+
+    Reading the source as text instead would match the comments that explain
+    these choices as readily as the choices themselves -- which is how the
+    first version of these tests failed, asserting `--onefile` was absent from
+    a file whose docstring says "--onedir, not --onefile".
+    """
+    tree = ast.parse((ROOT / "packaging" / "windows" / "build.py").read_text())
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "run"):
+            continue
+        if not node.args or not isinstance(node.args[0], ast.List):
+            continue
+        strings = [e.value for e in node.args[0].elts if isinstance(e, ast.Constant)
+                   and isinstance(e.value, str)]
+        if "PyInstaller" in strings:
+            return strings
+    raise AssertionError("build.py has no run([...]) call invoking PyInstaller")
+
+
+def code_without_prose(path: pathlib.Path) -> str:
+    """Source with docstrings removed, so a test cannot match an explanation."""
+    tree = ast.parse(path.read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                node.body = body[1:] or [ast.Pass()]
+    return ast.unparse(ast.fix_missing_locations(tree))
+
+
+def load_icon_generator():
+    """Import packaging/make_icon.py by path; it is a script, not a package."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("make_icon", ROOT / "packaging" / "make_icon.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def substitute(text: str, **values) -> str:
@@ -97,12 +141,7 @@ class Recipe(unittest.TestCase):
     def test_the_icon_matches_what_the_generator_draws(self):
         # Regenerating must be a no-op, or the committed icon and the script
         # that claims to draw it have drifted.
-        import importlib.util
-
-        spec = importlib.util.spec_from_file_location(
-            "make_icon", ROOT / "packaging" / "appimage" / "make_icon.py")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = load_icon_generator()
 
         import tempfile
 
@@ -112,7 +151,7 @@ class Recipe(unittest.TestCase):
             self.assertEqual(
                 out.read_bytes(),
                 (RECIPE / "wow-addons-from-github.png").read_bytes(),
-                "re-run packaging/appimage/make_icon.py and commit the result",
+                "re-run packaging/make_icon.py and commit the result",
             )
 
     def test_the_only_requirement_is_the_local_package(self):
@@ -128,6 +167,152 @@ class Recipe(unittest.TestCase):
         document = xml.dom.minidom.parse(str(RECIPE / "wow-addons-from-github.appdata.xml"))
         launchable = document.getElementsByTagName("launchable")[0]
         self.assertEqual(launchable.firstChild.nodeValue, "wow-addons-from-github.desktop")
+
+
+class WindowsIcon(unittest.TestCase):
+    """The .ico PyInstaller embeds. Malformed, the build fails or ships blank.
+
+    Written by hand from zlib and struct, so the format details are ours to get
+    wrong: an entry whose recorded size disagrees with its payload, or a 256
+    that forgot to record itself as 0, both produce a file Windows quietly
+    refuses to draw.
+    """
+
+    ICO = ROOT / "packaging" / "windows" / "wow-addons-from-github.ico"
+
+    def entries(self):
+        data = self.ICO.read_bytes()
+        reserved, kind, count = struct.unpack("<HHH", data[:6])
+        self.assertEqual((reserved, kind), (0, 1), "not an icon directory")
+        found = []
+        for index in range(count):
+            head = data[6 + 16 * index: 6 + 16 * (index + 1)]
+            width, height, palette, _r, planes, bpp, size, offset = struct.unpack("<BBBBHHII", head)
+            found.append({
+                "width": width or 256, "height": height or 256, "palette": palette,
+                "planes": planes, "bpp": bpp, "blob": data[offset:offset + size],
+                "declared": size,
+            })
+        return found
+
+    def test_it_carries_the_sizes_windows_asks_for(self):
+        # 16 is the taskbar and title bar; a 256 scaled down to it turns to mush,
+        # which is the entire reason each size is drawn at its own scale.
+        self.assertEqual(sorted(e["width"] for e in self.entries()), [16, 32, 48, 256])
+
+    def test_every_entry_is_a_png_of_the_size_it_claims(self):
+        for entry in self.entries():
+            self.assertEqual(entry["blob"][:8], b"\x89PNG\r\n\x1a\n", "entry is not a PNG")
+            self.assertEqual(len(entry["blob"]), entry["declared"], "declared size is wrong")
+            width, height = struct.unpack(">ii", entry["blob"][16:24])
+            self.assertEqual((width, height), (entry["width"], entry["height"]),
+                             "the directory and the PNG header disagree")
+
+    def test_entries_describe_full_colour_images(self):
+        for entry in self.entries():
+            self.assertEqual(entry["bpp"], 32)
+            self.assertEqual(entry["planes"], 1)
+            self.assertEqual(entry["palette"], 0, "0 means not paletted")
+
+    def test_the_icons_match_what_the_generator_draws(self):
+        module = load_icon_generator()
+        self.assertEqual(
+            module.ico_bytes({size: module.png_bytes(module.render(size)) for size in module.ICO_SIZES}),
+            self.ICO.read_bytes(),
+            "re-run packaging/make_icon.py and commit the result",
+        )
+
+    def test_both_platforms_are_drawn_from_one_script(self):
+        # If these ever came from separate sources the two builds would drift
+        # into looking like different programs.
+        source = (ROOT / "packaging" / "make_icon.py").read_text()
+        self.assertIn("PNG_PATH", source)
+        self.assertIn("ICO_PATH", source)
+
+
+class WindowsBuild(unittest.TestCase):
+    BUILD = ROOT / "packaging" / "windows" / "build.py"
+
+    def test_it_builds_a_folder_rather_than_a_single_file(self):
+        # A one-file build is a self-extracting archive, which is what a lot of
+        # malware looks like, so heuristic antivirus flags it far more often.
+        flags = pyinstaller_flags()
+        self.assertIn("--onedir", flags)
+        self.assertNotIn("--onefile", flags)
+
+    def test_it_is_windowed_so_double_clicking_opens_a_window(self):
+        self.assertIn("--windowed", pyinstaller_flags())
+
+    def test_it_names_the_lazily_imported_gui_module(self):
+        # wowaddons.gui is imported inside a function, inside a try/except, so a
+        # missing Tk degrades to a message. That is invisible to a static
+        # analyser: without the hidden import the build succeeds and the .exe
+        # has no window at all.
+        flags = pyinstaller_flags()
+        self.assertIn("wowaddons.gui", flags)
+        self.assertIn("tkinter", flags)
+        self.assertEqual(flags.count("--hidden-import"), 2)
+
+    def test_the_entry_point_does_not_reuse_the_checkout_launcher(self):
+        # addons.py exists to put the repo root on sys.path, which is precisely
+        # wrong inside a frozen build, where the package is already bundled.
+        entry = code_without_prose(ROOT / "packaging" / "windows" / "entry.py")
+        self.assertIn("from wowaddons.__main__ import main", entry)
+        self.assertNotIn("sys.path", entry)
+
+
+class NothingWindowsCannotCheckOut(unittest.TestCase):
+    """No tracked path may be a name Windows reserves for a device.
+
+    This is not a style rule. `git checkout` on Windows refuses a repository
+    containing one, with "invalid path 'CONOUT$'" and nothing else -- not the
+    file, the whole clone. Every Windows contributor and every Windows CI job
+    fails at checkout, before a single test runs.
+
+    It happened here: a test called winconsole._reopen() off Windows, where
+    CONOUT$ is an ordinary filename rather than a console device, and the empty
+    file it left behind was committed.
+    """
+
+    # Device names MS-DOS reserved and Windows still honours, plus the console
+    # handles. Reserved with any extension, and case-insensitively.
+    RESERVED = {
+        "con", "prn", "aux", "nul", "conout$", "conin$",
+        *(f"com{n}" for n in range(1, 10)),
+        *(f"lpt{n}" for n in range(1, 10)),
+    }
+
+    def tracked_paths(self):
+        import subprocess
+
+        result = subprocess.run(
+            ["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, text=True, check=False
+        )
+        if result.returncode != 0:
+            self.skipTest("not a git checkout")
+        return [p for p in result.stdout.split("\0") if p]
+
+    def test_no_tracked_path_uses_a_reserved_device_name(self):
+        paths = self.tracked_paths()
+        self.assertTrue(paths, "git ls-files returned nothing")
+        offenders = [
+            path
+            for path in paths
+            for part in pathlib.PurePosixPath(path).parts
+            if part.split(".")[0].lower() in self.RESERVED
+        ]
+        self.assertEqual(offenders, [], "these break `git checkout` on Windows")
+
+    def test_no_tracked_path_uses_a_character_windows_forbids(self):
+        # Same failure mode, different cause: a colon or a trailing dot in a
+        # tracked name makes the clone impossible to check out on Windows.
+        offenders = [
+            path for path in self.tracked_paths()
+            if set(path) & set('<>:"|?*') or any(
+                part != part.rstrip(" .") for part in pathlib.PurePosixPath(path).parts
+            )
+        ]
+        self.assertEqual(offenders, [], "these break `git checkout` on Windows")
 
 
 class Scripts(unittest.TestCase):

@@ -29,7 +29,19 @@ anyone is realistically running.
 > entirely with `./WoW-Addons-from-GitHub-x86_64.AppImage --appimage-extract-and-run`.
 > That is the whole problem; nothing else about the AppImage needs anything installed.
 
-A Windows `.exe` is next — see [Windows](#windows).
+### The window (Windows)
+
+Download the zip from [Releases](../../releases), unzip it anywhere, and run
+**WoW Addons from GitHub.exe** inside.
+
+No Python, no installer, no registry entries — delete the folder and it is gone. The same
+`.exe` is also the command line: give it arguments and it behaves exactly like the script
+below.
+
+> **Windows will warn you the first time.** The download is not code-signed, so SmartScreen
+> shows "Windows protected your PC". Click **More info → Run anyway**. A signing certificate
+> is the only thing that removes that, and it costs a few hundred dollars a year — not worth
+> it until enough people are using this to justify it.
 
 ### The terminal
 
@@ -40,11 +52,12 @@ python3 addons.py set MyAddon github:someone/MyAddon
 python3 addons.py update
 ```
 
-The CLI stays first-class and is not going anywhere. The AppImage is the same tool: give
-it arguments and it behaves exactly like the script above.
+The CLI stays first-class and is not going anywhere. Both downloads are the same tool:
+give either one arguments and it behaves exactly like the script above.
 
 ```
 ./WoW-Addons-from-GitHub-x86_64.AppImage update --check
+"WoW Addons from GitHub.exe" update --check
 ```
 
 ## Why
@@ -74,8 +87,8 @@ Running from a checkout instead needs **Python 3.9 or newer**, and that is the w
   need Tk, which some distributions package separately: `sudo apt install python3-tk`,
   `sudo dnf install python3-tkinter`, or `sudo pacman -S tk`. Running the tool with no
   arguments tells you which of these you want if it is missing.
-- **Windows:** `winget install Python.Python.3.12`, or python.org — Tk is included. A
-  packaged `.exe` that removes this step is planned — see [Windows](#windows) below.
+- **Windows:** `winget install Python.Python.3.12`, or python.org — Tk is included. The
+  packaged `.exe` removes this step entirely.
 
 ## Commands
 
@@ -180,23 +193,30 @@ types. The two things that used to be Linux-shaped are fixed:
   old manifest under `~/.config\wow-addons\` is read automatically and moves to the new
   location the next time anything is written — you do not need to do anything.
 
-**A packaged `.exe` is the next piece of work.** The window and the engine behind it are
-already done and platform-independent, so what remains is PyInstaller and a release job.
+The packaged `.exe` is built and released alongside the AppImage. It is a **folder in a
+zip**, not a single self-extracting file: one-file builds are what a lot of malware looks
+like, so antivirus flags them far more often, and they unpack to a temp directory on every
+launch.
 
-Worth knowing in advance: an unsigned `.exe` triggers SmartScreen's "Windows protected
-your PC", which only a code-signing certificate removes. The AppImage has no equivalent
-problem, which is why Linux was the honest first release.
+One consequence of building it `--windowed` — which is what makes double-clicking open a
+window instead of a console — is that running it from `cmd` with arguments borrows the
+console you typed into, and `cmd` does not wait for it. Your prompt comes back first and
+the output appears underneath it. That is cosmetic; redirection (`... > out.txt`) works
+normally.
 
 The full design and packaging plan is in [UI-PLAN.md](UI-PLAN.md).
 
 ## Development
 
 ```
-wowaddons/core.py   the engine: manifest, scanning, sources, install. Never prints.
-wowaddons/cli.py    argparse, and the only module that writes to a terminal
-wowaddons/gui.py    the Tkinter window
-addons.py           launcher: the window with no arguments, the CLI with them
-packaging/appimage/ the AppImage recipe and its build script
+wowaddons/core.py        the engine: manifest, scanning, sources, install. Never prints.
+wowaddons/cli.py         argparse, and the only module that writes to a terminal
+wowaddons/gui.py         the Tkinter window
+wowaddons/winconsole.py  how a windowed .exe grows a console when given arguments
+addons.py                launcher: the window with no arguments, the CLI with them
+packaging/make_icon.py   the icon, for both platforms, from one description
+packaging/appimage/      the AppImage recipe, build script and smoke test
+packaging/windows/       the PyInstaller build and its smoke test
 ```
 
 Both front ends call `core.update_addon` for one addon at a time, which is what keeps them
@@ -205,7 +225,7 @@ per front end. Nothing in `core` prints — that is the constraint that makes a 
 possible at all, and it is worth defending.
 
 ```
-python3 -m unittest discover -s tests -t . -v          # 53 tests
+python3 -m unittest discover -s tests -t . -v          # 92 tests
 xvfb-run -a python3 -m unittest discover -s tests -t . # including the window
 ```
 
@@ -221,12 +241,21 @@ rate limit when the real cause was a blocked proxy or a private repository, and 
 AppImage entry point that stops going through the wrapper that sets up Tcl/Tk — which
 would produce a build that passes every check except opening a window.
 
-### Building the AppImage
+### Building the downloads
 
 ```
-packaging/appimage/build.sh
+packaging/appimage/build.sh                                                # Linux
 packaging/appimage/smoke-test.sh dist/WoW-Addons-from-GitHub-x86_64.AppImage
+
+python packaging/windows/build.py                                          # Windows
+python packaging/windows/smoke-test.py "dist/WoW Addons from GitHub"
 ```
+
+PyInstaller only ever builds for the machine it runs on, so the `.exe` comes from CI or
+from a Windows box. Running `packaging/windows/build.py` from a Linux checkout is still
+worth doing: it produces a Linux binary and proves the entry point resolves and that Tk
+and the lazily-imported `wowaddons.gui` were actually collected — the two failures that
+otherwise surface only as a `.exe` with no window.
 
 `build.sh` puts its own tooling in `.build-venv/` and installs nothing into your Python.
 The AppImage itself has no dependencies — `python-appimage` is used to wrap a manylinux

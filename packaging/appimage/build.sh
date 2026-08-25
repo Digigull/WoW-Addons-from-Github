@@ -62,8 +62,10 @@ else
     fi
 fi
 
-# Regenerate the icon so it can never drift from the script that draws it.
-python3 "$HERE/make_icon.py"
+# Regenerate the icon so it can never drift from the script that draws it. The
+# generator lives one level up because it draws the Windows .ico from the same
+# description -- the two builds must not end up looking like different programs.
+python3 "$HERE/../make_icon.py"
 
 # `local+` copies the package tree verbatim, so a developer's stale bytecode
 # would be copied in with it. Cheap to avoid, and it keeps builds identical
