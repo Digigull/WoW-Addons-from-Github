@@ -25,3 +25,28 @@ jobs:
         run: python -m unittest discover -s tests -t . -v
       - name: The CLI at least starts
         run: python addons.py --help
+
+  gui:
+    # The window tests skip themselves when there is no display, which is right
+    # for a developer on a server and useless as CI -- a job where every test
+    # silently skips is a job that reports success for having done nothing. So
+    # this one installs Tk and a display on purpose, and fails if they skip.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The system Python, not setup-python: _tkinter has to be compiled into
+      # the interpreter, and apt's python3-tk only serves the system one.
+      - name: Tk and a display
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq python3-tk xvfb
+      - name: Confirm this Python really has Tk
+        run: python3 -c "import tkinter; print('tk', tkinter.TkVersion)"
+      - name: Window tests
+        run: |
+          set -o pipefail
+          xvfb-run -a python3 -m unittest tests.test_gui -v 2>&1 | tee gui.log
+          if grep -q "skipped" gui.log; then
+            echo "::error::the window tests skipped -- they were supposed to run here"
+            exit 1
+          fi
+      - name: Everything else, with a display present
+        run: xvfb-run -a python3 -m unittest discover -s tests -t . -v

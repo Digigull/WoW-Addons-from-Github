@@ -4,3 +4,6 @@ __pycache__/
 build/
 dist/
 *.spec
+
+# The build script's own virtualenv for python-appimage.
+.build-venv/

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=WoW Addons from GitHub
+GenericName=WoW Addon Updater
+Comment=Update your WoW addons from repositories you choose, and nowhere else
+Exec=wow-addons-from-github
+Icon=wow-addons-from-github
+Categories=Game;Utility;
+Keywords=wow;warcraft;addon;addons;updater;
+Terminal=false

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.digigull.wow-addons-from-github</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>WoW Addons from GitHub</name>
+  <summary>Update your WoW addons from repositories you choose, and nowhere else</summary>
+  <description>
+    <p>
+      Bind each installed World of Warcraft addon to the place its updates should
+      come from -- a GitHub repository, or a folder on your own disk -- and update
+      them all in one click.
+    </p>
+    <p>
+      It contacts exactly the hosts named in your own manifest and nothing else.
+      There is no catalogue, no account and no telemetry of any kind.
+    </p>
+  </description>
+  <launchable type="desktop-id">wow-addons-from-github.desktop</launchable>
+  <categories>
+    <category>Game</category>
+    <category>Utility</category>
+  </categories>
+  <url type="homepage">https://github.com/Digigull/WoW-Addons-from-Github</url>
+  <url type="bugtracker">https://github.com/Digigull/WoW-Addons-from-Github/issues</url>
+  <provides>
+    <binary>wow-addons-from-github</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+</component>

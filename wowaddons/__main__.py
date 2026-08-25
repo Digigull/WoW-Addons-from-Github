@@ -6,13 +6,29 @@ be the GUI: an AppImage is double-clicked far more often than it is typed.
 
 from __future__ import annotations
 
+import os
 import sys
+from pathlib import Path
 
 from . import cli
 
 
-def main(argv: list[str] | None = None, *, prog: str = "addons.py") -> None:
+def invoked_as(default: str = "addons.py") -> str:
+    """What to call this in --help.
+
+    Inside an AppImage the script the user actually typed is the .AppImage
+    file, whose path the runtime puts in $APPIMAGE; argv[0] by then is a path
+    into a mount point under /tmp and would be nonsense in a usage line.
+    """
+    appimage = os.environ.get("APPIMAGE")
+    if appimage:
+        return Path(appimage).name
+    return default
+
+
+def main(argv: list[str] | None = None, *, prog: str | None = None) -> None:
     argv = sys.argv[1:] if argv is None else argv
+    prog = invoked_as() if prog is None else invoked_as(prog)
     if argv:
         cli.main(argv, prog=prog)
         return
