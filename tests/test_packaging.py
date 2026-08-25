@@ -461,6 +461,43 @@ class Releasing(unittest.TestCase):
         self.assertIn("the release published without its metadata", commands)
         self.assertIn("isPrerelease", commands)
 
+    def test_a_release_can_be_rebuilt_without_touching_git(self):
+        """The only repair route for a failed release that a browser can drive.
+
+        The workflow file that runs is the one at the ref you dispatch from, so
+        dispatching main with a tag named rebuilds that tag against a workflow
+        fixed since. Without the input the only repair is deleting and
+        recreating the tag, and a release whose build half-failed cannot be
+        fixed by anyone without a git checkout.
+        """
+        workflow = self.WORKFLOW.read_text()
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertRegex(workflow, r"inputs:\s*\n\s+tag:")
+        for job in ("version-matches-tag", "publish"):
+            self.assertIn(
+                "inputs.tag != ''", self.workflow_jobs()[job],
+                f"job {job!r} still only runs for a tag push, so a dispatch publishes nothing",
+            )
+
+    def test_nothing_names_the_release_after_the_ref_it_ran_from(self):
+        # GITHUB_REF_NAME is "main" on a dispatch. Left anywhere in the publish
+        # job it would create a release literally called main, and upload the
+        # binaries to it.
+        self.assertNotIn(
+            "GITHUB_REF_NAME", self.WORKFLOW.read_text(),
+            "use RELEASE_TAG: a dispatched run would publish a release named after the branch",
+        )
+
+    def test_the_builds_check_out_the_tag_they_are_publishing(self):
+        # Otherwise a dispatched rebuild ships main's code under the tag's name
+        # -- the exact mismatch version-matches-tag exists to prevent.
+        jobs = self.workflow_jobs()
+        for job in ("appimage", "windows", "version-matches-tag", "publish"):
+            self.assertIn(
+                "ref: ${{ inputs.tag }}", jobs[job],
+                f"job {job!r} would build the dispatch ref instead of the tag",
+            )
+
     def test_the_publish_waits_for_the_version_check(self):
         # Otherwise a mismatched tag still publishes; the check would just go
         # red beside it.
