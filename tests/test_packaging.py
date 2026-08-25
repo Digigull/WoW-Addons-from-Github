@@ -141,6 +141,26 @@ class Scripts(unittest.TestCase):
         # any runner or container without FUSE -- which is most of them.
         self.assertIn("APPIMAGE_EXTRACT_AND_RUN=1", (ROOT / "packaging/appimage/build.sh").read_text())
 
+    def test_the_build_packages_the_appdir_itself(self):
+        # python-appimage joins the appimagetool command with spaces and runs it
+        # through a shell without quoting, so an output name containing spaces
+        # -- which ours does, because the desktop Name= belongs in a menu --
+        # gets split into separate arguments and nothing is written. Building
+        # with --no-packaging and invoking appimagetool here avoids trading a
+        # readable menu entry for a working build.
+        script = (ROOT / "packaging/appimage/build.sh").read_text()
+        self.assertIn("--no-packaging", script)
+        self.assertIn("ensure_appimagetool", script)
+
+    def test_the_desktop_name_would_break_the_builders_own_packaging(self):
+        # A guard on the comment above: if Name= ever loses its spaces, the
+        # --no-packaging detour stops being necessary and can be simplified out.
+        name = None
+        for line in (RECIPE / "wow-addons-from-github.desktop").read_text().splitlines():
+            if line.startswith("Name="):
+                name = line[5:].strip()
+        self.assertIn(" ", name, "if this is no longer true, revisit build.sh")
+
     def test_the_build_makes_the_package_importable(self):
         # `local+wowaddons` is resolved with importlib against the build
         # interpreter, so the repo root has to be on the path.

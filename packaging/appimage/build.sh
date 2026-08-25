@@ -73,21 +73,40 @@ find "$ROOT/wowaddons" -name '__pycache__' -type d -prune -exec rm -rf {} +
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+# --no-packaging stops after assembling the AppDir, and we run appimagetool
+# ourselves. That is not a preference: python-appimage builds the appimagetool
+# command line by joining a list with spaces and running it through a shell,
+# without quoting. The output name comes from the desktop file's Name=, which
+# is "WoW Addons from GitHub" because that is what belongs in an applications
+# menu -- and unquoted, the shell splits it into five arguments and appimagetool
+# silently writes nothing. Doing this step here keeps the menu entry readable
+# AND the download name free of spaces, instead of trading one for the other.
 ( cd "$WORK" && "$PY" -m python_appimage build app \
+        --no-packaging \
         --python-version "$PYTHON_VERSION" \
         "$RECIPE" )
 
-# The output is named from the desktop file's Name=, which has spaces in it
-# because that is what belongs in a menu. A download does not want them.
-BUILT="$(find "$WORK" -maxdepth 1 -name '*.AppImage' -print -quit)"
-if [ -z "$BUILT" ]; then
-    echo "build produced no AppImage" >&2
+APPDIR="$(find "$WORK" -maxdepth 1 -mindepth 1 -type d -name "*-$ARCH" -print -quit)"
+if [ -z "$APPDIR" ]; then
+    echo "build produced no AppDir under $WORK" >&2
+    ls -la "$WORK" >&2
     exit 1
 fi
 
+# Reuse python-appimage's fetch so the tool is downloaded and cached once. It
+# returns the AppRun of an already-extracted copy, so this needs no FUSE either.
+APPIMAGETOOL="$("$PY" -c 'from python_appimage.utils.deps import ensure_appimagetool; print(ensure_appimagetool())')"
+
 mkdir -p "$OUT"
 FINAL="$OUT/WoW-Addons-from-GitHub-$ARCH.AppImage"
-mv "$BUILT" "$FINAL"
+rm -f "$FINAL"
+echo "== Packaging $(basename "$APPDIR") -> $(basename "$FINAL")"
+ARCH="$ARCH" "$APPIMAGETOOL" --no-appstream "$APPDIR" "$FINAL"
+
+if [ ! -f "$FINAL" ]; then
+    echo "appimagetool exited cleanly but produced no file" >&2
+    exit 1
+fi
 chmod +x "$FINAL"
 
 echo "== Built $FINAL ($(du -h "$FINAL" | cut -f1))"
