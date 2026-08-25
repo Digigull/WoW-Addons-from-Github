@@ -9,7 +9,8 @@ There are two ways to use it, over the same engine — a window, or the terminal
 
 ### The window (Linux)
 
-Download the AppImage from [Releases](../../releases), make it executable, and open it.
+Download the AppImage from [the latest release](../../releases/latest), make it executable,
+and open it.
 
 ```
 chmod +x WoW-Addons-from-GitHub-x86_64.AppImage
@@ -31,7 +32,7 @@ anyone is realistically running.
 
 ### The window (Windows)
 
-Download the zip from [Releases](../../releases), unzip it anywhere, and run
+Download the zip from [the latest release](../../releases/latest), unzip it anywhere, and run
 **WoW Addons from GitHub.exe** inside.
 
 No Python, no installer, no registry entries — delete the folder and it is gone. The same

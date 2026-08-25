@@ -2,6 +2,26 @@ Update your World of Warcraft addons from repositories **you** choose. No catalo
 account, and no telemetry of any kind — it contacts exactly the hosts named in your own
 manifest and nothing else.
 
+## Fixed since v0.3.0
+
+**If you used v0.3.0, please read this one.** Updating an addon from a GitHub source
+**deleted** the folder that was already there instead of keeping a copy of it — even
+though the window said it would move it aside to `<Name>.replaced`. If you bound an addon
+to a repository on v0.3.0 and had edited anything inside that addon's own folder, it is
+gone. Saved variables normally live in `WTF/Account/…` rather than `Interface/AddOns/`, so
+in most cases nothing of yours was in there — but it is worth a look. v0.3.0 has been
+withdrawn for this reason.
+
+Also in this release:
+
+- **Copies are kept once, not on every update.** Only a folder this tool did not install
+  is kept, so `<Name>.replaced2`, `.replaced3` cannot pile up. A checkbox in the Set-source
+  dialog, or `--no-backup`, turns even the one copy off.
+- **Paste a repository link.** The page URL, the clone URL, the SSH one, or a link to a
+  branch — which is understood as that branch. `owner/repo` still works.
+- **Check for updates**, with a **Latest** column beside Installed. It downloads nothing
+  and writes nothing, so seeing what is out of date does not commit you to installing it.
+
 ## Download
 
 | You are on | Get | Then |
@@ -47,8 +67,10 @@ If you try it, the two places to watch are the folder picker against a real
 - A `local:` source installs as a link, so `git pull` in that checkout *is* the update —
   a symlink on Linux, a directory junction on Windows (which needs no administrator
   rights).
-- **It never deletes an addon you already had.** Anything it would replace is moved to
-  `<Name>.replaced` first, and the window tells you the name before you commit to it.
+- **It keeps the first copy of anything you installed yourself.** A folder this tool did
+  not put there is moved to `<Name>.replaced`, beside the addon in your AddOns folder, and
+  the window names it before you commit. After that the folder is one this tool wrote, so
+  later updates replace it directly rather than making another copy.
 - One unreachable repository does not sink the run — that addon is marked failed and
   everything else still updates.
 
