@@ -247,7 +247,7 @@ class WindowTests(unittest.TestCase):
         dlg.destroy()
 
     def test_no_caution_for_a_folder_that_is_only_a_link(self):
-        (self.addons / "Loose").symlink_to(self.addons, target_is_directory=True)
+        core.make_link(self.addons, self.addons / "Loose")
         dlg = self.dialog("Loose")
         dlg.choice.set("local")
         dlg._sync()

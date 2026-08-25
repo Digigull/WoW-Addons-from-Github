@@ -182,12 +182,18 @@ These were bugs independent of the UI, and blocked a credible Windows build:
    ```
 
    Removal differs too: a junction is removed with `os.rmdir`, not `os.unlink`.
-   `Path.is_symlink()`'s treatment of junctions has not been consistent across Python
-   versions, so `core.is_link()` checks the reparse tag rather than trusting it. That
-   check is the load-bearing one: everything that replaces an installed addon asks "is
-   it a link?" first and calls `shutil.rmtree` if the answer is no, so an `is_link()`
-   that missed a junction would send `rmtree` **through** it into the user's own source
-   checkout. There is a test for exactly that, and it runs on the Windows CI.
+
+   > **Verified on Windows CI, and the guess in this plan was wrong.** It said
+   > "`Path.is_symlink()` returns True for junctions on modern Python — verify the detach
+   > path on a real Windows box, not by reasoning." Windows CI says **False**, on both
+   > 3.9 and 3.12. Two tests written against `Path.is_symlink()` failed there the moment
+   > junctions went in, which is precisely the check working as intended.
+   >
+   > So `core.is_link()` checks the reparse tag instead of delegating. That check is the
+   > load-bearing one: everything that replaces an installed addon asks "is it a link?"
+   > first and calls `shutil.rmtree` if the answer is no — so an `is_link()` that missed
+   > a junction would send `rmtree` **through** it and delete the user's own source
+   > checkout. There is a test for exactly that, and it runs on Windows.
 
 2. **Manifest to `%APPDATA%`.** Used to land in `C:\Users\<you>\.config\wow-addons\`.
    Now `%APPDATA%\wow-addons\` on Windows, `$XDG_CONFIG_HOME` elsewhere — and the old

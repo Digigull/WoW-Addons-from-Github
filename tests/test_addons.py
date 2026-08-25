@@ -271,7 +271,9 @@ class UpdatingOneAddon(unittest.TestCase):
         for _ in range(2):
             result = addons.update_addon("MyAddon", entry, self.root)
             self.assertEqual(result.outcome, addons.CHANGED)
-            self.assertTrue((self.root / "MyAddon").is_symlink())
+            # is_link, not Path.is_symlink: on Windows this installs a junction,
+            # and Path.is_symlink() reports False for one. See LinkingWithoutPrivileges.
+            self.assertTrue(addons.is_link(self.root / "MyAddon"))
         self.assertEqual(entry["installed"], "linked")
 
 
@@ -307,7 +309,7 @@ class DisplacingRealFiles(unittest.TestCase):
 
             addons.update_addon("MyAddon", entry, root)
             self.assertTrue((root / "MyAddon.replaced" / "old.lua").is_file(), "the old files must survive")
-            self.assertTrue((root / "MyAddon").is_symlink())
+            self.assertTrue(addons.is_link(root / "MyAddon"))
 
     def test_a_symlink_is_not_reported_as_displaced(self):
         # Replacing a link destroys nothing, so warning about it would be noise.
@@ -316,7 +318,9 @@ class DisplacingRealFiles(unittest.TestCase):
             root.mkdir()
             source = pathlib.Path(tmp) / "src" / "MyAddon"
             source.mkdir(parents=True)
-            (root / "MyAddon").symlink_to(source, target_is_directory=True)
+            # Made the way the tool makes them, so this exercises a junction on
+            # Windows rather than a symlink the tool would never create.
+            addons.make_link(source, root / "MyAddon")
             entry = {"source": f"local:{source}", "mode": "link"}
             self.assertIsNone(addons.will_displace(entry, root))
 
@@ -342,6 +346,26 @@ class LinkingWithoutPrivileges(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_path_is_symlink_is_not_enough_on_its_own(self):
+        """What Windows CI answered, rather than what seemed likely.
+
+        The plan flagged this as "verify on a real Windows box, not by
+        reasoning", and the answer is that Path.is_symlink() reports False for a
+        directory junction on both Python 3.9 and 3.12. is_link() therefore
+        cannot delegate to it -- which matters because callers use the answer to
+        decide whether shutil.rmtree is safe.
+
+        Off Windows the two agree, and this asserts that much everywhere.
+        """
+        link = self.root / "link"
+        addons.make_link(self.source, link)
+        try:
+            self.assertTrue(addons.is_link(link))
+            if os.name != "nt":
+                self.assertTrue(link.is_symlink())
+        finally:
+            addons.remove_link(link)
 
     def test_a_link_round_trips(self):
         link = self.root / "link"
