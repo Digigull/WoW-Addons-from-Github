@@ -1,10 +1,9 @@
 # A desktop UI, shipped as a Windows .exe and a Linux AppImage
 
-**Status: the Linux half is built and released. Milestones 1, 3 and 5 are done; the
-AppImage is what Milestone 5 produces. Milestones 2 and 4 — the Windows fixes and the
-`.exe` — are the remaining work,** and they are the next thing to pick up. Everything
-below is kept as written except where a decision has since been settled by contact with
-reality; those places say so.
+**Status: Milestones 1, 2, 3 and 5 are done. The Linux AppImage is built, and the two
+Windows bugs that gate a credible `.exe` are fixed. Milestone 4 — PyInstaller and a
+Windows release job — is what remains.** Everything below is kept as written except where
+a decision has since been settled by contact with reality; those places say so.
 
 The target: a user downloads one file, double-clicks it, points it at their WoW folder,
 sees their addons in a list, picks a source for each, and clicks Update. No Python, no
@@ -166,9 +165,9 @@ Cancellation: a `threading.Event` the worker checks between addons. Mid-download
 cancellation is not worth the complexity — cancelling between addons is enough, and it
 leaves the manifest consistent.
 
-## 5. Windows prerequisites
+## 5. Windows prerequisites — **done**
 
-These are bugs today, independent of the UI, and block a credible Windows build:
+These were bugs independent of the UI, and blocked a credible Windows build:
 
 1. **Junctions instead of symlinks.** `os.symlink` on Windows requires administrator rights
    or Developer Mode. Directory junctions require neither and WoW reads them identically.
@@ -182,15 +181,21 @@ These are bugs today, independent of the UI, and block a credible Windows build:
        dst.symlink_to(src, target_is_directory=True)
    ```
 
-   Removal differs too: a junction is removed with `os.rmdir`, not `os.unlink`, and
-   `Path.is_symlink()` returns True for junctions on modern Python — verify the
-   detach path on a real Windows box, not by reasoning.
+   Removal differs too: a junction is removed with `os.rmdir`, not `os.unlink`.
+   `Path.is_symlink()`'s treatment of junctions has not been consistent across Python
+   versions, so `core.is_link()` checks the reparse tag rather than trusting it. That
+   check is the load-bearing one: everything that replaces an installed addon asks "is
+   it a link?" first and calls `shutil.rmtree` if the answer is no, so an `is_link()`
+   that missed a junction would send `rmtree` **through** it into the user's own source
+   checkout. There is a test for exactly that, and it runs on the Windows CI.
 
-2. **Manifest to `%APPDATA%`.** Currently lands in `C:\Users\<you>\.config\wow-addons\`.
-   Should be `%APPDATA%\wow-addons\` on Windows, `$XDG_CONFIG_HOME` elsewhere.
+2. **Manifest to `%APPDATA%`.** Used to land in `C:\Users\<you>\.config\wow-addons\`.
+   Now `%APPDATA%\wow-addons\` on Windows, `$XDG_CONFIG_HOME` elsewhere — and the old
+   location is still *read* when the new one is empty, so upgrading does not look like
+   "you have no addons bound". The next write completes the move on its own.
 
-Both belong in `core.py` and both want a test. CI already runs on `windows-latest`, so a
-junction test will actually be exercised.
+Both landed in `core.py` with tests, and because the CI matrix includes `windows-latest`
+the junction paths are actually executed there rather than reasoned about.
 
 ## 6. Packaging
 
@@ -263,15 +268,15 @@ once there are enough Windows users for it to be worth it.
 | # | Work | Status |
 |---|---|---|
 | 1 | Split into `core` / `cli` / `gui` packages; extract `update_addon`; tests still green | **done** |
-| 2 | Windows junctions + `%APPDATA%`, with tests on the existing Windows CI | next |
+| 2 | Windows junctions + `%APPDATA%`, with tests on the existing Windows CI | **done** |
 | 3 | Tkinter window: folder picker, addon table, Set-source dialog, threaded update with progress | **done** |
-| 4 | PyInstaller Windows build + release workflow | after 2 |
+| 4 | PyInstaller Windows build + release workflow | next |
 | 5 | AppImage build + release workflow | **done** |
 | 6 | Real-hardware testing both platforms; README rewrite for non-technical users | Linux README done; hardware testing outstanding |
 
-Milestone 2 is the gate on the Windows `.exe` and should be done first: a packaged build
-that needs administrator rights to bind a `local:` source, or that hides its manifest
-under `~/.config` on Windows, is not worth shipping.
+Milestone 2 was the gate on the Windows `.exe` and is done: a packaged build that needed
+administrator rights to bind a `local:` source, or that hid its manifest under
+`~/.config`, would not have been worth shipping.
 
 **Still untested on real hardware.** The AppImage is verified by CI — it starts, opens a
 window under Xvfb, and scans a folder — but nobody has yet run it on a desktop against an

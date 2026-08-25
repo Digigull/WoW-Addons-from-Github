@@ -22,6 +22,8 @@ import json
 import os
 import re
 import shutil
+import stat
+import subprocess
 import tempfile
 import urllib.error
 import urllib.request
@@ -29,8 +31,33 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "wow-addons"
+def on_windows() -> bool:
+    return os.name == "nt"
+
+
+def default_config_dir(windows: bool | None = None) -> Path:
+    """Where this platform expects an application to keep its settings.
+
+    %APPDATA% on Windows; $XDG_CONFIG_HOME (or ~/.config) everywhere else.
+    Windows landing in ~/.config was a straight bug -- it works, but it is not
+    a place a Windows user or their backup software would ever think to look.
+
+    `windows` is a parameter rather than a bare os.name check so that a test can
+    ask what the other platform would do. Faking os.name globally is not an
+    option: pathlib reads it to pick which kind of Path to build, so a test that
+    set it would break every path in the process.
+    """
+    if on_windows() if windows is None else windows:
+        base = os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming"
+        return Path(base) / "wow-addons"
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "wow-addons"
+
+
+CONFIG_DIR = default_config_dir()
 MANIFEST = CONFIG_DIR / "manifest.json"
+# Where Windows used to put it. Read from here if nothing is in the new place
+# yet, so upgrading does not silently look like "you have no addons bound".
+LEGACY_WINDOWS_MANIFEST = Path.home() / ".config" / "wow-addons" / "manifest.json"
 USER_AGENT = "wow-addons-sync (stdlib urllib)"
 
 
@@ -49,13 +76,27 @@ def _nothing(*_args) -> None:
 # ── manifest ─────────────────────────────────────────────────────────────────
 
 
-def load() -> dict:
-    if not MANIFEST.exists():
+def manifest_to_read(windows: bool | None = None) -> Path:
+    """The manifest to load, which is not always the one we would write.
+
+    On Windows the location moved to %APPDATA%; anyone who used the tool before
+    that has their real manifest under ~/.config. Reading from the old place
+    when the new one is empty makes the move invisible, and the next `save`
+    writes to the new location and completes the migration on its own.
+    """
+    if MANIFEST.exists() or not (on_windows() if windows is None else windows):
+        return MANIFEST
+    return LEGACY_WINDOWS_MANIFEST if LEGACY_WINDOWS_MANIFEST.exists() else MANIFEST
+
+
+def load(windows: bool | None = None) -> dict:
+    path = manifest_to_read(windows)
+    if not path.exists():
         return {"addons_dir": None, "addons": {}}
     try:
-        return json.loads(MANIFEST.read_text())
+        return json.loads(path.read_text())
     except json.JSONDecodeError as exc:
-        die(f"manifest is not valid JSON ({exc}). Fix or delete {MANIFEST}")
+        die(f"manifest is not valid JSON ({exc}). Fix or delete {path}")
 
 
 def save(state: dict) -> None:
@@ -78,6 +119,85 @@ def addons_dir(state: dict) -> Path:
 
 def new_entry(name: str) -> dict:
     return {"source": "unmanaged", "mode": "link", "installed": None, "folders": [name]}
+
+
+# ── links ────────────────────────────────────────────────────────────────────
+# A `local:` source is installed as a link so that `git pull` in the checkout is
+# the whole update. On Unix that is a symlink. On Windows os.symlink needs
+# administrator rights or Developer Mode, which is not a reasonable thing to ask
+# of someone who wants to update an addon -- so a directory JUNCTION is used
+# instead. It needs no privileges at all and the client cannot tell the
+# difference.
+#
+# Junctions differ from symlinks in both directions, and both differences bite:
+#
+#   creating   mklink /J, because CreateJunction is private in CPython
+#   removing   os.rmdir, not os.unlink -- unlink refuses a directory
+#
+# is_link() is the one that actually matters for safety. Everything that
+# replaces an installed addon asks "is it a link?" first and calls shutil.rmtree
+# if the answer is no. Get that wrong for a junction and rmtree walks THROUGH it
+# and deletes the user's source checkout. That is why this checks the reparse
+# tag rather than trusting Path.is_symlink(), whose treatment of junctions has
+# not been consistent across Python versions.
+
+
+def is_link(path: Path) -> bool:
+    """True for a symlink, and for a Windows directory junction."""
+    try:
+        if path.is_symlink():
+            return True
+    except OSError:
+        return False
+    if os.name != "nt":
+        return False
+    try:
+        return os.lstat(path).st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+    except (OSError, AttributeError, ValueError):
+        return False
+
+
+def link_target(path: Path) -> str | None:
+    """Where a link points, or None if it is not one (or cannot be read)."""
+    if not is_link(path):
+        return None
+    try:
+        target = os.readlink(path)
+    except OSError:
+        return None
+    # readlink on a junction hands back an extended-length path. It is correct
+    # but it is not what anyone typed, and it should not be what a listing shows.
+    for prefix in ("\\\\?\\UNC\\", "\\\\?\\"):
+        if target.startswith(prefix):
+            target = target[len(prefix):]
+            break
+    return target
+
+
+def make_link(source: Path, destination: Path) -> None:
+    """Point destination at source. Junction on Windows, symlink elsewhere."""
+    if os.name != "nt":
+        destination.symlink_to(source, target_is_directory=True)
+        return
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(destination), str(source)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not destination.exists():
+        detail = (result.stderr or result.stdout or "").strip() or f"mklink exited {result.returncode}"
+        die(f"could not link {destination} -> {source}: {detail}")
+
+
+def remove_link(path: Path) -> None:
+    """Detach a link without touching what it points at."""
+    if os.name == "nt" and path.is_dir():
+        # A junction is a directory entry: unlink refuses it, rmdir removes the
+        # reparse point and leaves the target alone. rmdir on a symlink-to-dir
+        # behaves the same way, so this covers both without asking which it is.
+        os.rmdir(path)
+    else:
+        path.unlink()
 
 
 # ── .toc parsing ─────────────────────────────────────────────────────────────
@@ -142,8 +262,8 @@ def scan_installed(root: Path) -> dict[str, dict]:
             "title": strip_colours(fields.get("title", child.name)),
             "version": fields.get("version", ""),
             "guess": guess_source(fields),
-            "is_link": child.is_symlink(),
-            "link_target": os.readlink(child) if child.is_symlink() else None,
+            "is_link": is_link(child),
+            "link_target": link_target(child),
         }
     return found
 
@@ -408,8 +528,10 @@ def install_zip(blob: bytes, target: Path, dry_run: bool) -> list[str]:
                 die(f"archive names an unusable addon folder: {name!r}")
             destination = target / name
             if not dry_run:
-                if destination.is_symlink():
-                    destination.unlink()
+                # is_link first, always: rmtree on a junction would delete
+                # through it into whatever it points at.
+                if is_link(destination):
+                    remove_link(destination)
                 elif destination.exists():
                     shutil.rmtree(destination)
                 shutil.copytree(folder, destination)
@@ -429,8 +551,8 @@ def install_local(source_path: Path, target: Path, mode: str, dry_run: bool, *, 
     if dry_run:
         return [source_path.name]
 
-    if destination.is_symlink():
-        destination.unlink()
+    if is_link(destination):
+        remove_link(destination)
     elif destination.exists():
         # A real folder here is almost always an older manual copy. Move it
         # aside rather than delete it: this is the one step that cannot be undone.
@@ -441,7 +563,7 @@ def install_local(source_path: Path, target: Path, mode: str, dry_run: bool, *, 
     if mode == "copy":
         shutil.copytree(source_path, destination)
     else:
-        destination.symlink_to(source_path.resolve(), target_is_directory=True)
+        make_link(source_path.resolve(), destination)
     return [source_path.name]
 
 
@@ -471,7 +593,7 @@ def will_displace(entry: dict, root: Path) -> Path | None:
     if not source.startswith("local:"):
         return None
     destination = root / Path(source[len("local:"):]).name
-    if destination.exists() and not destination.is_symlink():
+    if destination.exists() and not is_link(destination):
         return backup_name(destination)
     return None
 

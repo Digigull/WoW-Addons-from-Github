@@ -240,7 +240,7 @@ class SourceDialog(tk.Toplevel):
         # github: which folders the archive contains is not knowable until it
         # has been downloaded, so the addon's own name is the best guess going.
         existing = self.addons_root / self.addon
-        if existing.exists() and not existing.is_symlink():
+        if existing.exists() and not core.is_link(existing):
             return self.addon, core.backup_name(existing)
         return None
 

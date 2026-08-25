@@ -18,6 +18,7 @@ whose failure would be silent:
 """
 
 import io
+import os
 import pathlib
 import sys
 import tempfile
@@ -318,6 +319,167 @@ class DisplacingRealFiles(unittest.TestCase):
             (root / "MyAddon").symlink_to(source, target_is_directory=True)
             entry = {"source": f"local:{source}", "mode": "link"}
             self.assertIsNone(addons.will_displace(entry, root))
+
+
+class LinkingWithoutPrivileges(unittest.TestCase):
+    """A `local:` source installs as a link. On Windows that has to be a junction.
+
+    os.symlink needs administrator rights or Developer Mode there, which is not
+    a reasonable thing to ask of somebody who wants to update an addon. A
+    directory junction needs neither and the client cannot tell the difference.
+
+    These run on every platform on purpose: the CI matrix includes
+    windows-latest, so this is the code path actually being exercised there, not
+    a reasoned-about one.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.source = self.root / "source"
+        self.source.mkdir()
+        (self.source / "keep.lua").write_text("precious")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_link_round_trips(self):
+        link = self.root / "link"
+        addons.make_link(self.source, link)
+        self.assertTrue(addons.is_link(link), "a link this tool made must read back as one")
+        self.assertTrue((link / "keep.lua").is_file(), "the client has to see through it")
+        self.assertEqual(pathlib.Path(addons.link_target(link)), self.source)
+
+        addons.remove_link(link)
+        self.assertFalse(link.exists())
+        self.assertTrue((self.source / "keep.lua").is_file(), "detaching must not touch the target")
+
+    def test_a_real_directory_is_not_a_link(self):
+        self.assertFalse(addons.is_link(self.source))
+        self.assertIsNone(addons.link_target(self.source))
+
+    def test_is_link_does_not_raise_on_something_that_is_not_there(self):
+        self.assertFalse(addons.is_link(self.root / "nope"))
+
+    def test_replacing_a_link_does_not_delete_through_it(self):
+        # The one that would be unrecoverable. Everything that replaces an
+        # installed addon asks is_link() first and calls shutil.rmtree if the
+        # answer is no -- so an is_link() that misses a Windows junction means
+        # rmtree walks through it and deletes the user's source checkout.
+        addons_dir = self.root / "AddOns"
+        addons_dir.mkdir()
+        addons.make_link(self.source, addons_dir / "source")
+
+        addons.install_local(self.source, addons_dir, "link", dry_run=False)
+
+        self.assertTrue((self.source / "keep.lua").is_file(), "the source checkout must survive")
+        self.assertTrue(addons.is_link(addons_dir / "source"))
+
+    def test_an_archive_can_replace_a_linked_addon(self):
+        addons_dir = self.root / "AddOns"
+        addons_dir.mkdir()
+        source = self.root / "MyAddon"
+        source.mkdir()
+        (source / "keep.lua").write_text("precious")
+        addons.make_link(source, addons_dir / "MyAddon")
+
+        addons.install_zip(mkzip({"MyAddon/MyAddon.toc": "a"}), addons_dir, dry_run=False)
+
+        self.assertTrue((source / "keep.lua").is_file(), "the source checkout must survive")
+        self.assertFalse(addons.is_link(addons_dir / "MyAddon"), "it is real files now")
+        self.assertTrue((addons_dir / "MyAddon" / "MyAddon.toc").is_file())
+
+    def test_a_scan_reports_a_linked_addon_as_linked(self):
+        addons_dir = self.root / "AddOns"
+        addons_dir.mkdir()
+        addon = self.root / "MyAddon"
+        addon.mkdir()
+        (addon / "MyAddon.toc").write_text("## Title: Mine")
+        addons.make_link(addon, addons_dir / "MyAddon")
+
+        found = addons.scan_installed(addons_dir)
+        self.assertTrue(found["MyAddon"]["is_link"])
+        self.assertEqual(pathlib.Path(found["MyAddon"]["link_target"]), addon)
+
+    def test_a_link_target_has_no_extended_length_prefix(self):
+        # readlink on a junction hands back \\?\C:\... which is correct and
+        # is not what anyone typed; it should not be what a listing shows.
+        link = self.root / "link"
+        addons.make_link(self.source, link)
+        try:
+            self.assertFalse(addons.link_target(link).startswith("\\\\?\\"))
+        finally:
+            addons.remove_link(link)
+
+
+class WhereTheManifestLives(unittest.TestCase):
+    """%APPDATA% on Windows, $XDG_CONFIG_HOME elsewhere.
+
+    Windows landing in ~/.config worked but is not a place a Windows user, or
+    their backup software, would ever think to look.
+    """
+
+    def setUp(self):
+        self.environ = dict(os.environ)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.environ)
+
+    def test_windows_uses_appdata(self):
+        os.environ["APPDATA"] = os.path.join("C:" + os.sep, "Users", "you", "AppData", "Roaming")
+        where = str(addons.default_config_dir(windows=True))
+        self.assertTrue(where.endswith("wow-addons"), where)
+        self.assertIn("Roaming", where)
+        self.assertNotIn(".config", where)
+
+    def test_windows_falls_back_when_appdata_is_unset(self):
+        os.environ.pop("APPDATA", None)
+        self.assertIn("Roaming", str(addons.default_config_dir(windows=True)))
+
+    def test_elsewhere_uses_xdg(self):
+        os.environ["XDG_CONFIG_HOME"] = os.path.join(os.sep, "somewhere", "config")
+        self.assertEqual(
+            addons.default_config_dir(windows=False),
+            pathlib.Path(os.sep, "somewhere", "config", "wow-addons"),
+        )
+
+    def test_xdg_defaults_to_dot_config(self):
+        os.environ.pop("XDG_CONFIG_HOME", None)
+        self.assertEqual(
+            addons.default_config_dir(windows=False), pathlib.Path.home() / ".config" / "wow-addons"
+        )
+
+    def test_the_old_windows_location_is_still_read(self):
+        # Upgrading must not look like "you have no addons bound".
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            legacy = tmp / "legacy.json"
+            legacy.write_text('{"addons_dir": "/old/place", "addons": {}}')
+            new, old_legacy = addons.MANIFEST, addons.LEGACY_WINDOWS_MANIFEST
+            try:
+                addons.MANIFEST = tmp / "new.json"
+                addons.LEGACY_WINDOWS_MANIFEST = legacy
+                self.assertEqual(addons.load(windows=True)["addons_dir"], "/old/place")
+
+                # And once something is written to the new place, that wins.
+                addons.MANIFEST.write_text('{"addons_dir": "/new/place", "addons": {}}')
+                self.assertEqual(addons.load(windows=True)["addons_dir"], "/new/place")
+            finally:
+                addons.MANIFEST, addons.LEGACY_WINDOWS_MANIFEST = new, old_legacy
+
+    def test_the_old_location_is_not_consulted_off_windows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            legacy = tmp / "legacy.json"
+            legacy.write_text('{"addons_dir": "/old/place", "addons": {}}')
+            new, old_legacy = addons.MANIFEST, addons.LEGACY_WINDOWS_MANIFEST
+            try:
+                addons.MANIFEST = tmp / "new.json"
+                addons.LEGACY_WINDOWS_MANIFEST = legacy
+                self.assertIsNone(addons.load(windows=False)["addons_dir"])
+            finally:
+                addons.MANIFEST, addons.LEGACY_WINDOWS_MANIFEST = new, old_legacy
 
 
 if __name__ == "__main__":

@@ -194,7 +194,12 @@ def cmd_update(args, state: dict) -> None:
 
 
 def cmd_where(args, state: dict) -> None:
+    reading = core.manifest_to_read()
     note(f"manifest:  {core.MANIFEST}")
+    if reading != core.MANIFEST:
+        # Windows, mid-migration: say which file the numbers came from, because
+        # otherwise `where` points at an empty file and looks like it is lying.
+        note(f"           (still reading {reading}; the next write moves it)")
     note(f"AddOns:    {state.get('addons_dir') or '(not set)'}")
 
 

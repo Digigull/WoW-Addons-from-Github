@@ -140,9 +140,9 @@ Everything the terminal does, in one window:
 - **Archives containing `../` paths are refused.** This unpacks zips published by third
   parties.
 - **Your manifest stays out of the way**, at `$XDG_CONFIG_HOME/wow-addons/manifest.json` —
-  in practice `~/.config/wow-addons/manifest.json`, and `C:\Users\<you>\.config\wow-addons\`
-  on Windows. It holds your disk paths, so it does not belong in a repository. `where` prints
-  the resolved location.
+  in practice `~/.config/wow-addons/manifest.json`, and `%APPDATA%\wow-addons\` on Windows.
+  It holds your disk paths, so it does not belong in a repository. `where` prints the
+  resolved location.
 
 `GITHUB_TOKEN` is honoured if set, and is entirely optional: unauthenticated GitHub allows 60
 requests an hour, which is far more than a personal addon list needs.
@@ -165,25 +165,23 @@ Then restart Bottles. Or bind that addon with `--copy` and avoid links entirely.
 
 ## Windows
 
-The tool runs on Windows today with Python installed, and `github:` sources work normally.
+The tool runs on Windows with Python installed — the CLI, the window, and both source
+types. The two things that used to be Linux-shaped are fixed:
 
-Two things are still Linux-shaped, and both are small:
+- **`local:` sources install as a directory junction**, not a symlink. `os.symlink` on
+  Windows needs administrator rights or Developer Mode; a junction needs neither, and the
+  client cannot tell the difference. `--copy` still works if you would rather have real
+  files.
+- **The manifest lives in `%APPDATA%\wow-addons\`.** If you used an earlier version, your
+  old manifest under `~/.config\wow-addons\` is read automatically and moves to the new
+  location the next time anything is written — you do not need to do anything.
 
-1. **`local:` sources create a real symlink**, which on Windows needs administrator rights or
-   Developer Mode. Directory *junctions* need neither and are the correct mechanism there.
-   Until that lands, use `--copy` for `local:` sources on Windows.
-2. **The manifest goes to `~/.config/wow-addons/`** rather than `%APPDATA%`, which works but
-   is not where a Windows tool should keep it.
-
-The Linux AppImage is built and released. **A Windows `.exe` is the next piece of work**,
-and those two items are its prerequisites — a packaged Windows build that needs
-administrator rights to bind a `local:` source, or that hides its manifest in the wrong
-place, is not worth shipping. The window and the engine behind it are already done and
-platform-independent, so what remains really is those two fixes plus PyInstaller.
+**A packaged `.exe` is the next piece of work.** The window and the engine behind it are
+already done and platform-independent, so what remains is PyInstaller and a release job.
 
 Worth knowing in advance: an unsigned `.exe` triggers SmartScreen's "Windows protected
 your PC", which only a code-signing certificate removes. The AppImage has no equivalent
-problem, which is why Linux is the honest first release.
+problem, which is why Linux was the honest first release.
 
 The full design and packaging plan is in [UI-PLAN.md](UI-PLAN.md).
 
