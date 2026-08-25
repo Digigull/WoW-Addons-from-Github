@@ -59,11 +59,21 @@ def usable(stream) -> bool:
 def _reopen() -> None:
     """Point the standard streams at the console we just acquired.
 
+    Windows only, and the guard is not a formality. CONOUT$ and CONIN$ are
+    console devices there; anywhere else they are just filenames, so calling
+    this off Windows silently creates two junk files in the working directory.
+    One of them reached a commit that way, and since CONOUT$ is a reserved name
+    on Windows, `git checkout` then refused the whole repository with
+    "invalid path 'CONOUT$'" -- every Windows CI job died before running a
+    single test.
+
     Only the ones that need it. A caller can perfectly well redirect stdout and
     leave stderr behind -- `app.exe list > out.txt` run by a parent that passes
     a pipe for one and nothing for the other -- and replacing the working half
     would throw away the redirection this whole module exists to respect.
     """
+    if os.name != "nt":
+        return
     for name in ("stdout", "stderr"):
         if not usable(getattr(sys, name, None)):
             try:

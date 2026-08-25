@@ -261,6 +261,60 @@ class WindowsBuild(unittest.TestCase):
         self.assertNotIn("sys.path", entry)
 
 
+class NothingWindowsCannotCheckOut(unittest.TestCase):
+    """No tracked path may be a name Windows reserves for a device.
+
+    This is not a style rule. `git checkout` on Windows refuses a repository
+    containing one, with "invalid path 'CONOUT$'" and nothing else -- not the
+    file, the whole clone. Every Windows contributor and every Windows CI job
+    fails at checkout, before a single test runs.
+
+    It happened here: a test called winconsole._reopen() off Windows, where
+    CONOUT$ is an ordinary filename rather than a console device, and the empty
+    file it left behind was committed.
+    """
+
+    # Device names MS-DOS reserved and Windows still honours, plus the console
+    # handles. Reserved with any extension, and case-insensitively.
+    RESERVED = {
+        "con", "prn", "aux", "nul", "conout$", "conin$",
+        *(f"com{n}" for n in range(1, 10)),
+        *(f"lpt{n}" for n in range(1, 10)),
+    }
+
+    def tracked_paths(self):
+        import subprocess
+
+        result = subprocess.run(
+            ["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, text=True, check=False
+        )
+        if result.returncode != 0:
+            self.skipTest("not a git checkout")
+        return [p for p in result.stdout.split("\0") if p]
+
+    def test_no_tracked_path_uses_a_reserved_device_name(self):
+        paths = self.tracked_paths()
+        self.assertTrue(paths, "git ls-files returned nothing")
+        offenders = [
+            path
+            for path in paths
+            for part in pathlib.PurePosixPath(path).parts
+            if part.split(".")[0].lower() in self.RESERVED
+        ]
+        self.assertEqual(offenders, [], "these break `git checkout` on Windows")
+
+    def test_no_tracked_path_uses_a_character_windows_forbids(self):
+        # Same failure mode, different cause: a colon or a trailing dot in a
+        # tracked name makes the clone impossible to check out on Windows.
+        offenders = [
+            path for path in self.tracked_paths()
+            if set(path) & set('<>:"|?*') or any(
+                part != part.rstrip(" .") for part in pathlib.PurePosixPath(path).parts
+            )
+        ]
+        self.assertEqual(offenders, [], "these break `git checkout` on Windows")
+
+
 class Scripts(unittest.TestCase):
     def test_the_build_and_smoke_scripts_are_executable(self):
         for name in ("build.sh", "smoke-test.sh"):

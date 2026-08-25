@@ -135,10 +135,34 @@ class AcquiringOne(unittest.TestCase):
             try:
                 winconsole._reopen()
                 self.assertIs(sys.stdout, handle, "a working stdout was replaced")
-            except OSError:
-                pass  # no console to open CONOUT$ on; the assertion above is the point
             finally:
                 sys.stdout, sys.stderr = sys.__stdout__, sys.__stderr__
+
+    def test_reopening_writes_nothing_to_disk_off_windows(self):
+        """CONOUT$ is a console device on Windows and a filename everywhere else.
+
+        Called off Windows, _reopen used to create CONOUT$ and CONIN$ in the
+        working directory. One of them was committed that way -- and because
+        the name is reserved on Windows, `git checkout` then refused the entire
+        repository with "invalid path 'CONOUT$'", so every Windows CI job died
+        before running a single test.
+        """
+        import tempfile
+
+        cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chdir(tmp)
+            try:
+                sys.stdout = sys.stderr = None
+                winconsole._reopen()
+            finally:
+                sys.stdout, sys.stderr = sys.__stdout__, sys.__stderr__
+                leftovers = sorted(os.listdir(tmp))
+                os.chdir(cwd)
+        if os.name == "nt":
+            self.assertEqual(leftovers, [], "console devices are not files on Windows")
+        else:
+            self.assertEqual(leftovers, [], "_reopen created files off Windows")
 
     @unittest.skipUnless(os.name == "nt", "Windows-only path")
     def test_a_windows_process_with_a_console_needs_nothing(self):
