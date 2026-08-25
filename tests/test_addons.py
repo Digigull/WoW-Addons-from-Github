@@ -953,3 +953,131 @@ class UpdatingOneAddonOfManyEndToEnd(unittest.TestCase):
         self.assertEqual(entry["folders"], ["AscensionHonorTracker"])
         self.assertEqual(sorted(p.name for p in self.root.iterdir()),
                          ["AscensionHonorTracker"])
+
+
+class LayoutsFromRealAscensionAddons(unittest.TestCase):
+    """Five links somebody actually handed over, reduced to their shapes.
+
+    Every one of these was checked against the real repository before being
+    written down here, because guessing at addon layouts is how the last three
+    bugs got in. The names are kept so a failure points at something findable.
+    """
+
+    def install(self, files):
+        with tempfile.TemporaryDirectory() as tmp:
+            return addons.install_zip(mkzip(files), pathlib.Path(tmp), dry_run=True)
+
+    def test_several_addons_that_ship_together(self):
+        # gerob/LootCollector: a main addon plus two companions, with bundled
+        # libraries nested inside them. The companions install; the libraries
+        # must not, or AddOns fills up with LibStub and LibBase64-1.0.
+        self.assertEqual(
+            self.install({
+                "gerob-LootCollector-1a2b3c/LootCollector/LootCollector.toc": "a",
+                "gerob-LootCollector-1a2b3c/LootCollector/Libs/LibStub/LibStub.toc": "lib",
+                "gerob-LootCollector-1a2b3c/LootCollector/Libs/LibBase64-1.0/LibBase64-1.0.toc": "lib",
+                "gerob-LootCollector-1a2b3c/LootCollector_CustomImport/LootCollector_CustomImport.toc": "b",
+                "gerob-LootCollector-1a2b3c/LootCollector_StarterDB/LootCollector_StarterDB.toc": "c",
+                "gerob-LootCollector-1a2b3c/Docs/notes.md": "d",
+            }),
+            ["LootCollector", "LootCollector_CustomImport", "LootCollector_StarterDB"],
+        )
+
+    def test_one_addon_beside_the_usual_repository_furniture(self):
+        # LaSainteChips/AscensionRaidLootCompanion: .github, docs, CHANGELOG,
+        # AGENTS.md -- none of which is an addon.
+        self.assertEqual(
+            self.install({
+                "x-1a2b3c/AscensionRaidLootCompanion/AscensionRaidLootCompanion.toc": "a",
+                "x-1a2b3c/AscensionRaidLootCompanion/Core/init.lua": "b",
+                "x-1a2b3c/docs/guide.md": "c",
+                "x-1a2b3c/.github/workflows/ci.yml": "d",
+                "x-1a2b3c/CHANGELOG.md": "e",
+            }),
+            ["AscensionRaidLootCompanion"],
+        )
+
+    def test_a_repo_whose_root_is_the_addon_with_one_toc_per_client(self):
+        """ayro-CMD/FrostSeek ships seven .toc files, one per WoW flavour.
+
+        They all belong in a single folder named FrostSeek -- the client picks
+        the .toc that matches itself. Choosing FrostSeek_Cata.toc would name the
+        folder FrostSeek_Cata, which every client would then ignore.
+        """
+        self.assertEqual(
+            self.install({
+                "ayro-CMD-FrostSeek-1a2b3c/FrostSeek.toc": "a",
+                "ayro-CMD-FrostSeek-1a2b3c/FrostSeek_Cata.toc": "b",
+                "ayro-CMD-FrostSeek-1a2b3c/FrostSeek_CataPS.toc": "c",
+                "ayro-CMD-FrostSeek-1a2b3c/FrostSeek_Mists.toc": "d",
+                "ayro-CMD-FrostSeek-1a2b3c/FrostSeek_TBC.toc": "e",
+                "ayro-CMD-FrostSeek-1a2b3c/FrostSeek_Vanilla.toc": "f",
+                "ayro-CMD-FrostSeek-1a2b3c/FrostSeek_Wrath.toc": "g",
+                "ayro-CMD-FrostSeek-1a2b3c/Core.lua": "h",
+            }),
+            ["FrostSeek"],
+        )
+
+    def test_the_addon_is_named_by_its_toc_not_by_the_repository(self):
+        """Minnona/Minn-Tinkers holds MinnTinkers.toc -- the hyphen differs.
+
+        The game loads Folder/Folder.toc and silently ignores anything else, so
+        installing this as Minn-Tinkers (or as the archive's wrapper name) would
+        produce an addon that never appears in the list and no error anywhere.
+        """
+        self.assertEqual(
+            self.install({
+                "Minnona-Minn-Tinkers-1a2b3c/MinnTinkers.toc": "a",
+                "Minnona-Minn-Tinkers-1a2b3c/Core.lua": "b",
+                "Minnona-Minn-Tinkers-1a2b3c/Modules/thing.lua": "c",
+            }),
+            ["MinnTinkers"],
+        )
+
+    def test_a_flavour_toc_does_not_win_when_it_sorts_first(self):
+        """The rule is shortest stem, not first alphabetically.
+
+        "-" sorts before ".", so Addon-Classic.toc comes first in the listing
+        and would name the folder Addon-Classic -- which no client loads. The
+        underscore form does not discriminate here, because "." sorts before
+        "_" and the base name wins by accident.
+        """
+        self.assertEqual(
+            self.install({"r-1a2b3c/Addon-Classic.toc": "a", "r-1a2b3c/Addon.toc": "b"}),
+            ["Addon"],
+        )
+
+
+class AnAccountIsNotAnAddon(unittest.TestCase):
+    """https://github.com/Ascension-Addons names no repository at all.
+
+    It is an easy thing to paste when the addons you want are published by an
+    organisation, and "not a GitHub repository" reads as though the link were
+    broken rather than as "you are one click short".
+    """
+
+    def test_an_account_page_is_recognised_as_one(self):
+        for text in ("https://github.com/Ascension-Addons",
+                     "https://github.com/Ascension-Addons/",
+                     "github.com/Ascension-Addons"):
+            with self.subTest(text=text):
+                self.assertEqual(addons.github_account(text), "Ascension-Addons")
+
+    def test_a_repository_is_not_mistaken_for_an_account(self):
+        for text in ("https://github.com/o/r", "https://github.com/o/r/tree/main/Sub",
+                     "o/r", "git@github.com:o/r.git"):
+            with self.subTest(text=text):
+                self.assertIsNone(addons.github_account(text))
+
+    def test_the_error_says_what_to_do_instead(self):
+        with self.assertRaises(addons.Fail) as caught:
+            addons.resolve_source("X", "github:https://github.com/Ascension-Addons")
+        message = str(caught.exception)
+        self.assertIn("Ascension-Addons", message)
+        self.assertIn("account", message)
+        self.assertIn("Ascension-Addons/repo-name", message)
+
+    def test_it_is_still_refused_rather_than_stored(self):
+        # Storing it as a source would produce a 404 at update time, long after
+        # the paste, with nothing pointing back at the cause.
+        self.assertIsNone(addons.parse_repo("https://github.com/Ascension-Addons"))

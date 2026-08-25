@@ -355,6 +355,25 @@ def parse_repo(text: str) -> tuple[str, str | None, str | None] | None:
     return None
 
 
+ACCOUNT_URL = re.compile(
+    r"^(?:https?://)?(?:www\.)?github\.com/(?P<name>[\w.-]+)/*(?:[#?].*)?$", re.I
+)
+
+
+def github_account(text: str) -> str | None:
+    """The account name, if this is a github.com user or organisation page.
+
+    `github.com/Ascension-Addons` is a perfectly good link that names no
+    repository at all, and it is an easy thing to paste when the addons you
+    want are published by an organisation. Saying only "not a GitHub
+    repository" about it is true and unhelpful -- it reads as though the link
+    is broken, when the real answer is "open the addon you want and paste that
+    address instead".
+    """
+    match = ACCOUNT_URL.match(text.strip())
+    return match.group("name") if match else None
+
+
 def looks_like_a_repo(source: str) -> bool:
     """Is this a GitHub repository rather than a path, with no prefix to say so?
 
@@ -422,6 +441,11 @@ def resolve_source(addon: str, source: str) -> tuple[str, str, Path | None]:
             spec, branch, folder = split_repo_spec(rest)
             found = parse_repo(spec)
             if found is None:
+                account = github_account(spec)
+                if account:
+                    die(f"'{account}' is a GitHub account, not a repository -- it may hold\n"
+                        "     many addons. Open the one you want on github.com and paste\n"
+                        f"     that address, or write it as {account}/repo-name.")
                 die(f"cannot see a GitHub repository in '{spec}'.\n"
                     "     Expected owner/repo, or a github.com URL.")
             repo, url_branch, url_folder = found

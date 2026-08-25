@@ -374,6 +374,20 @@ class SourceDialog(tk.Toplevel):
             # working URL to retype it by hand is a small insult.
             found = core.parse_repo(self.repo.get())
             if found is None:
+                account = core.github_account(self.repo.get())
+                if account:
+                    # An organisation page names no repository, and is an easy
+                    # thing to paste when the addons you want are published by
+                    # one. "Not a GitHub repository" would read as though the
+                    # link were broken.
+                    messagebox.showerror(
+                        "That is an account, not an addon",
+                        f"{account} is a GitHub account, which may hold many addons.\n\n"
+                        "Open the addon you want on github.com and paste that address —\n"
+                        f"or write it as {account}/repo-name.",
+                        parent=self,
+                    )
+                    return
                 messagebox.showerror(
                     "Not a GitHub repository",
                     "Paste a github.com link, or write it as owner/repo.\n\n"

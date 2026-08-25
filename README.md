@@ -125,6 +125,9 @@ existing folder outright instead of keeping one copy of it).
 | `https://github.com/owner/repo` | A pasted link works too — the page URL, the clone URL, the SSH one, a link to a branch (taken as `@branch`), or a link to a folder (taken as `#Folder`). |
 | `unmanaged` | Left alone. The default for anything `scan` finds and cannot place. |
 
+A link to a GitHub **account or organisation** (`github.com/Some-Org`) names no repository,
+so it is refused with a note saying so — open the addon you want and paste that address.
+
 ### A repository that holds several addons
 
 Some people keep every addon they have written in one repository. Bound as a whole, such a
