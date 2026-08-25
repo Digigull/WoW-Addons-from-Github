@@ -104,6 +104,15 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
+      # First, and not optional: the notes this job publishes live in the
+      # repository, and a job that only downloads artifacts has an empty
+      # workspace. This job went without a checkout until v0.3.1 failed on
+      # `open .github/release-notes.md: no such file or directory` -- hidden
+      # until then only because the old `view || create` shape skipped the
+      # branch that read the file. It also has to come before the download:
+      # checkout cleans the workspace, artifacts and all.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts

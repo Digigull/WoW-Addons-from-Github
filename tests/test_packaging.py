@@ -17,9 +17,9 @@ CLI smoke test -- and then cannot open a window.
 import ast
 import os
 import pathlib
-import sys
 import re
 import struct
+import sys
 import unittest
 import xml.dom.minidom
 
@@ -336,6 +336,59 @@ class Releasing(unittest.TestCase):
         return "\n".join(
             line for line in self.WORKFLOW.read_text().splitlines()
             if not line.lstrip().startswith("#")
+        )
+
+    def workflow_jobs(self) -> dict:
+        """Each job in the workflow, as name -> its own block of the file.
+
+        No PyYAML in a stdlib-only project, and none is needed: jobs are the
+        keys indented four spaces under `jobs:`, and a job owns every line
+        until the next one.
+        """
+        jobs, name = {}, None
+        inside = False
+        for line in self.workflow_commands().splitlines():
+            if line.rstrip() == "jobs:":
+                inside = True
+                continue
+            if not inside:
+                continue
+            if re.fullmatch(r"  ([\w-]+):", line.rstrip()):
+                name = line.strip().rstrip(":")
+                jobs[name] = []
+            elif name:
+                jobs[name].append(line)
+        return {name: "\n".join(lines) for name, lines in jobs.items()}
+
+    def test_every_job_that_reads_a_repo_file_checks_the_repo_out(self):
+        """A job with no checkout has an empty workspace, artifacts aside.
+
+        `publish` had no checkout and got away with it while the notes file was
+        only read on a branch that never ran. The moment `gh release edit`
+        started reading it on every tag, v0.3.1 died on `no such file or
+        directory` -- after both builds had spent their five minutes, and with
+        the release already public and untitled.
+        """
+        for name, body in self.workflow_jobs().items():
+            wanted = sorted({
+                path for path in re.findall(r"[\w.][\w./-]*\.(?:md|sh|py|txt|cfg|toml)", body)
+                if (ROOT / path).is_file()
+            })
+            if not wanted:
+                continue
+            self.assertIn(
+                "actions/checkout", body,
+                f"job {name!r} reads {wanted} but never checks the repository out",
+            )
+
+    def test_the_checkout_comes_before_the_download(self):
+        # checkout cleans the workspace before it fetches, so a checkout after
+        # actions/download-artifact deletes the artifacts it just downloaded.
+        publish = self.workflow_jobs()["publish"]
+        self.assertIn("actions/checkout", publish)
+        self.assertLess(
+            publish.index("actions/checkout"), publish.index("download-artifact"),
+            "checkout would wipe the downloaded artifacts",
         )
 
     def test_the_version_is_reportable(self):
