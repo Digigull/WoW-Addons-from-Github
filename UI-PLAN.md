@@ -284,10 +284,21 @@ Milestone 2 was the gate on the Windows `.exe` and is done: a packaged build tha
 administrator rights to bind a `local:` source, or that hid its manifest under
 `~/.config`, would not have been worth shipping.
 
-**Still untested on real hardware.** The AppImage is verified by CI — it starts, opens a
-window under Xvfb, and scans a folder — but nobody has yet run it on a desktop against an
-actual WoW install. That is the next thing worth doing after Milestone 2, and it is the
-kind of thing CI cannot stand in for.
+### What the first green build actually produced
+
+| | Estimated in this plan | Measured |
+|---|---|---|
+| Bundled size | ~15 MB | **20 MB** (`WoW-Addons-from-GitHub-x86_64.AppImage`) |
+| Tk inside the image | "believed to include tkinter" | **Tk 8.6 on Python 3.12.14** |
+| glibc floor | "build on the oldest you support" | **2.17**, from the base image, regardless of builder |
+
+The smoke test's last step launches the AppImage itself under Xvfb and fails if it exits
+on its own; on the first green build it stayed up, which is the closest thing to "the
+window opens" that CI can assert.
+
+**Still untested on real hardware.** Nobody has yet run it on a desktop against an actual
+WoW install, and nobody has run the Windows junction code anywhere but CI. That is the
+next thing worth doing, and it is the kind of thing CI cannot stand in for.
 
 ## 9. Open questions
 

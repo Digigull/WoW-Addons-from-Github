@@ -16,8 +16,12 @@ chmod +x WoW-Addons-from-GitHub-x86_64.AppImage
 ./WoW-Addons-from-GitHub-x86_64.AppImage
 ```
 
-No Python, no install, nothing to keep updated. It asks for your WoW folder the first
-time, then shows every addon it found with the source bound to each one.
+About 20 MB, and that is everything: its own Python, its own Tk, and the tool. No install,
+nothing to keep updated, and deleting the file uninstalls it. It asks for your WoW folder
+the first time, then shows every addon it found with the source bound to each one.
+
+It runs on anything with glibc 2.17 or newer — CentOS 7 era, and older than anything
+anyone is realistically running.
 
 > **If it will not start** with an error mentioning `libfuse.so.2`, your distribution no
 > longer ships FUSE 2 — recent Debian and Ubuntu do not. Either install it
