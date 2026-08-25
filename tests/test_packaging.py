@@ -17,9 +17,9 @@ CLI smoke test -- and then cannot open a window.
 import ast
 import os
 import pathlib
-import sys
 import re
 import struct
+import sys
 import unittest
 import xml.dom.minidom
 
@@ -338,6 +338,59 @@ class Releasing(unittest.TestCase):
             if not line.lstrip().startswith("#")
         )
 
+    def workflow_jobs(self) -> dict:
+        """Each job in the workflow, as name -> its own block of the file.
+
+        No PyYAML in a stdlib-only project, and none is needed: jobs are the
+        keys indented four spaces under `jobs:`, and a job owns every line
+        until the next one.
+        """
+        jobs, name = {}, None
+        inside = False
+        for line in self.workflow_commands().splitlines():
+            if line.rstrip() == "jobs:":
+                inside = True
+                continue
+            if not inside:
+                continue
+            if re.fullmatch(r"  ([\w-]+):", line.rstrip()):
+                name = line.strip().rstrip(":")
+                jobs[name] = []
+            elif name:
+                jobs[name].append(line)
+        return {name: "\n".join(lines) for name, lines in jobs.items()}
+
+    def test_every_job_that_reads_a_repo_file_checks_the_repo_out(self):
+        """A job with no checkout has an empty workspace, artifacts aside.
+
+        `publish` had no checkout and got away with it while the notes file was
+        only read on a branch that never ran. The moment `gh release edit`
+        started reading it on every tag, v0.3.1 died on `no such file or
+        directory` -- after both builds had spent their five minutes, and with
+        the release already public and untitled.
+        """
+        for name, body in self.workflow_jobs().items():
+            wanted = sorted({
+                path for path in re.findall(r"[\w.][\w./-]*\.(?:md|sh|py|txt|cfg|toml)", body)
+                if (ROOT / path).is_file()
+            })
+            if not wanted:
+                continue
+            self.assertIn(
+                "actions/checkout", body,
+                f"job {name!r} reads {wanted} but never checks the repository out",
+            )
+
+    def test_the_checkout_comes_before_the_download(self):
+        # checkout cleans the workspace before it fetches, so a checkout after
+        # actions/download-artifact deletes the artifacts it just downloaded.
+        publish = self.workflow_jobs()["publish"]
+        self.assertIn("actions/checkout", publish)
+        self.assertLess(
+            publish.index("actions/checkout"), publish.index("download-artifact"),
+            "checkout would wipe the downloaded artifacts",
+        )
+
     def test_the_version_is_reportable(self):
         # A shipped binary that cannot say which build it is makes every bug
         # report start with a guessing game.
@@ -407,6 +460,43 @@ class Releasing(unittest.TestCase):
         commands = self.workflow_commands()
         self.assertIn("the release published without its metadata", commands)
         self.assertIn("isPrerelease", commands)
+
+    def test_a_release_can_be_rebuilt_without_touching_git(self):
+        """The only repair route for a failed release that a browser can drive.
+
+        The workflow file that runs is the one at the ref you dispatch from, so
+        dispatching main with a tag named rebuilds that tag against a workflow
+        fixed since. Without the input the only repair is deleting and
+        recreating the tag, and a release whose build half-failed cannot be
+        fixed by anyone without a git checkout.
+        """
+        workflow = self.WORKFLOW.read_text()
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertRegex(workflow, r"inputs:\s*\n\s+tag:")
+        for job in ("version-matches-tag", "publish"):
+            self.assertIn(
+                "inputs.tag != ''", self.workflow_jobs()[job],
+                f"job {job!r} still only runs for a tag push, so a dispatch publishes nothing",
+            )
+
+    def test_nothing_names_the_release_after_the_ref_it_ran_from(self):
+        # GITHUB_REF_NAME is "main" on a dispatch. Left anywhere in the publish
+        # job it would create a release literally called main, and upload the
+        # binaries to it.
+        self.assertNotIn(
+            "GITHUB_REF_NAME", self.WORKFLOW.read_text(),
+            "use RELEASE_TAG: a dispatched run would publish a release named after the branch",
+        )
+
+    def test_the_builds_check_out_the_tag_they_are_publishing(self):
+        # Otherwise a dispatched rebuild ships main's code under the tag's name
+        # -- the exact mismatch version-matches-tag exists to prevent.
+        jobs = self.workflow_jobs()
+        for job in ("appimage", "windows", "version-matches-tag", "publish"):
+            self.assertIn(
+                "ref: ${{ inputs.tag }}", jobs[job],
+                f"job {job!r} would build the dispatch ref instead of the tag",
+            )
 
     def test_the_publish_waits_for_the_version_check(self):
         # Otherwise a mismatched tag still publishes; the check would just go

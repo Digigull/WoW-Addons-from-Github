@@ -3,6 +3,15 @@ name: release
 # Deliberately separate from tests.yml, and deliberately not on every push: a
 # slow build on every commit is how people stop watching CI. It runs on a tag,
 # on demand, and on changes to the things that can break the builds themselves.
+#
+# The `tag` input is how a release gets rebuilt without touching git. Actions ->
+# release -> Run workflow, leave the branch on main, type the tag: the builds
+# check that tag out, and the publish job edits that tag's existing release in
+# place. That matters because the workflow that RUNS always comes from the ref
+# you dispatch from, not from the tag -- so a release whose build failed on a
+# bug since fixed on main can be republished without moving or recreating the
+# tag, which the web UI cannot do. Blank builds both binaries and publishes
+# nothing.
 on:
   push:
     tags: ["v*"]
@@ -13,6 +22,11 @@ on:
       - "addons.py"
       - ".github/workflows/release.yml"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish, e.g. v0.3.1 (blank = build only)"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -22,6 +36,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
       - uses: actions/setup-python@v5
         with:
@@ -54,6 +70,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
       - uses: actions/setup-python@v5
         with:
@@ -82,17 +100,21 @@ jobs:
     # A tag that ships a binary calling itself something else is how you end up
     # unable to reproduce a bug report. Cheap to check, and better here than
     # after both builds have spent five minutes.
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
       - name: The tag and wowaddons.__version__ must agree
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           declared=$(python3 -c "import wowaddons; print(wowaddons.__version__)")
-          tagged="${GITHUB_REF_NAME#v}"
+          tagged="${RELEASE_TAG#v}"
           echo "tag says $tagged, code says $declared"
           if [ "$declared" != "$tagged" ]; then
-            echo "::error::tag ${GITHUB_REF_NAME} ships a build calling itself $declared"
+            echo "::error::tag ${RELEASE_TAG} ships a build calling itself $declared"
             exit 1
           fi
 
@@ -101,9 +123,20 @@ jobs:
     # Attaching from each build job instead would race: two jobs would find no
     # release and both try to create it, and one of them would lose.
     needs: [appimage, windows, version-matches-tag]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
     runs-on: ubuntu-latest
     steps:
+      # First, and not optional: the notes this job publishes live in the
+      # repository, and a job that only downloads artifacts has an empty
+      # workspace. This job went without a checkout until v0.3.1 failed on
+      # `open .github/release-notes.md: no such file or directory` -- hidden
+      # until then only because the old `view || create` shape skipped the
+      # branch that read the file. It also has to come before the download:
+      # checkout cleans the workspace, artifacts and all.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -139,28 +172,29 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             echo "release already exists; applying title, notes and pre-release flag"
-            gh release edit "${GITHUB_REF_NAME}" \
-              --title "${GITHUB_REF_NAME}" \
+            gh release edit "${RELEASE_TAG}" \
+              --title "${RELEASE_TAG}" \
               --prerelease \
               --notes-file .github/release-notes.md
           else
-            gh release create "${GITHUB_REF_NAME}" \
-              --title "${GITHUB_REF_NAME}" \
+            gh release create "${RELEASE_TAG}" \
+              --title "${RELEASE_TAG}" \
               --prerelease \
               --notes-file .github/release-notes.md
           fi
-          gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+          gh release upload "${RELEASE_TAG}" dist/* --clobber
 
           # Prove it, rather than trusting the exit codes above. A release with
           # the right files and none of the right metadata is exactly the
           # failure this step just had, and it exited 0 at the time.
-          gh release view "${GITHUB_REF_NAME}" --json name,isPrerelease,body \
+          gh release view "${RELEASE_TAG}" --json name,isPrerelease,body \
             --jq '"title=\(.name) prerelease=\(.isPrerelease) notes=\(.body|length) chars"'
-          published=$(gh release view "${GITHUB_REF_NAME}" --json isPrerelease --jq .isPrerelease)
-          notes=$(gh release view "${GITHUB_REF_NAME}" --json body --jq '.body|length')
+          published=$(gh release view "${RELEASE_TAG}" --json isPrerelease --jq .isPrerelease)
+          notes=$(gh release view "${RELEASE_TAG}" --json body --jq '.body|length')
           if [ "$published" != "true" ] || [ "$notes" -lt 100 ]; then
             echo "::error::the release published without its metadata"
             exit 1
