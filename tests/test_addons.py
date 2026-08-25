@@ -1081,3 +1081,62 @@ class AnAccountIsNotAnAddon(unittest.TestCase):
         # Storing it as a source would produce a 404 at update time, long after
         # the paste, with nothing pointing back at the cause.
         self.assertIsNone(addons.parse_repo("https://github.com/Ascension-Addons"))
+
+
+class OneAddonBuiltForSeveralClients(unittest.TestCase):
+    """Four shapes a "which client?" repository takes, and what each needs.
+
+    Only one of them needs the user to choose. Getting this wrong is quiet:
+    an addon built for the wrong client is not something the game reports.
+    """
+
+    def install(self, files, **kw):
+        with tempfile.TemporaryDirectory() as tmp:
+            return addons.install_zip(mkzip(files), pathlib.Path(tmp), dry_run=True, **kw)
+
+    def test_one_toc_per_client_needs_no_choice_at_all(self):
+        # The WoW convention, and what ayro-CMD/FrostSeek does. Every flavour
+        # .toc belongs in the one folder; the client loads the one that matches
+        # itself. Splitting them would break all of them.
+        self.assertEqual(
+            self.install({
+                "r-1a2b/MyAddon.toc": "a", "r-1a2b/MyAddon_Vanilla.toc": "b",
+                "r-1a2b/MyAddon_Wrath.toc": "c", "r-1a2b/MyAddon_Cata.toc": "d",
+            }),
+            ["MyAddon"],
+        )
+
+    def test_a_folder_per_client_is_refused_rather_than_guessed(self):
+        """Wrath/MyAddon and Retail/MyAddon: sort order must not decide this.
+
+        It did, briefly, and silently: "Retail" sorts before "Wrath", so a repo
+        offering both installed the retail build on a Wrath realm with no
+        indication that a choice had even been made. Refusing and naming the
+        options is the only honest answer -- the tool cannot know which client
+        somebody plays.
+        """
+        files = {"r-1a2b/Wrath/MyAddon/MyAddon.toc": "WRATH",
+                 "r-1a2b/Retail/MyAddon/MyAddon.toc": "RETAIL"}
+        with self.assertRaises(addons.Fail) as caught:
+            self.install(files)
+        message = str(caught.exception)
+        self.assertIn("Retail", message)
+        self.assertIn("Wrath", message)
+        self.assertIn("#", message, "the message must say how to choose")
+
+    def test_naming_the_client_folder_installs_that_build(self):
+        files = {"r-1a2b/Wrath/MyAddon/MyAddon.toc": "WRATH",
+                 "r-1a2b/Retail/MyAddon/MyAddon.toc": "RETAIL"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            addons.install_zip(mkzip(files), root, False, only="Wrath")
+            self.assertEqual((root / "MyAddon" / "MyAddon.toc").read_text(), "WRATH")
+
+    def test_one_way_down_is_still_followed_without_a_choice(self):
+        # The refusal must not fire for the ordinary single-addon repo that
+        # simply keeps its addon under src/ -- there is nothing to choose.
+        self.assertEqual(
+            self.install({"r-1a2b/src/MyAddon/MyAddon.toc": "x",
+                          "r-1a2b/docs/readme.md": "y"}),
+            ["MyAddon"],
+        )

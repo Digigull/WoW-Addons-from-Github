@@ -678,12 +678,24 @@ def addon_dirs_in(tree: Path, depth: int = 1) -> list[tuple[Path, str]]:
     # its own libraries (Libs/AceGUI-3.0/AceGUI-3.0.toc), and a search that
     # kept descending would install those as though they were the addon.
     if depth > 0:
+        candidates = {}
         for child in subdirs:
             if child.name.startswith("."):
                 continue
             found = addon_dirs_in(child, depth=depth - 1)
             if found:
-                return found
+                candidates[child.name] = found
+        if len(candidates) == 1:
+            return next(iter(candidates.values()))
+        if len(candidates) > 1:
+            # Several ways down, each holding an addon. This is what a repo with
+            # a folder per client looks like -- Wrath/MyAddon, Retail/MyAddon --
+            # and picking one would be a coin toss decided by sort order. It
+            # really did install Retail on a Wrath realm, silently, and an addon
+            # built for the wrong client is not an error the game reports.
+            names = ", ".join(sorted(candidates))
+            die(f"this repo holds an addon in more than one folder ({names}). "
+                f"Name the one you want: #{sorted(candidates)[0]}")
     return []
 
 
