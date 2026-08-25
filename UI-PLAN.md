@@ -1,7 +1,9 @@
-# Draft: a desktop UI, shipped as a Windows .exe and a Linux AppImage
+# A desktop UI, shipped as a Windows .exe and a Linux AppImage
 
-**Status: draft for discussion. Nothing here is built yet.** The goal is that someone
-picking this up can start at Milestone 1 without re-deciding anything settled below.
+**Status: Milestones 1, 2, 3 and 5 are done. The Linux AppImage is built, and the two
+Windows bugs that gate a credible `.exe` are fixed. Milestone 4 — PyInstaller and a
+Windows release job — is what remains.** Everything below is kept as written except where
+a decision has since been settled by contact with reality; those places say so.
 
 The target: a user downloads one file, double-clicks it, points it at their WoW folder,
 sees their addons in a list, picks a source for each, and clicks Update. No Python, no
@@ -87,18 +89,27 @@ worse answer to "I want an app" than a real window, and it invites a Windows fir
 Tkinter keeps the project's defining property — **stdlib only, nothing to install** — intact
 all the way to the UI.
 
-> **Verify before committing to this:** that the Linux AppImage base actually ships Tk. The
-> `python-appimage` manylinux builds are believed to include `tkinter`, but confirm by running
-> `python -c "import tkinter"` inside the chosen base image before Milestone 4. If it does
-> not, either pick a base that does or bundle Tcl/Tk explicitly. On Windows this is a
-> non-issue: python.org builds include Tk and PyInstaller collects it.
+> **Settled: the base does ship Tk.** The `python-appimage` manylinux builds include
+> `_tkinter`, and the tool relocates the matching Tcl/Tk into `usr/share/tcltk` and points
+> `TCL_LIBRARY`, `TK_LIBRARY` and `TKPATH` at it. Route 1 stands; no fallback was needed.
+>
+> One trap found on the way, which the recipe and `tests/test_packaging.py` now guard:
+> those exports are set by the wrapper script at `usr/bin/pythonX.Y`, **not** by the
+> interpreter under `opt/`, and a recipe's own entry point *replaces* the base `AppRun`.
+> An entry point that calls the interpreter directly yields an AppImage that starts, prints
+> help, scans a folder, passes every CLI check — and cannot open a window. Use
+> `{{ python-executable }}`, which is the wrapper.
+>
+> `packaging/appimage/smoke-test.sh` re-proves this on every build rather than trusting it:
+> it opens a real Tk window inside the image, and then launches the AppImage itself under
+> Xvfb and fails if it exits on its own.
 
 Use `ttk` widgets (`ttk.Treeview` for the table), not the ancient `tk.*` ones — same
 stdlib, considerably less dated.
 
-## 3. The refactor this needs first
+## 3. The refactor this needs first — **done**
 
-`addons.py` is already close to the right shape: the engine functions (`scan_installed`,
+`addons.py` was already close to the right shape: the engine functions (`scan_installed`,
 `latest_github`, `install_zip`, `install_local`, manifest `load`/`save`) have no opinion
 about the terminal. The `cmd_*` functions are where presentation and orchestration are
 tangled — `cmd_update` loops, decides, installs, prints and saves, all in one body.
@@ -154,9 +165,9 @@ Cancellation: a `threading.Event` the worker checks between addons. Mid-download
 cancellation is not worth the complexity — cancelling between addons is enough, and it
 leaves the manifest consistent.
 
-## 5. Windows prerequisites
+## 5. Windows prerequisites — **done**
 
-These are bugs today, independent of the UI, and block a credible Windows build:
+These were bugs independent of the UI, and blocked a credible Windows build:
 
 1. **Junctions instead of symlinks.** `os.symlink` on Windows requires administrator rights
    or Developer Mode. Directory junctions require neither and WoW reads them identically.
@@ -170,15 +181,27 @@ These are bugs today, independent of the UI, and block a credible Windows build:
        dst.symlink_to(src, target_is_directory=True)
    ```
 
-   Removal differs too: a junction is removed with `os.rmdir`, not `os.unlink`, and
-   `Path.is_symlink()` returns True for junctions on modern Python — verify the
-   detach path on a real Windows box, not by reasoning.
+   Removal differs too: a junction is removed with `os.rmdir`, not `os.unlink`.
 
-2. **Manifest to `%APPDATA%`.** Currently lands in `C:\Users\<you>\.config\wow-addons\`.
-   Should be `%APPDATA%\wow-addons\` on Windows, `$XDG_CONFIG_HOME` elsewhere.
+   > **Verified on Windows CI, and the guess in this plan was wrong.** It said
+   > "`Path.is_symlink()` returns True for junctions on modern Python — verify the detach
+   > path on a real Windows box, not by reasoning." Windows CI says **False**, on both
+   > 3.9 and 3.12. Two tests written against `Path.is_symlink()` failed there the moment
+   > junctions went in, which is precisely the check working as intended.
+   >
+   > So `core.is_link()` checks the reparse tag instead of delegating. That check is the
+   > load-bearing one: everything that replaces an installed addon asks "is it a link?"
+   > first and calls `shutil.rmtree` if the answer is no — so an `is_link()` that missed
+   > a junction would send `rmtree` **through** it and delete the user's own source
+   > checkout. There is a test for exactly that, and it runs on Windows.
 
-Both belong in `core.py` and both want a test. CI already runs on `windows-latest`, so a
-junction test will actually be exercised.
+2. **Manifest to `%APPDATA%`.** Used to land in `C:\Users\<you>\.config\wow-addons\`.
+   Now `%APPDATA%\wow-addons\` on Windows, `$XDG_CONFIG_HOME` elsewhere — and the old
+   location is still *read* when the new one is empty, so upgrading does not look like
+   "you have no addons bound". The next write completes the move on its own.
+
+Both landed in `core.py` with tests, and because the CI matrix includes `windows-latest`
+the junction paths are actually executed there rather than reasoned about.
 
 ## 6. Packaging
 
@@ -195,7 +218,7 @@ pyinstaller --noconfirm --windowed --name "WoW Addons from GitHub" addons.py
   archives, which is also what a lot of malware looks like, and they draw heuristic
   antivirus flags far more often. One-dir also starts faster.
 
-### Linux — AppImage
+### Linux — AppImage — **done, route 1**
 
 Two routes, in order of preference:
 
@@ -205,9 +228,11 @@ Two routes, in order of preference:
 2. **PyInstaller `--onedir` + `linuxdeploy` + `appimagetool`** — more control, more moving
    parts. Fall back to this if route 1 cannot supply Tk.
 
-Build on the **oldest glibc you intend to support**, not on Debian 13 — an AppImage built
-against a new glibc will not run on older distributions, and this is the single most common
-way AppImages ship broken.
+~~Build on the **oldest glibc you intend to support**~~ — **this turned out not to apply.**
+The advice is right for anything compiled, and wrong here: with route 1 the glibc floor
+comes from the bundled manylinux2014 interpreter (glibc 2.17, 2012) whatever the build
+machine runs, because nothing in this project is compiled. CI builds on `ubuntu-22.04` for
+the sake of the surrounding tooling, not for the floor.
 
 > **Flag for the user:** AppImages need FUSE 2 at runtime, which recent Debian and Ubuntu
 > releases no longer install by default. Users may need `libfuse2` (`libfuse2t64` on newer
@@ -246,22 +271,40 @@ once there are enough Windows users for it to be worth it.
 
 ## 8. Milestones
 
-| # | Work | Rough effort |
+| # | Work | Status |
 |---|---|---|
-| 1 | Split into `core` / `cli` / `gui` packages; extract `update_addon`; tests still green | 1 day |
-| 2 | Windows junctions + `%APPDATA%`, with tests on the existing Windows CI | 0.5 day |
-| 3 | Tkinter window: folder picker, addon table, Set-source dialog, threaded update with progress | 2–3 days |
-| 4 | PyInstaller Windows build + release workflow | 0.5 day |
-| 5 | AppImage build + release workflow | 1 day |
-| 6 | Real-hardware testing both platforms; README rewrite for non-technical users | 1–2 days |
+| 1 | Split into `core` / `cli` / `gui` packages; extract `update_addon`; tests still green | **done** |
+| 2 | Windows junctions + `%APPDATA%`, with tests on the existing Windows CI | **done** |
+| 3 | Tkinter window: folder picker, addon table, Set-source dialog, threaded update with progress | **done** |
+| 4 | PyInstaller Windows build + release workflow | next |
+| 5 | AppImage build + release workflow | **done** |
+| 6 | Real-hardware testing both platforms; README rewrite for non-technical users | Linux README done; hardware testing outstanding |
 
-**≈ 6–8 focused days.** Milestones 1 and 2 are worth doing regardless of whether the UI
-happens — one is a latent maintenance problem, the other is a real Windows bug.
+Milestone 2 was the gate on the Windows `.exe` and is done: a packaged build that needed
+administrator rights to bind a `local:` source, or that hid its manifest under
+`~/.config`, would not have been worth shipping.
+
+### What the first green build actually produced
+
+| | Estimated in this plan | Measured |
+|---|---|---|
+| Bundled size | ~15 MB | **20 MB** (`WoW-Addons-from-GitHub-x86_64.AppImage`) |
+| Tk inside the image | "believed to include tkinter" | **Tk 8.6 on Python 3.12.14** |
+| glibc floor | "build on the oldest you support" | **2.17**, from the base image, regardless of builder |
+
+The smoke test's last step launches the AppImage itself under Xvfb and fails if it exits
+on its own; on the first green build it stayed up, which is the closest thing to "the
+window opens" that CI can assert.
+
+**Still untested on real hardware.** Nobody has yet run it on a desktop against an actual
+WoW install, and nobody has run the Windows junction code anywhere but CI. That is the
+next thing worth doing, and it is the kind of thing CI cannot stand in for.
 
 ## 9. Open questions
 
-1. **Does the CLI stay supported?** This plan assumes yes, and that it costs almost nothing
-   once `core` is extracted. Say if you would rather the UI simply replace it.
+1. ~~**Does the CLI stay supported?**~~ **Yes, and it did cost almost nothing.** The CLI is
+   unchanged in behaviour, `addons.py` still works from a checkout, and the AppImage runs
+   the CLI too when given arguments.
 2. **Auto-update of the app itself?** Deliberately excluded — it is a large amount of work
    and, on Windows, roughly doubles the code-signing problem. Manual download for now.
 3. **A "check for addon updates on launch" toggle?** Cheap to add, but it means the app
@@ -269,4 +312,6 @@ happens — one is a latent maintenance problem, the other is a real Windows bug
    **off by default** if it exists at all.
 4. **Do you want a packaged CLI too**, or is the terminal path "install Python and run the
    script"? Affects whether Milestone 4 ships one binary or two.
-5. **Minimum Linux version to support** — decides the AppImage build image.
+5. ~~**Minimum Linux version to support**~~ — **answered by the base image, not by a
+   decision:** glibc 2.17 and newer, which is CentOS 7 era and older than anything anyone
+   is realistically running.

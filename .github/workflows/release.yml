@@ -1,0 +1,66 @@
+name: release
+
+# Deliberately separate from tests.yml, and deliberately not on every push: a
+# slow build on every commit is how people stop watching CI. It runs on a tag,
+# on demand, and on changes to the things that can break the build itself.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "packaging/**"
+      - "wowaddons/**"
+      - "addons.py"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  appimage:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # xvfb is for the smoke test, which opens a real window. It is not a
+      # build dependency and nothing from it ends up in the AppImage.
+      - name: Tools the smoke test needs
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
+
+      - name: Build
+        run: packaging/appimage/build.sh
+
+      # This is the step that matters. It proves Tk works inside the image
+      # rather than assuming the base ships it -- see the script for why that
+      # is worth a whole job's worth of care.
+      - name: Smoke test
+        run: packaging/appimage/smoke-test.sh dist/WoW-Addons-from-GitHub-x86_64.AppImage
+
+      - name: What went in it
+        run: |
+          ls -lh dist/
+          sha256sum dist/*.AppImage | tee dist/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WoW-Addons-from-GitHub-x86_64.AppImage
+          path: dist/
+          if-no-files-found: error
+
+      # `gh` is already on the runner, so the release needs no third-party
+      # action -- which suits a project whose selling point is a small trust
+      # surface.
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 \
+            || gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes
+          gh release upload "${GITHUB_REF_NAME}" \
+            dist/WoW-Addons-from-GitHub-x86_64.AppImage dist/SHA256SUMS.txt --clobber

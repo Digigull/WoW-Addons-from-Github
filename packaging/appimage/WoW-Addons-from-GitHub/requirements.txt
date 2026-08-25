@@ -1,0 +1,6 @@
+# The tool has no dependencies and never will -- that is the point of it. This
+# line is not a package from PyPI: python-appimage's `local+` prefix copies the
+# `wowaddons` package straight out of this checkout into the AppImage's
+# site-packages, which is why the build has to run from the repository root
+# with it importable (build.sh sets PYTHONPATH for exactly this).
+local+wowaddons
