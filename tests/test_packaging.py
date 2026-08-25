@@ -17,6 +17,7 @@ CLI smoke test -- and then cannot open a window.
 import ast
 import os
 import pathlib
+import sys
 import re
 import struct
 import unittest
@@ -313,6 +314,69 @@ class NothingWindowsCannotCheckOut(unittest.TestCase):
             )
         ]
         self.assertEqual(offenders, [], "these break `git checkout` on Windows")
+
+
+class Releasing(unittest.TestCase):
+    """The release machinery, which is only ever exercised for real on a tag.
+
+    Everything here is cheap and checked on every push, because the alternative
+    is finding out at the moment somebody is trying to cut a release.
+    """
+
+    NOTES = ROOT / ".github" / "release-notes.md"
+    WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
+
+    def test_the_version_is_reportable(self):
+        # A shipped binary that cannot say which build it is makes every bug
+        # report start with a guessing game.
+        import subprocess
+
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "addons.py"), "--version"],
+            capture_output=True, text=True, cwd=ROOT,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        import wowaddons
+
+        self.assertIn(wowaddons.__version__, result.stdout)
+
+    def test_the_window_shows_the_version_too(self):
+        # A GUI has no --version, so the title bar is where it has to appear.
+        gui = (ROOT / "wowaddons" / "gui.py").read_text()
+        self.assertIn("__version__", gui)
+
+    def test_the_release_notes_exist_where_the_workflow_looks(self):
+        # gh release create --notes-file fails the publish if this is missing,
+        # after both builds have already run.
+        workflow = self.WORKFLOW.read_text()
+        self.assertIn("--notes-file .github/release-notes.md", workflow)
+        self.assertTrue(self.NOTES.is_file())
+        self.assertGreater(len(self.NOTES.read_text()), 500, "notes look like a stub")
+
+    def test_the_notes_name_the_files_the_builds_actually_produce(self):
+        # Release notes telling somebody to download a filename that does not
+        # exist is the first thing they see and the easiest thing to get wrong.
+        notes = self.NOTES.read_text()
+        self.assertIn("WoW-Addons-from-GitHub-x86_64.AppImage", notes)
+        self.assertIn("WoW-Addons-from-GitHub-windows-x64", notes)
+
+        appimage = (ROOT / "packaging/appimage/build.sh").read_text()
+        self.assertIn("WoW-Addons-from-GitHub-$ARCH.AppImage", appimage)
+        windows = (ROOT / "packaging/windows/build.py").read_text()
+        self.assertIn('"WoW-Addons-from-GitHub-windows-x64"', windows)
+
+    def test_the_notes_warn_about_both_first_run_scares(self):
+        # SmartScreen and the missing libfuse2 are the two things that look
+        # like faults and are not. Leaving either out generates bug reports.
+        notes = self.NOTES.read_text().lower()
+        self.assertIn("smartscreen", notes)
+        self.assertIn("libfuse", notes)
+
+    def test_the_publish_waits_for_the_version_check(self):
+        # Otherwise a mismatched tag still publishes; the check would just go
+        # red beside it.
+        workflow = self.WORKFLOW.read_text()
+        self.assertIn("needs: [appimage, windows, version-matches-tag]", workflow)
 
 
 class Scripts(unittest.TestCase):
