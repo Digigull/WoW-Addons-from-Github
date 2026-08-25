@@ -43,6 +43,8 @@ below.
 > is the only thing that removes that, and it costs a few hundred dollars a year — not worth
 > it until enough people are using this to justify it.
 
+Not sure which build you have? `--version` says, and the window puts it in its title bar.
+
 ### The terminal
 
 ```
@@ -101,6 +103,8 @@ Running from a checkout instead needs **Python 3.9 or newer**, and that is the w
 | `accept` | Take every source that `scan` suggested, in one go. |
 | `update [Addon...]` | Bring bound addons up to date. Defaults to all of them. |
 | `where` | Print the manifest and AddOns paths. |
+
+`--version` prints the version and exits; the window shows it in the title bar.
 
 Useful flags on `update`: `--check` (report what is out of date, download nothing),
 `--dry-run`, `--force` (reinstall even when the version matches).

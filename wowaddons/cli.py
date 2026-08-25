@@ -10,7 +10,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import core
+from . import __version__, core
 from .core import Fail
 
 EPILOG = """\
@@ -218,6 +218,13 @@ def build_parser(prog: str = "addons.py", epilog: str | None = None) -> argparse
         description="Bind each installed WoW addon to the repo you want it updated from.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=EPILOG if epilog is None else epilog,
+    )
+    # Before the subparsers, so `--version` works on its own. Every bug report
+    # about a downloaded binary starts with "which build?", and a user who
+    # double-clicked an AppImage has no other way to answer that.
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}",
+        help="print the version and exit",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

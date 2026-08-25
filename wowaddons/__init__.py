@@ -12,4 +12,8 @@ addon at a time, so the rule that one failure does not sink the run is written
 once rather than once per front end.
 """
 
-__version__ = "0.2.0"
+# Single source of truth. `--version` reports it, the window puts it in its
+# title bar, and the release tag is expected to match -- a test checks that the
+# tag being built is the version being shipped, because a binary that lies
+# about which build it is makes every bug report start from nothing.
+__version__ = "0.3.0"

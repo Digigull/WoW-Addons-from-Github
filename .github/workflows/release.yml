@@ -78,11 +78,29 @@ jobs:
           path: dist/WoW-Addons-from-GitHub-windows-x64.zip
           if-no-files-found: error
 
+  version-matches-tag:
+    # A tag that ships a binary calling itself something else is how you end up
+    # unable to reproduce a bug report. Cheap to check, and better here than
+    # after both builds have spent five minutes.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag and wowaddons.__version__ must agree
+        run: |
+          declared=$(python3 -c "import wowaddons; print(wowaddons.__version__)")
+          tagged="${GITHUB_REF_NAME#v}"
+          echo "tag says $tagged, code says $declared"
+          if [ "$declared" != "$tagged" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} ships a build calling itself $declared"
+            exit 1
+          fi
+
   publish:
     # One job creates the release, after both builds have proved themselves.
     # Attaching from each build job instead would race: two jobs would find no
     # release and both try to create it, and one of them would lose.
-    needs: [appimage, windows]
+    needs: [appimage, windows, version-matches-tag]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -99,11 +117,18 @@ jobs:
       # `gh` is already on the runner, so the release needs no third-party
       # action -- which suits a project whose selling point is a small trust
       # surface.
+      # --prerelease, deliberately. Both downloads are verified by CI on every
+      # build, but neither has been run on real hardware against an actual WoW
+      # install. GitHub's "Pre-release" label says exactly that, and it is one
+      # click to promote once somebody has. Drop the flag when that is true.
       - name: Create the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
           gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 \
-            || gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes
+            || gh release create "${GITHUB_REF_NAME}" \
+                 --title "${GITHUB_REF_NAME}" \
+                 --prerelease \
+                 --notes-file .github/release-notes.md
           gh release upload "${GITHUB_REF_NAME}" dist/* --clobber

@@ -32,7 +32,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import core
+from . import __version__, core
 from .core import Fail
 
 POLL_MS = 100
@@ -328,7 +328,10 @@ class App(ttk.Frame):
         self.worker: _Worker | None = None
         self.failures = self.updated = 0
 
-        master.title("WoW Addons from GitHub")
+        # The version belongs where a user can read it off without hunting: a
+        # GUI has no --version, and "which build are you running?" is the first
+        # question any bug report needs answered.
+        master.title(f"WoW Addons from GitHub {__version__}")
         master.minsize(760, 420)
         self.grid(sticky="nsew")
         master.columnconfigure(0, weight=1)
