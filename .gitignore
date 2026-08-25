@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+# PyInstaller output, for when the Windows build lands
+build/
+dist/
+*.spec
