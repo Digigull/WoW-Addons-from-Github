@@ -58,7 +58,7 @@ from pathlib import Path
 
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "wow-addons"
 MANIFEST = CONFIG_DIR / "manifest.json"
-USER_AGENT = "ascension-addons-sync (stdlib urllib)"
+USER_AGENT = "wow-addons-sync (stdlib urllib)"
 
 # ── output ───────────────────────────────────────────────────────────────────
 # Same shape as the converter's deploy script, so output from the two reads the
