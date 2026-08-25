@@ -162,6 +162,15 @@ class SourceDialog(tk.Toplevel):
                         command=self._sync).grid(row=0, column=0, sticky="w", **pad)
         self.local_entry = ttk.Entry(body, textvariable=self.local, width=44)
         self.local_entry.grid(row=0, column=1, sticky="ew", **pad)
+        # Re-check as the path is edited: which folder is at risk depends on
+        # what is typed, so a warning that only updated on a radio click would
+        # be stale the moment someone pointed at a different checkout.
+        #
+        # A widget binding rather than a StringVar trace, deliberately: a trace
+        # outlives the dialog and Tcl tears it down from whatever thread the
+        # garbage collector happened to be on, which aborts the process with
+        # "Tcl_AsyncDelete: async handler deleted by the wrong thread".
+        self.local_entry.bind("<KeyRelease>", self._show_caution)
         self.browse = ttk.Button(body, text="Browse…", command=self._browse)
         self.browse.grid(row=0, column=2, **pad)
         self.copy_box = ttk.Checkbutton(body, text="copy files instead of linking", variable=self.copy)
@@ -209,21 +218,48 @@ class SourceDialog(tk.Toplevel):
         self.branch_entry.configure(state="normal" if choice == "github" and self.track.get() else "disabled")
         self._show_caution()
 
-    def _show_caution(self) -> None:
+    def _displaced(self) -> tuple[str, Path] | None:
+        """(folder name, where it would be moved to), or None if nothing is at risk.
+
+        The folder that actually gets displaced is named after the SOURCE, not
+        after the addon: binding "OldThing" to a checkout called OldThing-fork
+        installs OldThing-fork, because the client matches folder name to the
+        .toc inside and renaming on the way in would break it. Warning about
+        the wrong folder would be worse than not warning at all.
+        """
+        choice = self.choice.get()
+        if choice == "unmanaged":
+            return None
+        if choice == "local":
+            path = self.local.get().strip()
+            if not path:
+                return None
+            backup = core.will_displace({"source": f"local:{path}"}, self.addons_root)
+            return (Path(path).name, backup) if backup else None
+
+        # github: which folders the archive contains is not knowable until it
+        # has been downloaded, so the addon's own name is the best guess going.
         existing = self.addons_root / self.addon
-        if self.choice.get() != "unmanaged" and existing.exists() and not existing.is_symlink():
-            backup = core.backup_name(existing).name
-            self.caution.configure(
-                text=f"⚠  {self.addon} is real files in your AddOns folder right now. "
-                     f"Updating it will move that folder aside to {backup} rather than delete it."
-            )
-        else:
+        if existing.exists() and not existing.is_symlink():
+            return self.addon, core.backup_name(existing)
+        return None
+
+    def _show_caution(self, *_a) -> None:
+        displaced = self._displaced()
+        if displaced is None:
             self.caution.configure(text="")
+            return
+        name, backup = displaced
+        self.caution.configure(
+            text=f"⚠  {name} is real files in your AddOns folder right now. "
+                 f"Updating it will move that folder aside to {backup.name} rather than delete it."
+        )
 
     def _browse(self) -> None:
         chosen = filedialog.askdirectory(title=f"Folder holding {self.addon}", parent=self)
         if chosen:
             self.local.set(chosen)
+            self._show_caution()
 
     def _save(self) -> None:
         choice = self.choice.get()

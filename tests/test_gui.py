@@ -198,7 +198,51 @@ class WindowTests(unittest.TestCase):
         (self.addons / "Loose" / "old.lua").write_text("x")
         dlg = self.dialog("Loose")
         dlg.choice.set("local")
+        dlg.local.set(str(self.addons.parent / "checkouts" / "Loose"))
         dlg._sync()
+        self.assertIn("Loose.replaced", dlg.caution.cget("text"))
+        dlg.destroy()
+
+    def test_a_github_source_still_warns_about_the_addons_own_folder(self):
+        # Which folders a downloaded archive contains cannot be known in
+        # advance, so the addon's own name is the best guess available.
+        (self.addons / "Loose").mkdir()
+        dlg = self.dialog("Loose")
+        dlg.choice.set("github")
+        dlg._sync()
+        self.assertIn("Loose.replaced", dlg.caution.cget("text"))
+        dlg.destroy()
+
+    def test_the_caution_names_the_source_folder_not_the_addon(self):
+        # Binding "Loose" to a checkout called Loose-fork installs Loose-fork,
+        # because the client matches folder name to the .toc inside. Warning
+        # about the wrong folder would be worse than not warning at all.
+        (self.addons / "Loose-fork").mkdir()
+        (self.addons / "Loose").mkdir()
+        dlg = self.dialog("Loose")
+        dlg.choice.set("local")
+        dlg.local.set(str(self.addons.parent / "checkouts" / "Loose-fork"))
+        dlg._sync()
+        self.assertIn("Loose-fork.replaced", dlg.caution.cget("text"))
+        self.assertNotIn("Loose.replaced", dlg.caution.cget("text"))
+        dlg.destroy()
+
+    def test_the_caution_follows_what_is_typed(self):
+        # Typed, not just chosen by radio button: the warning has to track the
+        # path, or it is stale the moment someone points at another checkout.
+        (self.addons / "Loose").mkdir()
+        dlg = self.dialog("Loose")
+        dlg.choice.set("local")
+        dlg._sync()
+        self.assertEqual(dlg.caution.cget("text"), "", "nothing typed yet, nothing at risk")
+
+        # Really type it: a synthetic KeyRelease is delivered to the focused
+        # widget, so without the focus_force nothing reaches the binding and
+        # the test would pass for the wrong reason.
+        dlg.local_entry.focus_force()
+        dlg.update()
+        dlg.local_entry.insert("end", str(self.addons.parent / "checkouts" / "Loose"))
+        dlg.local_entry.event_generate("<KeyRelease>", when="now")
         self.assertIn("Loose.replaced", dlg.caution.cget("text"))
         dlg.destroy()
 
