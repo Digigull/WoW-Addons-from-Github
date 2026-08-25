@@ -117,7 +117,8 @@ Two things are still Linux-shaped, and both are small:
 2. **The manifest goes to `~/.config/wow-addons/`** rather than `%APPDATA%`, which works but
    is not where a Windows tool should keep it.
 
-A packaged `.exe` is planned after those, so Windows users need no Python install at all.
+A desktop UI shipped as a Windows `.exe` and a Linux AppImage is planned, with those two
+items as prerequisites. The design and packaging plan is drafted in [UI-PLAN.md](UI-PLAN.md).
 
 ## Development
 
