@@ -162,9 +162,11 @@ def cmd_scan(args, state: dict) -> None:
     install = selected(args, state)
     root = core.addons_dir(install)
     step(f"Scanning {root}")
-    installed, guessed = core.rescan(install, root)
+    installed, guessed, forgotten = core.rescan(install, root)
     core.save(state)
     note(f"{installed} addon folder(s) installed")
+    if forgotten:
+        note(f"{forgotten} unmanaged addon(s) no longer on disk -- dropped from the list")
     if guessed:
         note(f"{guessed} with a source found or suggested -- see `addons.py list`")
     note("")
@@ -231,6 +233,9 @@ def cmd_update(args, state: dict) -> None:
     root = core.addons_dir(install)
     entries = install.get("addons", {})
     names = args.addons or core.display_order(entries)
+    # The flag turns it on for one run; the window's checkbox is what sets it
+    # for good, and both front ends read the same answer.
+    offline = args.offline or core.checks_offline(install)
 
     # Waiting on GitHub with nothing on screen reads as a hang, and the pacing
     # only exists to be waited on, so it says so.
@@ -239,7 +244,8 @@ def cmd_update(args, state: dict) -> None:
     # about it so the next run can ask for free.
     core.begin_run()
 
-    step("Update" + (" (dry run)" if args.dry_run else ""))
+    step("Update" + (" (dry run)" if args.dry_run else "")
+         + (" — without the GitHub API" if offline else ""))
     changed = skipped = 0
     failed: list[str] = []
     for name in names:
@@ -249,7 +255,8 @@ def cmd_update(args, state: dict) -> None:
             continue
 
         result = core.update_addon(
-            name, entry, root, force=args.force, dry_run=args.dry_run, check=args.check
+            name, entry, root, force=args.force, dry_run=args.dry_run,
+            check=args.check, offline=offline,
         )
         for level, message in result.notes:
             show(level, message)
@@ -378,6 +385,8 @@ def build_parser(prog: str = "addons.py", epilog: str | None = None) -> argparse
     p.add_argument("--check", action="store_true", help="report what is out of date, download nothing")
     p.add_argument("--dry-run", action="store_true", help="do everything but write")
     p.add_argument("--force", action="store_true", help="reinstall even if the version matches")
+    p.add_argument("--offline", action="store_true",
+                   help="check without the GitHub API: follows branches, not releases")
     p.set_defaults(func=cmd_update)
 
     p = sub.add_parser("where", help="print the manifest and AddOns paths")

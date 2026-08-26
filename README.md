@@ -98,7 +98,7 @@ Running from a checkout instead needs **Python 3.9 or newer**, and that is the w
 | Command | What it does |
 |---|---|
 | `init <path>` | Remember where the client is. Accepts your WoW folder, its `Interface` folder, or `Interface/AddOns` itself. |
-| `scan` | Read every addon already installed and record it, guessing a source from each `.toc` where it can. |
+| `scan` | Read every addon already installed and record it, guessing a source from each `.toc` where it can. Drops unmanaged rows whose folder you have deleted; keeps bound ones, flagged *not installed*. |
 | `list` | Every addon, its source, and its installed version. Bound addons first, then the rest, each alphabetically. |
 | `set <Addon> <source>` | Bind one addon to where its updates come from. |
 | `accept` | Take every source that `scan` suggested, in one go. |
@@ -318,6 +318,11 @@ Everything the terminal does, in one window:
   not write, whatever it recorded about the addon you bound. Turn the copy
   off entirely with `--no-backup`, or the checkbox in the Set-source dialog, and an
   existing folder is replaced outright.
+- **A rescan never throws away a binding.** An unmanaged row whose folder you deleted is
+  dropped from the list, because it held nothing of yours. A row you had bound is kept and
+  flagged *not installed* — that is also how an addon you have bound but not yet fetched
+  appears, and the binding is the one thing scanning cannot work out again. Set its source
+  to `unmanaged` and rescan to be rid of it.
 - **One failed source does not sink the run.** An unreachable, private or renamed repository
   is reported and skipped — everything else still updates, and the manifest still saves.
 - **Archives containing `../` paths are refused.** This unpacks zips published by third
@@ -376,6 +381,30 @@ Nothing is taken on trust anywhere in that. A ref that cannot be seen is never r
 unchanged, an unreadable listing is ignored rather than guessed at, and a private
 repository or a network that blocks git falls straight back to the REST path — the same
 shape as codeload falling back to the API zipball.
+
+### Checking without the API at all
+
+The 60 an hour is counted **per address**, so on a shared, office or CGNAT connection
+something else can spend yours. For that case there is a checkbox — *Check without the
+GitHub API*, or `--offline` in the terminal — under which no API call is made under any
+circumstance:
+
+- an addon's version comes from hashing its folder inside the repository's archive, which
+  comes from the same host as the *Download ZIP* button and costs no quota;
+- the digest is kept against the commit it came from, so it is computed once ever, and the
+  free ref listing means an archive is only fetched when the branch has actually moved;
+- an addon bound to a whole repository downloads nothing at all to check — the ref listing
+  already carries the commit.
+
+**It cannot see releases**, and that is why it is a checkbox rather than the default. A
+release asset is a file the author *uploaded*; it is not in the repository, so no amount
+of downloading the repository will find it. Addons checked this way follow their default
+branch and install the source tree instead of the author's packaged zip — which for an
+addon whose author ships a properly packaged build is a real downgrade, not just a slower
+route. Bandwidth replaces quota. Leave it off unless you are actually hitting the limit.
+
+The setting is per install, so a server behind a shared address and one at home need not
+agree about it.
 
 Both front ends print how many calls are left after a run, and say when they are waiting
 and why, so a pause never looks like a hang. What was learned is kept in

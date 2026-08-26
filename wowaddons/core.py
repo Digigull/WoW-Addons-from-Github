@@ -289,6 +289,15 @@ def save(state: dict) -> None:
     tmp.replace(MANIFEST)
 
 
+def checks_offline(install: dict) -> bool:
+    """Whether this install checks without the GitHub REST API."""
+    return bool(install.get("offline"))
+
+
+def set_checks_offline(install: dict, offline: bool) -> None:
+    install["offline"] = bool(offline)
+
+
 def addons_dir(install: dict) -> Path:
     """The AddOns folder of one install -- not of the manifest as a whole."""
     state = one_install(install, "addons_dir")
@@ -451,8 +460,8 @@ def scan_installed(root: Path) -> dict[str, dict]:
     return found
 
 
-def rescan(state: dict, root: Path) -> tuple[int, int]:
-    """Fold what is on disk into the manifest. Returns (installed, guessed).
+def rescan(state: dict, root: Path) -> tuple[int, int, int]:
+    """Fold what is on disk into the manifest. (installed, guessed, forgotten).
 
     Does not save -- the caller decides when to write, which matters for a GUI
     that may want to scan speculatively.
@@ -479,12 +488,30 @@ def rescan(state: dict, root: Path) -> tuple[int, int]:
             entry["suggested"] = facts["guess"]
             guessed += 1
 
-    # Anything in the manifest that is no longer on disk.
+    # Anything in the manifest that is no longer on disk. What happens next
+    # depends on whether the row holds a decision of yours.
+    #
+    # A bound row is KEPT and flagged. "Not installed" is a real state, not an
+    # error: it is how an addon you have bound but not yet fetched appears, and
+    # how one you deleted to force a clean reinstall appears between the delete
+    # and the update. Dropping it would throw away the binding you set, which
+    # is the only thing in this manifest you cannot get back by scanning again.
+    #
+    # An unmanaged row holds nothing of yours -- it is a note that a folder was
+    # once there, and the folder is not there any more. Keeping it means the
+    # list slowly fills with addons you deleted on purpose and cannot get rid
+    # of, because nothing else in this tool removes a row.
+    forgotten = 0
     for name in list(entries):
-        if name not in installed:
+        if name in installed:
+            continue
+        if entries[name].get("source", "unmanaged") == "unmanaged":
+            del entries[name]
+            forgotten += 1
+        else:
             entries[name]["missing"] = True
 
-    return len(installed), guessed
+    return len(installed), guessed, forgotten
 
 
 # ── sources ──────────────────────────────────────────────────────────────────
@@ -961,6 +988,7 @@ def begin_run() -> None:
     answers that have not changed.
     """
     _run_cache.clear()
+    _recent_archive.clear()
     # Refetched every run on purpose: comparing this run's listing against the
     # one kept from last run is what says whether anything moved, and a
     # listing held over from the previous pass would answer "no" for ever.
@@ -991,6 +1019,7 @@ def forget_github_state() -> None:
     """Drop everything remembered about GitHub, in memory. For a fresh look."""
     global _store, _store_dirty
     _run_cache.clear()
+    _recent_archive.clear()
     _refs_now.clear()
     _refs_before.clear()
     _store = None
@@ -1498,7 +1527,185 @@ def latest_github(repo_spec: str) -> tuple[str, str]:
     return sha, archive_url(repo, ref)
 
 
-def addons_in_repo(repo_spec: str) -> list[str]:
+# -- checking without the API at all -----------------------------------------
+#
+# Everything above spends the REST quota carefully. This spends none of it.
+#
+# Two questions still reach the API in the ordinary path: which commit last
+# touched a folder, and what a release has attached to it. Both have an answer
+# that costs no quota, because the archive itself is served from codeload,
+# which is not the API:
+#
+#   the version of a folder      hash what is inside it, in the archive
+#   the folders a repo holds     read them out of the archive
+#
+# What it cannot do is see a release. A release asset is a file the author
+# UPLOADED; it is not in the repository, so no amount of downloading the
+# repository will find it. An addon checked this way therefore follows its
+# default branch instead of its releases, and installs the source tree rather
+# than the author's packaged zip. That is a real difference and it is why this
+# is a checkbox rather than the default.
+#
+# The cost is bandwidth in place of quota. It is smaller than it sounds: a
+# digest is stored against the commit it was taken from, so it is computed once
+# ever for a given commit, and the ref advertisement (free) means an archive is
+# only fetched when the branch has actually moved.
+
+_recent_archive: dict[str, bytes] = {}
+
+
+def archive_bytes(url: str) -> bytes:
+    """The archive at `url`, reusing the last one when it is the same.
+
+    An offline check downloads an archive to work out a version and the install
+    immediately wants the same bytes. Keeping exactly one is enough to make
+    that one download instead of two, without holding a pile of repositories in
+    memory -- which, for a mode whose whole cost is bandwidth, would be a poor
+    trade.
+    """
+    if url in _recent_archive:
+        return _recent_archive[url]
+    blob = download(url)
+    _recent_archive.clear()
+    _recent_archive[url] = blob
+    return blob
+
+
+def without_wrapper(names: list[str]) -> str:
+    """The single directory a GitHub archive wraps everything in, or ''.
+
+    `codeload` hands back `repo-main/...`; the wrapper is an artefact of how
+    the archive is built and is not part of any path in the repository.
+    """
+    tops = {name.split("/", 1)[0] for name in names if "/" in name}
+    return tops.pop() + "/" if len(tops) == 1 else ""
+
+
+def digests_in_archive(blob: bytes) -> dict[str, str]:
+    """A content digest for every addon folder in an archive.
+
+    Every folder at once, deliberately: nine addons in one repository would
+    otherwise mean nine downloads of the same archive to hash them one at a
+    time. Digesting the lot costs one pass over bytes already in hand.
+
+    A folder is an addon when it holds a .toc named after itself -- the same
+    rule the installer and the repository listing apply, so this cannot promise
+    something the install would then not find. One level of nesting is allowed
+    (`src/MyAddon`); a candidate sitting inside another is a bundled library
+    (`MyAddon/Libs/AceGUI-3.0`) and is not offered separately.
+
+    A digest covers EVERYTHING under the folder, libraries included -- a change
+    inside `MyAddon/Libs` is a change to MyAddon, and an addon that did not
+    notice its own bundled code moving would be worse than no digest at all.
+    So it moves when and only when that addon's own files move, which is a
+    closer answer than "the last commit that touched it".
+    """
+    import hashlib
+
+    with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+        listed = archive.namelist()
+        lead = without_wrapper(listed)
+        paths = {}
+        for name in listed:
+            if name.endswith("/"):
+                continue
+            path = name[len(lead):] if name.startswith(lead) else name
+            if path:
+                paths[path] = name
+
+        candidates = set()
+        for path in paths:
+            if "/" not in path:
+                continue
+            folder = path.rsplit("/", 1)[0]
+            if folder.count("/") > 1:
+                continue
+            leaf = folder.rsplit("/", 1)[-1]
+            if path.rsplit("/", 1)[-1].lower() == f"{leaf.lower()}.toc":
+                candidates.add(folder)
+
+        digests = {}
+        for folder in sorted(candidates):
+            if any(folder.startswith(other + "/") for other in candidates if other != folder):
+                continue
+            digest = hashlib.sha256()
+            for path in sorted(p for p in paths if p.startswith(folder + "/")):
+                digest.update(path.encode())
+                digest.update(archive.read(paths[path]))
+            digests[folder] = digest.hexdigest()[:12]
+    return digests
+
+
+def digest_key(repo: str, sha: str, folder: str) -> str:
+    return f"digest:{repo}@{sha}:{folder}"
+
+
+def folder_digest(repo: str, ref: str, folder: str) -> str:
+    """This folder's version, worked out from the archive rather than the API.
+
+    Kept against the commit it was taken from, so it is never stale and never
+    computed twice: the same commit always has the same contents.
+    """
+    global _store_dirty
+    sha = ref_sha(repo, ref) or ref
+    known = store().get(digest_key(repo, sha, folder))
+    if known and known.get("digest"):
+        touch(digest_key(repo, sha, folder))
+        return known["digest"]
+
+    blob = archive_bytes(archive_url(repo, ref, tag=names_a_tag(repo, ref)))
+    digests = digests_in_archive(blob)
+    for name, value in digests.items():
+        store()[digest_key(repo, sha, name)] = {"digest": value, "at": time.time()}
+    _store_dirty = True
+    if folder not in digests:
+        die(f"nothing in {repo} holds '{folder}' -- check the folder name")
+    return digests[folder]
+
+
+def offline_ref(repo: str, branch: str | None) -> str:
+    """Which ref to follow, without asking the API which one is default."""
+    found = git_refs(repo)
+    if not found:
+        die(f"cannot reach git for {repo}.\n"
+            "     Checking without the GitHub API needs github.com reachable;\n"
+            "     untick that box to use the API instead.")
+    ref = branch or found.get("head")
+    if not ref or ref_sha(repo, ref) is None:
+        die(f"no branch or tag '{branch or found.get('head')}' in {repo}")
+    return ref
+
+
+def offline_version(repo_spec: str) -> tuple[str, str]:
+    """(version, archive url) for a source, spending no REST quota at all.
+
+    Follows the default branch rather than releases -- see the note above.
+    """
+    repo, branch, folder = split_repo_spec(repo_spec)
+    ref = offline_ref(repo, branch)
+    url = archive_url(repo, ref, tag=names_a_tag(repo, ref))
+
+    chosen = wanted_folders(folder)
+    if not chosen:
+        # No folder named: the ref's own commit is the version, and the ref
+        # advertisement already told us it. Nothing is downloaded to check.
+        return ref_sha(repo, ref)[:12], url
+
+    version = folder_digest(repo, ref, chosen[0])
+    for extra in chosen[1:]:
+        version = f"{version}+{folder_digest(repo, ref, extra)[:7]}"
+    return version, url
+
+
+def offline_addons_in_repo(repo_spec: str) -> list[str]:
+    """The addon folders a repository holds, read out of its archive."""
+    repo, branch, _folder = split_repo_spec(repo_spec)
+    ref = offline_ref(repo, branch)
+    blob = archive_bytes(archive_url(repo, ref, tag=names_a_tag(repo, ref)))
+    return sorted(digests_in_archive(blob), key=str.lower)
+
+
+def addons_in_repo(repo_spec: str, *, offline: bool = False) -> list[str]:
     """The addon folders a repository holds, for somebody to choose from.
 
     A folder counts as an addon when it holds a .toc named after itself -- the
@@ -1514,6 +1721,9 @@ def addons_in_repo(repo_spec: str) -> list[str]:
     choosing what to install means it -- and installing it separately is the
     mistake `addon_dirs_in` is bounded to avoid.
     """
+    if offline:
+        return offline_addons_in_repo(repo_spec)
+
     repo, branch, _folder = split_repo_spec(repo_spec)
     ref = branch or default_branch(repo)
     tree = http_json(f"https://api.github.com/repos/{repo}/git/trees/{ref}?recursive=1")
@@ -1953,6 +2163,7 @@ def update_addon(
     force: bool = False,
     dry_run: bool = False,
     check: bool = False,
+    offline: bool = False,
     progress=None,
 ) -> Result:
     """Update a single addon. Returns what happened; never prints.
@@ -2000,7 +2211,7 @@ def update_addon(
 
         progress("checking", rest)
         _repo, _branch, folder = split_repo_spec(rest)
-        version, url = latest_github(rest)
+        version, url = offline_version(rest) if offline else latest_github(rest)
         result.version = version
         if entry.get("installed") == version and not force:
             return Result(name=name, outcome=UP_TO_DATE, detail=f"up to date ({version})", version=version)
@@ -2010,7 +2221,9 @@ def update_addon(
             return result
 
         progress("downloading", f"{rest} {version}")
-        blob = download(url)
+        # Offline checking has usually just fetched this exact archive to work
+        # the version out; reuse those bytes rather than paying for them twice.
+        blob = archive_bytes(url) if offline else download(url)
         progress("installing", rest)
         # backup= is the user's own preference; the entry decides folder by
         # folder which of them that preference actually applies to.
