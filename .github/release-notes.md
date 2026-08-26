@@ -2,6 +2,18 @@ Update your World of Warcraft addons from repositories **you** choose. No catalo
 account, and no telemetry of any kind — it contacts exactly the hosts named in your own
 manifest and nothing else.
 
+## Fixed in v0.5.1
+
+**Set source did nothing in v0.5.0.** Choosing any source in the window — a repo, a
+folder, or Unmanaged — failed silently: nothing was saved, and the table redrew the value
+that was already there. It looked like the app reverting your choice on purpose. The
+manifest was never touched, so nothing was lost and nothing needs undoing; re-set the
+source on v0.5.1 and it holds. The terminal (`addons.py set`) was never affected.
+
+An unexpected error in the window now says so, instead of going to a console a windowed
+build does not have. That is what turned a one-line bug into something that looked like
+the program disobeying you.
+
 ## New since v0.3.1
 
 **Several WoW folders at once.** A vanilla server, a Wrath one and retail are separate

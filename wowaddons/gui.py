@@ -28,12 +28,15 @@ from __future__ import annotations
 
 import queue
 import threading
+import traceback
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from . import __version__, core
 from .core import Fail
+
+ISSUES_URL = "https://github.com/Digigull/WoW-Addons-from-Github/issues"
 
 POLL_MS = 100
 UNMANAGED_LABEL = "(unmanaged)"
@@ -700,11 +703,34 @@ class App(ttk.Frame):
     # -- actions -------------------------------------------------------------
 
     def guard(self, action):
-        """Run something that may raise Fail, and put the message in a dialog."""
+        """Run something that may fail, and put the reason in a dialog.
+
+        Fail is the expected kind: a repo that cannot be reached, a folder that
+        is not there. Anything else is a bug in this program -- but a windowed
+        build has no console, so an unhandled exception in a button callback
+        goes nowhere at all. The button then appears to do nothing, and the
+        table redraws the old value, which reads as the app quietly undoing
+        what you asked for.
+
+        That is not hypothetical: v0.5.0 shipped with `Set source` raising
+        TypeError on every use, and it was reported as "it reverts back to the
+        source instead of leaving it unmanaged". Showing the error would not
+        have fixed the bug, but it would have named it.
+        """
         try:
             return action()
         except Fail as exc:
             messagebox.showerror("Cannot do that", str(exc), parent=self)
+            return None
+        except Exception as exc:  # noqa: BLE001 - see above; nowhere else to report
+            traceback.print_exc()
+            messagebox.showerror(
+                "Something went wrong",
+                f"{type(exc).__name__}: {exc}\n\n"
+                "This is a bug in this program, not something you did.\n"
+                f"Please report it at {ISSUES_URL}",
+                parent=self,
+            )
             return None
 
     def choose_folder(self) -> None:
@@ -751,7 +777,7 @@ class App(ttk.Frame):
             return
         source, copy = dialog.result
         keep = dialog.keep_backup
-        if self.guard(lambda: core.set_source(self.state, name, source, copy=copy, backup=keep)) is None:
+        if self.guard(lambda: core.set_source(self.install(), name, source, copy=copy, backup=keep)) is None:
             return
         core.save(self.state)
         self.refresh()

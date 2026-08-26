@@ -199,6 +199,104 @@ class WindowTests(unittest.TestCase):
         written = json.loads(core.MANIFEST.read_text())
         self.assertEqual(core.current(written)["addons"]["Bound"]["installed"], "v3")
 
+    # -- the Set source button, end to end -----------------------------------
+
+    def click_set_source(self, name, result, keep_backup=True):
+        """Drive App.set_source with the dialog answering `result`.
+
+        The button, not the pieces. Every test here used to call core.set_source
+        directly with an install, so nothing ever executed the line in App that
+        chooses what to pass -- and that line was wrong in v0.5.0: it handed
+        over the whole manifest, the TypeError escaped guard() (which catches
+        only Fail), and the save never happened. The table then redrew the old
+        value, which reads exactly like the source reverting by itself.
+        """
+        class Dialog:
+            def __init__(self, *_a, **_k):
+                self.result, self.keep_backup = result, keep_backup
+
+        real_dialog = gui.SourceDialog
+        gui.SourceDialog = Dialog
+        # An INSTANCE attribute, removed again rather than reassigned. Putting
+        # the bound method back as an instance attribute keeps a reference to
+        # the Tk object past destroy(), and it then finalises on whatever
+        # thread the collector is on -- "main thread is not in main loop", and
+        # on the next line Tcl_AsyncDelete aborts the process. Deleting it
+        # restores the ordinary class lookup and holds nothing.
+        self.root.wait_window = lambda *_a, **_k: None
+        try:
+            self.app.tree.selection_set(name)
+            self.app.set_source()
+        finally:
+            gui.SourceDialog = real_dialog
+            del self.root.wait_window
+
+    def test_setting_a_source_from_the_window_actually_saves_it(self):
+        self.click_set_source("Loose", ("github:o/r#Sub", False))
+        self.assertEqual(self.app.entries()["Loose"]["source"], "github:o/r#Sub")
+        written = json.loads(core.MANIFEST.read_text())
+        self.assertEqual(core.current(written)["addons"]["Loose"]["source"], "github:o/r#Sub")
+
+    def test_a_bound_addon_can_be_returned_to_unmanaged(self):
+        """Reported from a real install: choosing Unmanaged reverted.
+
+        Nothing was reverting. The save was raising, so the manifest still held
+        the old source and refresh() drew it back.
+        """
+        self.assertEqual(self.app.entries()["Bound"]["source"], "github:o/r")
+        self.click_set_source("Bound", ("unmanaged", False))
+        self.assertEqual(self.app.entries()["Bound"]["source"], "unmanaged")
+        written = json.loads(core.MANIFEST.read_text())
+        self.assertEqual(core.current(written)["addons"]["Bound"]["source"], "unmanaged")
+
+    def test_the_table_shows_the_new_source_immediately(self):
+        # The window is the only feedback there is; a correct manifest behind a
+        # stale table is indistinguishable from the bug this replaced.
+        self.click_set_source("Bound", ("unmanaged", False))
+        # The table writes unmanaged in brackets, to read as an absence
+        # of a source rather than as a source called "unmanaged".
+        self.assertEqual(self.app.tree.set("Bound", "source"), "(unmanaged)")
+
+    def test_an_unexpected_error_is_shown_rather_than_swallowed(self):
+        """A windowed build has no console for a traceback to land in.
+
+        v0.5.0's Set source raised TypeError on every use. Nothing was shown,
+        the save never happened, and the table redrew the old value -- reported
+        as "it reverts back to the source instead of leaving it unmanaged".
+        Showing the error would not have fixed the bug, but it would have named
+        it instead of making the program look untrustworthy.
+        """
+        shown = []
+        real = gui.messagebox.showerror
+        gui.messagebox.showerror = lambda title, message, **k: shown.append((title, message))
+        try:
+            def boom():
+                raise TypeError("something a user cannot possibly have caused")
+            self.assertIsNone(self.app.guard(boom))
+        finally:
+            gui.messagebox.showerror = real
+        self.assertEqual(len(shown), 1)
+        title, message = shown[0]
+        self.assertIn("wrong", title.lower())
+        self.assertIn("TypeError", message)
+        self.assertIn("bug in this program", message)
+
+    def test_an_expected_failure_still_reads_as_ordinary(self):
+        # A repo that cannot be reached is not a crash and must not be dressed
+        # up as one, or the real crashes stop standing out.
+        shown = []
+        real = gui.messagebox.showerror
+        gui.messagebox.showerror = lambda title, message, **k: shown.append((title, message))
+        try:
+            def nope():
+                raise core.Fail("no such repo, or it is private: o/r")
+            self.app.guard(nope)
+        finally:
+            gui.messagebox.showerror = real
+        title, message = shown[0]
+        self.assertEqual(title, "Cannot do that")
+        self.assertNotIn("bug in this program", message)
+
     # -- several WoW folders -------------------------------------------------
 
     def second_install(self, name="Wrath"):
@@ -390,6 +488,16 @@ class WindowTests(unittest.TestCase):
 
         # And releasing them from another thread must now be inert, because the
         # dialog no longer holds the only references keeping them alive.
+        #
+        # Sweep the main thread first. gc.collect() on the worker below
+        # finalises everything pending in the whole process, not only what this
+        # test made -- so a tk variable left over by any earlier test would be
+        # finalised on that thread, raise "main thread is not in main loop", and
+        # abort the run with Tcl_AsyncDelete. The failure would look like this
+        # test's, and would not be. `variables` still holds its own references,
+        # so this collect cannot take them.
+        gc.collect()
+
         import threading
 
         failures = []
