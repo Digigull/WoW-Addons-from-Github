@@ -274,13 +274,58 @@ class WindowTests(unittest.TestCase):
         self.assertFalse(dlg.folder_boxes["Alpha"].get())
         dlg.destroy()
 
-    def test_a_repo_that_is_one_addon_offers_no_choice(self):
-        # FrostSeek, Minn-Tinkers: the repository root IS the addon. A list of
-        # one would imply a decision that does not exist.
+    def test_a_repo_whose_root_is_the_addon_offers_no_choice(self):
+        # FrostSeek, Minn-Tinkers: the repository root IS the addon.
         dlg = self.looked_up_dialog("Bound", "o/r", [])
         self.assertEqual(dlg.folder_boxes, {})
         self.assertIn("nothing to choose", dlg.lookup_status.cget("text"))
-        dlg.destroy()
+        dlg._save()
+        self.assertEqual(dlg.result, ("github:o/r", False))
+
+    def test_a_repo_holding_exactly_one_addon_offers_no_choice_either(self):
+        """One candidate is not a choice, and ticking it would do harm.
+
+        A single tick box implies a decision. Worse, naming a folder switches
+        the row from the repository's RELEASES to the last commit touching that
+        folder -- so an addon publishing tagged releases would quietly start
+        reporting commit ids instead of version numbers. Unticked it installs
+        exactly the same folder and keeps its releases.
+        """
+        dlg = self.looked_up_dialog("Bound", "o/r", ["OnlyOne"])
+        self.assertEqual(dlg.folder_boxes, {}, "a single candidate is not a choice")
+        self.assertIn("OnlyOne", dlg.lookup_status.cget("text"))
+        self.assertIn("nothing to choose", dlg.lookup_status.cget("text"))
+        dlg._save()
+        self.assertEqual(dlg.result, ("github:o/r", False),
+                         "a lone folder must not be written into the source")
+
+    def test_a_lone_candidate_never_triggers_the_are_you_sure(self):
+        # The question is for a repository of several addons with none ticked.
+        # Asking it when there was nothing to tick would be nonsense.
+        dlg = self.looked_up_dialog("Bound", "o/r", ["OnlyOne"])
+        real = gui.messagebox.askokcancel
+        gui.messagebox.askokcancel = lambda *a, **k: self.fail("should not have asked")
+        try:
+            dlg._save()
+        finally:
+            gui.messagebox.askokcancel = real
+        self.assertEqual(dlg.result, ("github:o/r", False))
+
+    def test_a_folder_already_saved_survives_a_repo_that_offers_no_list(self):
+        # Someone who typed a folder by hand, for a repo too large to list or
+        # laid out unusually, must not have it silently dropped.
+        entry = {"source": "github:o/r#Deep/Thing", "installed": None, "folders": []}
+        self.offer([])
+        dlg = gui.SourceDialog(self.root, "Bound", entry, self.addons)
+        dlg._begin_lookup()
+        for _ in range(40):
+            self.pump(2)
+            dlg._drain_lookups()
+            if dlg.lookup_status.cget("text"):
+                break
+        self.assertEqual(dlg.folder.get(), "Deep/Thing")
+        dlg._save()
+        self.assertEqual(dlg.result, ("github:o/r#Deep/Thing", False))
 
     def test_a_repo_that_cannot_be_read_says_so_and_does_not_block_saving(self):
         dlg = self.looked_up_dialog("Bound", "o/r", [], error="no such repo, or it is private: o/r")

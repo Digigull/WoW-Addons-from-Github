@@ -15,6 +15,10 @@ whole repository and installs every addon in it.
 Nothing is guessed when nothing matches. A wrong guess that arrives pre-ticked gets
 accepted without being read, and the addon then updates from somebody else's folder.
 
+A repository holding **one** addon offers no tick boxes at all — one candidate is not a
+choice, and naming it would switch that addon from its published releases to commit ids.
+The window says which addon it found and leaves it alone.
+
 A row already bound to a whole multi-addon repository is flagged in the table as
 *installs N addons*. The advice used to go into the Status column, which is 170 pixels
 wide, so it was a smudge rather than a warning.

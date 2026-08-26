@@ -165,7 +165,9 @@ single row that updates as a unit. Saving with nothing ticked asks first, becaus
 binds the whole repository.
 
 Nothing is guessed when nothing matches: a wrong guess arriving pre-ticked would be
-accepted without being read.
+accepted without being read. And a repository holding a single addon offers no tick boxes —
+one candidate is not a choice, and naming it would switch that addon from its releases to
+commit ids for no gain.
 
 A row already bound to a whole multi-addon repository is flagged in the table as
 *installs N addons*, so it can be narrowed whenever it suits.

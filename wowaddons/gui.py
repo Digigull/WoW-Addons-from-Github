@@ -363,8 +363,19 @@ class SourceDialog(tk.Toplevel):
                 # The repository root is the addon -- FrostSeek, Minn-Tinkers.
                 # There is nothing to choose, so say so and offer no choice.
                 self._show_list("one addon, installed whole — nothing to choose", [])
+            elif len(folders) == 1:
+                # One candidate is not a choice. Offering a single tick box
+                # would imply a decision, and ticking it would do real harm:
+                # naming a folder switches this row from the repository's
+                # RELEASES to the last commit touching that folder, so an addon
+                # that publishes tagged releases would silently start reporting
+                # commit ids instead of version numbers. Left unticked it
+                # installs exactly the same folder, and keeps its releases.
+                self._show_list(f"one addon: {folders[0]} — nothing to choose", [])
             else:
-                self._show_list(f"{len(folders)} addons — tick the ones this row updates", folders)
+                self._show_list(
+                    f"{len(folders)} addons — tick the ones this row updates", folders
+                )
         if not pending:
             self._poll_lookups()
 
