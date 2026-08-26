@@ -205,6 +205,81 @@ directory, laid out as `src/MyAddon/MyAddon.toc` beside a `docs/` folder, or as 
 whose root *is* the addon. An addon's own bundled libraries are never mistaken for the addon
 itself.
 
+## Working on your own addon
+
+If you write addons, the loop you want is not download-a-zip-and-copy-folders. There are
+two shapes, depending on where you edit.
+
+### You edit on the same machine the client runs on
+
+Bind the addon to your checkout. This is the cheapest thing the tool does — **no GitHub
+calls, no downloads, nothing to press between edits**:
+
+```
+git clone https://github.com/you/my-addons ~/src/my-addons     # once
+addons.py set HonorTracker local:~/src/my-addons/HonorTracker
+addons.py update HonorTracker
+```
+
+By default that installs a **symlink**, so `Interface/AddOns/HonorTracker` *is* your
+working tree. Save a file, `/reload` in the client, and you are looking at the change.
+There is no second update step, and the client cannot be running something other than what
+is checked out. `git pull` in the checkout is the whole update.
+
+Point the source at the **checkout root** and name the addon, and it finds the folder
+itself — handy when one repository holds several:
+
+```
+addons.py set HonorTracker local:~/src/my-addons     # finds HonorTracker/HonorTracker.toc
+addons.py set LootLog      local:~/src/my-addons
+```
+
+In the window it is the same thing: **Set source…**, *A folder on disk*, Browse.
+
+If you would rather have real files than a link — to check what a user's install actually
+looks like, or because something in your toolchain dislikes links — add `--copy`, or tick
+the box in the dialog. Then `update` copies the folder each time, and you do press Update
+after an edit.
+
+### You edit somewhere else and push to GitHub
+
+Then you do **not** need a clone, a zip, or a git command on the WoW machine. Bind the row
+to the repository once and press Update whenever you want the pushed version:
+
+```
+addons.py set HonorTracker github:you/my-addons#HonorTracker
+addons.py update HonorTracker
+```
+
+Fetching and unpacking the archive and replacing the folder is exactly what this tool is
+for; downloading the zip by hand and copying folders into `AddOns` is the job it removes.
+Naming the folder with `#HonorTracker` matters in a repository that holds several addons —
+without it the row installs all of them, and every one of them reports an update whenever
+any one of them changes.
+
+After the first fetch this is nearly free too: an unchanged repo answers `304`, which
+GitHub does not bill, and the archive comes from a host that is not the API. See
+[GitHub's rate limit](#githubs-rate-limit).
+
+### Going back and forth
+
+Switch a row between the two whenever it suits — `local:` while you are working on it,
+`github:` when you want to see what somebody else would actually receive:
+
+```
+addons.py set HonorTracker github:you/my-addons#HonorTracker   # test the pushed version
+addons.py set HonorTracker local:~/src/my-addons               # back to the checkout
+```
+
+Two things worth knowing before the first bind:
+
+- **If a real folder is already there, it is moved aside, not deleted** — to
+  `HonorTracker.replaced`, once, and later updates leave that first copy alone. The window
+  names the folder it would create *before* you click Save.
+- **On Windows a `local:` source installs as a directory junction**, not a symlink, so it
+  needs neither administrator rights nor Developer Mode. The client cannot tell the
+  difference.
+
 ## The window
 
 ![the window](docs/window.png)
@@ -304,18 +379,8 @@ and why, so a pause never looks like a hang. What was learned is kept in
 calls an hour. With the above it is rarely the thing standing between you and a finished
 update.
 
-### Working on your own addon
-
-If you are editing an addon yourself, bind it to the checkout rather than to GitHub:
-
-```
-addons.py set MyAddon local:~/src/my-addons/MyAddon
-```
-
-That costs no API calls at all, and in the default link mode the client reads your working
-tree directly — save the file, `/reload` in the client, done. There is nothing to press
-between edits and nothing to download. Point the row back at `github:` when you want to
-test what somebody else would actually receive.
+An addon you are writing yourself costs nothing at all — see
+[Working on your own addon](#working-on-your-own-addon).
 
 ## Linux, Wine and Proton
 
