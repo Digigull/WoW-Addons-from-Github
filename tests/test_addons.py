@@ -485,11 +485,11 @@ class WhereTheManifestLives(unittest.TestCase):
             try:
                 addons.MANIFEST = tmp / "new.json"
                 addons.LEGACY_WINDOWS_MANIFEST = legacy
-                self.assertEqual(addons.load(windows=True)["addons_dir"], "/old/place")
+                self.assertEqual(addons.current(addons.load(windows=True))["addons_dir"], "/old/place")
 
                 # And once something is written to the new place, that wins.
                 addons.MANIFEST.write_text('{"addons_dir": "/new/place", "addons": {}}')
-                self.assertEqual(addons.load(windows=True)["addons_dir"], "/new/place")
+                self.assertEqual(addons.current(addons.load(windows=True))["addons_dir"], "/new/place")
             finally:
                 addons.MANIFEST, addons.LEGACY_WINDOWS_MANIFEST = new, old_legacy
 
@@ -502,7 +502,7 @@ class WhereTheManifestLives(unittest.TestCase):
             try:
                 addons.MANIFEST = tmp / "new.json"
                 addons.LEGACY_WINDOWS_MANIFEST = legacy
-                self.assertIsNone(addons.load(windows=False)["addons_dir"])
+                self.assertIsNone(addons.current(addons.load(windows=False))["addons_dir"])
             finally:
                 addons.MANIFEST, addons.LEGACY_WINDOWS_MANIFEST = new, old_legacy
 
@@ -1140,3 +1140,141 @@ class OneAddonBuiltForSeveralClients(unittest.TestCase):
                           "r-1a2b/docs/readme.md": "y"}),
             ["MyAddon"],
         )
+
+
+class SeveralWoWFolders(unittest.TestCase):
+    """One person, a vanilla server, a Wrath one, maybe retail.
+
+    They share nothing. The same addon name means a different addon, possibly
+    from a different branch or a different folder of the same repository, and
+    certainly a different AddOns directory. Anything that leaks between them is
+    a bug that writes files into the wrong game.
+    """
+
+    def test_an_install_has_exactly_the_shape_the_manifest_used_to(self):
+        # This is what keeps the change small: every function that took the old
+        # state and reached for addons or addons_dir now takes one install and
+        # is otherwise untouched.
+        self.assertEqual(sorted(addons.blank_install()), ["addons", "addons_dir"])
+
+    def test_an_old_manifest_becomes_one_install_named_after_its_folder(self):
+        old = {"addons_dir": "/home/me/Games/Ascension/Interface/AddOns",
+               "addons": {"Bagnon": {"source": "github:o/r"}}}
+        new = addons.migrate(old)
+        self.assertEqual(list(new["installs"]), ["Ascension"])
+        self.assertEqual(new["current"], "Ascension")
+        self.assertEqual(addons.current(new)["addons"]["Bagnon"]["source"], "github:o/r")
+
+    def test_migrating_is_not_repeated_on_an_already_migrated_manifest(self):
+        once = addons.migrate({"addons_dir": "/w/Interface/AddOns", "addons": {}})
+        self.assertEqual(addons.migrate(once), once)
+
+    def test_a_manifest_that_never_reached_init_gets_no_phantom_install(self):
+        # Filing an empty placeholder under a name would leave it in the list
+        # forever, and the first real install would arrive as the second entry.
+        self.assertEqual(addons.migrate(addons.blank_install())["installs"], {})
+
+    def test_the_placeholder_is_swept_up_when_a_real_one_arrives(self):
+        state = {"installs": {"default": addons.blank_install()}, "current": "default"}
+        addons.add_install(state, pathlib.Path("/games/Wrath/Interface/AddOns"))
+        self.assertEqual(list(state["installs"]), ["Wrath"])
+
+    def test_naming_an_install_after_its_folder_skips_interface_and_addons(self):
+        for directory, expected in [
+            ("/games/Ascension/Interface/AddOns", "Ascension"),
+            ("/games/Vanilla/Interface/addons", "Vanilla"),
+            ("/games/Wrath", "Wrath"),
+        ]:
+            with self.subTest(directory=directory):
+                self.assertEqual(addons.install_name_for(directory), expected)
+
+    def test_two_installs_of_the_same_name_do_not_collide(self):
+        self.assertEqual(
+            addons.install_name_for("/elsewhere/Wrath/Interface/AddOns", taken={"Wrath"}),
+            "Wrath (2)",
+        )
+
+    def test_the_same_addon_can_be_bound_differently_in_each(self):
+        """The whole point of this. A shared addon name, two different sources.
+
+        Ascension is a Wrath-based realm; another server may be vanilla. The
+        same repository can hold a build for each, and binding one must say
+        nothing about the other.
+        """
+        state = {"installs": {}}
+        addons.add_install(state, pathlib.Path("/games/Vanilla/Interface/AddOns"))
+        addons.set_source(addons.current(state), "Shared", "github:o/r#Vanilla")
+        addons.add_install(state, pathlib.Path("/games/Wrath/Interface/AddOns"))
+        addons.set_source(addons.current(state), "Shared", "github:o/r#Wrath")
+
+        self.assertEqual(addons.pick(state, "Vanilla")["addons"]["Shared"]["source"],
+                         "github:o/r#Vanilla")
+        self.assertEqual(addons.pick(state, "Wrath")["addons"]["Shared"]["source"],
+                         "github:o/r#Wrath")
+
+    def test_pick_does_not_change_which_install_is_current(self):
+        # --install aims one run elsewhere. It would be a nasty surprise if it
+        # quietly left every later command pointed at the other game.
+        state = {"installs": {}}
+        addons.add_install(state, pathlib.Path("/games/Vanilla/Interface/AddOns"))
+        addons.add_install(state, pathlib.Path("/games/Wrath/Interface/AddOns"))
+        addons.pick(state, "Vanilla")
+        self.assertEqual(addons.current_name(state), "Wrath")
+
+    def test_use_does_change_it(self):
+        state = {"installs": {}}
+        addons.add_install(state, pathlib.Path("/games/Vanilla/Interface/AddOns"))
+        addons.add_install(state, pathlib.Path("/games/Wrath/Interface/AddOns"))
+        addons.use(state, "Vanilla")
+        self.assertEqual(addons.current_name(state), "Vanilla")
+
+    def test_an_unknown_install_is_refused_with_the_list(self):
+        state = {"installs": {}}
+        addons.add_install(state, pathlib.Path("/games/Wrath/Interface/AddOns"))
+        with self.assertRaises(addons.Fail) as caught:
+            addons.pick(state, "Typo")
+        self.assertIn("Wrath", str(caught.exception))
+
+    def test_pointing_init_at_the_same_folder_twice_is_an_update(self):
+        # Re-running init after moving the game must not leave two entries
+        # racing to manage one directory.
+        state = {"installs": {}}
+        first = addons.add_install(state, pathlib.Path("/games/Wrath/Interface/AddOns"))
+        again = addons.add_install(state, pathlib.Path("/games/Wrath/Interface/AddOns"))
+        self.assertEqual(first, again)
+        self.assertEqual(len(state["installs"]), 1)
+
+    def test_forgetting_one_moves_current_somewhere_real(self):
+        state = {"installs": {}}
+        addons.add_install(state, pathlib.Path("/games/Vanilla/Interface/AddOns"))
+        addons.add_install(state, pathlib.Path("/games/Wrath/Interface/AddOns"))
+        addons.forget_install(state, "Wrath")
+        self.assertEqual(addons.current_name(state), "Vanilla")
+        self.assertNotIn("Wrath", state["installs"])
+
+    def test_current_is_stable_when_the_record_is_unclear(self):
+        # An arbitrary answer here would update a different WoW folder than the
+        # last run did, which is how files land in the wrong game.
+        state = {"installs": {"Wrath": addons.blank_install(),
+                              "Vanilla": addons.blank_install()},
+                 "current": "gone"}
+        self.assertEqual(addons.current_name(state), "Vanilla")
+        self.assertEqual(addons.current_name(state), "Vanilla")
+
+    def test_handing_the_whole_manifest_to_an_install_function_is_an_error(self):
+        """An install and the old manifest are the same shape, so this is easy.
+
+        Quiet, too: setdefault("addons", {}) on a manifest writes the binding
+        into a top-level key nothing reads, and the addon looks bound and never
+        updates. A TypeError stops a test dead instead.
+        """
+        state = addons.migrate(addons.blank_install())
+        for call in (
+            lambda: addons.set_source(state, "A", "unmanaged"),
+            lambda: addons.accept_suggestions(state),
+            lambda: addons.addons_dir(state),
+            lambda: addons.rescan(state, pathlib.Path(".")),
+        ):
+            with self.subTest(call=call):
+                with self.assertRaises(TypeError):
+                    call()

@@ -114,6 +114,30 @@ for updates** does the same thing and fills in the **Latest** column without dow
 Flags on `set`: `--copy` (real files instead of a link), `--no-backup` (replace an
 existing folder outright instead of keeping one copy of it).
 
+## Several WoW folders
+
+A vanilla server, a Wrath one and retail are separate **installs**: separate AddOns
+directories, separate bindings, nothing shared between them. Running `init` again adds one
+rather than replacing the first, and it takes its name from the folder unless you give one.
+
+```
+addons.py init ~/Games/Vanilla --name Vanilla
+addons.py installs                    # what is known; * marks the one in use
+addons.py use Vanilla                 # switch
+addons.py update --install Wrath      # aim one run elsewhere, without switching
+addons.py forget Vanilla              # stop tracking it — deletes no game files
+```
+
+In the window, a picker appears above the table once there is more than one; it is hidden
+while there is only one, because a dropdown with a single entry can do nothing.
+
+The same addon can be bound differently in each — a different branch, or a different folder
+of the same repository — which is usually the reason for having two. `--install` aims a
+single run at another folder without changing which one later commands use.
+
+An existing manifest from before this becomes a single install named after its WoW folder,
+the first time the tool reads it. Nothing is rewritten until something saves.
+
 ## Sources
 
 | Source | Behaviour |

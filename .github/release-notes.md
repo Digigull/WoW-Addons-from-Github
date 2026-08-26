@@ -4,6 +4,14 @@ manifest and nothing else.
 
 ## New since v0.3.1
 
+**Several WoW folders at once.** A vanilla server, a Wrath one and retail are separate
+installs — separate AddOns directories, separate bindings, nothing shared. Run `init`
+again to add one; a picker appears above the table once there is more than one. The same
+addon can be bound differently in each, which is usually the reason for having two.
+
+Your existing manifest becomes a single install named after its WoW folder, the first time
+this reads it. Nothing you have bound is lost or needs redoing.
+
 **One addon out of a repository that holds several.** Some people keep every addon they
 have written in one repository. Binding an addon to such a repo used to install all of
 them, and — because the repo has a single commit history — made every addon in it report

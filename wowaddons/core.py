@@ -90,12 +90,190 @@ def manifest_to_read(windows: bool | None = None) -> Path:
     return LEGACY_WINDOWS_MANIFEST if LEGACY_WINDOWS_MANIFEST.exists() else MANIFEST
 
 
+# ── installs ─────────────────────────────────────────────────────────────────
+# One person can have several WoW folders: a vanilla server, a Wrath one,
+# retail. They share nothing -- different AddOns directories, and an addon
+# bound in one says nothing about the same addon in another, which may want a
+# different branch or a different folder of the same repository entirely.
+#
+# So the manifest holds several INSTALLS, and an install has exactly the shape
+# the whole manifest used to have:
+#
+#     {"addons_dir": "...", "addons": {name: entry}}
+#
+# That is deliberate and it is why this change is small: every function that
+# took the old state and reached for `addons` or `addons_dir` now takes one
+# install and is otherwise untouched. The outer manifest is a new, thin layer
+# above them.
+
+MANIFEST_VERSION = 2
+
+
+def blank_install() -> dict:
+    return {"addons_dir": None, "addons": {}}
+
+
+def is_empty_install(install: dict) -> bool:
+    """Nothing pointed at and nothing recorded -- a placeholder, not an install."""
+    return not install.get("addons_dir") and not install.get("addons")
+
+
+def install_name_for(directory: str | None, taken=()) -> str:
+    """A name to file an install under, from its folder.
+
+    `.../Ascension/Interface/AddOns` becomes "Ascension" -- the folder people
+    already call the install by, so nobody has to invent a label to get started.
+    """
+    name = "default"
+    if directory:
+        parts = [p for p in Path(directory).parts if p not in ("/", "\\")]
+        skip = {"addons", "interface"}
+        meaningful = [p for p in parts if p.lower() not in skip]
+        if meaningful:
+            name = meaningful[-1]
+    candidate, counter = name, 1
+    while candidate in taken:
+        counter += 1
+        candidate = f"{name} ({counter})"
+    return candidate
+
+
+def migrate(state: dict) -> dict:
+    """Bring a manifest written before installs existed up to date.
+
+    Read-time only, and non-destructive: the file on disk is not rewritten
+    until something else saves it, so an older build reading the same manifest
+    keeps working right up until this one writes.
+    """
+    if "installs" in state:
+        return state
+    install = {
+        "addons_dir": state.get("addons_dir"),
+        "addons": state.get("addons", {}),
+    }
+    if is_empty_install(install):
+        # A manifest that never got as far as `init`. Filing that under a name
+        # would leave a phantom install in the list forever, and the first real
+        # one would arrive as the second entry.
+        return {"version": MANIFEST_VERSION, "installs": {}}
+    name = install_name_for(install["addons_dir"])
+    return {"version": MANIFEST_VERSION, "current": name, "installs": {name: install}}
+
+
+def one_install(install: dict, called: str) -> dict:
+    """Guard against being handed the whole manifest instead of one install.
+
+    An install and the old whole-manifest shape are deliberately identical, so
+    the mistake is easy and, worse, quiet: `set_source(state, ...)` on a
+    manifest would `setdefault("addons", {})` at the top level and write the
+    binding into a key nothing ever reads again. The addon would appear to have
+    been bound and would never update.
+
+    A TypeError rather than a Fail: this is a contract violation in calling
+    code, not something a user did, and it should stop a test dead rather than
+    be reported in a status bar.
+    """
+    if "installs" in install:
+        raise TypeError(
+            f"{called}() takes one install, not the whole manifest; "
+            "pass core.current(state) or core.pick(state, name)"
+        )
+    return install
+
+
+def installs(state: dict) -> dict:
+    return state.setdefault("installs", {})
+
+
+def current_name(state: dict) -> str:
+    """The install commands act on, chosen stably when the record is unclear.
+
+    Falls back to the first install by name rather than to whatever a dict
+    happens to yield first: an arbitrary answer here would silently update a
+    different WoW folder than the last run did.
+    """
+    known = installs(state)
+    name = state.get("current")
+    if name in known:
+        return name
+    if known:
+        return sorted(known)[0]
+    name = name or "default"
+    known[name] = blank_install()
+    state["current"] = name
+    return name
+
+
+def current(state: dict) -> dict:
+    """The install to act on. Every command works through this."""
+    return installs(state).setdefault(current_name(state), blank_install())
+
+
+def pick(state: dict, name: str) -> dict:
+    """One install by name, without changing which one is current.
+
+    `--install` targets a command at another WoW folder for that one run. It
+    would be a nasty surprise if a single `--install Wrath update` quietly left
+    every later command pointed at Wrath.
+    """
+    known = installs(state)
+    if name not in known:
+        options = ", ".join(sorted(known)) or "none yet"
+        die(f"no install called '{name}'. There is: {options}")
+    return known[name]
+
+
+def use(state: dict, name: str) -> dict:
+    """Switch which install is current, and mean it -- the caller saves."""
+    install = pick(state, name)
+    state["current"] = name
+    return install
+
+
+def add_install(state: dict, directory: Path, name: str | None = None) -> str:
+    """Remember another WoW folder, and switch to it. Returns its name.
+
+    Pointing an existing install at the same folder again is an update, not a
+    duplicate: re-running init after moving the game should not leave two
+    entries racing to manage one directory.
+    """
+    known = installs(state)
+    target = str(directory)
+    for existing, install in known.items():
+        if install.get("addons_dir") == target and (name is None or name == existing):
+            state["current"] = existing
+            return existing
+    name = name or install_name_for(target, taken=known)
+    if name in known:
+        known[name]["addons_dir"] = target
+    else:
+        known[name] = {"addons_dir": target, "addons": {}}
+    # Sweep up any placeholder a bare `load` left behind, so the list shows the
+    # WoW folders somebody actually has and nothing else.
+    for empty in [n for n, i in known.items() if n != name and is_empty_install(i)]:
+        del known[empty]
+    state["current"] = name
+    return name
+
+
+def forget_install(state: dict, name: str) -> None:
+    """Stop tracking one install. Touches no files in the game folder."""
+    known = installs(state)
+    if name not in known:
+        die(f"no install called '{name}'")
+    del known[name]
+    if state.get("current") == name:
+        state.pop("current", None)
+        if known:
+            state["current"] = sorted(known)[0]
+
+
 def load(windows: bool | None = None) -> dict:
     path = manifest_to_read(windows)
     if not path.exists():
-        return {"addons_dir": None, "addons": {}}
+        return migrate(blank_install())
     try:
-        return json.loads(path.read_text())
+        return migrate(json.loads(path.read_text()))
     except json.JSONDecodeError as exc:
         die(f"manifest is not valid JSON ({exc}). Fix or delete {path}")
 
@@ -109,7 +287,9 @@ def save(state: dict) -> None:
     tmp.replace(MANIFEST)
 
 
-def addons_dir(state: dict) -> Path:
+def addons_dir(install: dict) -> Path:
+    """The AddOns folder of one install -- not of the manifest as a whole."""
+    state = one_install(install, "addons_dir")
     if not state.get("addons_dir"):
         die("no WoW folder set yet. Run:  addons.py init /path/to/your/wow/folder")
     path = Path(state["addons_dir"])
@@ -275,6 +455,7 @@ def rescan(state: dict, root: Path) -> tuple[int, int]:
     Does not save -- the caller decides when to write, which matters for a GUI
     that may want to scan speculatively.
     """
+    one_install(state, "rescan")
     installed = scan_installed(root)
     entries = state.setdefault("addons", {})
 
@@ -474,7 +655,7 @@ def set_source(
     state: dict, addon: str, source: str, *, copy: bool = False, backup: bool | None = None
 ) -> tuple[dict, Path | None]:
     """Bind one addon to a source. Returns (entry, local_path)."""
-    entries = state.setdefault("addons", {})
+    entries = one_install(state, "set_source").setdefault("addons", {})
     source, kind, local_path = resolve_source(addon, source)
 
     entry = entries.setdefault(addon, new_entry(addon))
@@ -489,7 +670,7 @@ def set_source(
 def accept_suggestions(state: dict) -> list[tuple[str, str]]:
     """Take every source `scan` suggested. Returns the (name, source) pairs."""
     taken = []
-    for name, entry in sorted(state.get("addons", {}).items()):
+    for name, entry in sorted(one_install(state, "accept_suggestions").get("addons", {}).items()):
         if entry.get("source") == "unmanaged" and entry.get("suggested"):
             entry["source"] = entry.pop("suggested")
             taken.append((name, entry["source"]))

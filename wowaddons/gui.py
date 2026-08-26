@@ -505,10 +505,24 @@ class App(ttk.Frame):
         top = ttk.Frame(self)
         top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         top.columnconfigure(1, weight=1)
-        ttk.Label(top, text="WoW folder:").grid(row=0, column=0, sticky="w")
+        # The install picker only earns its row once there is a second WoW
+        # folder. Shown from the start it is a control that does nothing, which
+        # is worse than absent -- _sync_installs hides and shows it.
+        ttk.Label(top, text="Install:").grid(row=0, column=0, sticky="w")
+        self.install_choice = tk.StringVar()
+        self.install_picker = ttk.Combobox(
+            top, textvariable=self.install_choice, state="readonly", width=22,
+        )
+        self.install_picker.grid(row=0, column=1, sticky="w", padx=8)
+        self.install_picker.bind("<<ComboboxSelected>>", self._switch_install)
+        self.install_row = (
+            top.grid_slaves(row=0, column=0)[0], self.install_picker,
+        )
+
+        ttk.Label(top, text="WoW folder:").grid(row=1, column=0, sticky="w")
         self.folder_label = ttk.Label(top, text="(not set)", foreground="grey")
-        self.folder_label.grid(row=0, column=1, sticky="w", padx=8)
-        ttk.Button(top, text="Change…", command=self.choose_folder).grid(row=0, column=2)
+        self.folder_label.grid(row=1, column=1, sticky="w", padx=8)
+        ttk.Button(top, text="Add…", command=self.choose_folder).grid(row=1, column=2)
 
         table = ttk.Frame(self)
         table.grid(row=1, column=0, sticky="nsew")
@@ -571,7 +585,7 @@ class App(ttk.Frame):
     # -- state ---------------------------------------------------------------
 
     def _first_run(self) -> None:
-        if not self.state.get("addons_dir"):
+        if not self.install().get("addons_dir"):
             self.say("Point this at your WoW folder to begin.")
             self.choose_folder()
         else:
@@ -580,16 +594,53 @@ class App(ttk.Frame):
     def say(self, message: str) -> None:
         self.status.configure(text=message)
 
+    def _sync_installs(self) -> None:
+        """Keep the picker showing what the manifest holds.
+
+        Hidden while there is one install, because a dropdown with a single
+        entry is a control that cannot do anything.
+        """
+        known = sorted(core.installs(self.state), key=str.lower)
+        current = core.current_name(self.state) if known else ""
+        self.install_picker.configure(values=known)
+        if self.install_choice.get() != current:
+            self.install_choice.set(current)
+        for widget in self.install_row:
+            if len(known) > 1:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
+    def _switch_install(self, *_a) -> None:
+        chosen = self.install_choice.get()
+        if not chosen or chosen == self.state.get("current"):
+            return
+        if self.guard(lambda: core.use(self.state, chosen)) is None:
+            return
+        core.save(self.state)
+        self.refresh()
+        self.say(f"{chosen}: {core.tilde(self.install().get('addons_dir') or '(not set)')}")
+
+    def install(self) -> dict:
+        """The WoW folder every button on this window acts on.
+
+        One person can have a vanilla server, a Wrath one and retail; they
+        share no addons and an addon bound in one says nothing about the same
+        addon in another. The picker above the table chooses between them.
+        """
+        return core.current(self.state)
+
     def entries(self) -> dict:
-        return self.state.setdefault("addons", {})
+        return self.install().setdefault("addons", {})
 
     def root_dir(self) -> Path | None:
-        directory = self.state.get("addons_dir")
+        directory = self.install().get("addons_dir")
         return Path(directory) if directory else None
 
     def refresh(self) -> None:
         """Redraw the table from the manifest. Never touches the disk or network."""
-        directory = self.state.get("addons_dir")
+        directory = self.install().get("addons_dir")
+        self._sync_installs()
         self.folder_label.configure(
             text=core.tilde(directory) if directory else "(not set)",
             foreground="" if directory else "grey",
@@ -664,17 +715,19 @@ class App(ttk.Frame):
         target = self.guard(lambda: core.find_addons_dir(Path(chosen)))
         if target is None:
             return
-        self.state["addons_dir"] = str(target)
+        name = core.add_install(self.state, target)
         core.save(self.state)
         self.say(f"Reading {target}…")
         self.rescan()
+        self.say(f"{name}: {core.tilde(str(target))}")
 
     def rescan(self) -> None:
         root = self.root_dir()
         if root is None:
             self.say("No WoW folder set yet.")
             return
-        outcome = self.guard(lambda: core.rescan(self.state, core.addons_dir(self.state)))
+        install = self.install()
+        outcome = self.guard(lambda: core.rescan(install, core.addons_dir(install)))
         if outcome is None:
             return
         installed, guessed = outcome
@@ -744,7 +797,7 @@ class App(ttk.Frame):
         if root is None:
             self.say("Set your WoW folder first.")
             return
-        if self.guard(lambda: core.addons_dir(self.state)) is None:
+        if self.guard(lambda: core.addons_dir(self.install())) is None:
             return
         names = [n for n in names if self.entries().get(n, {}).get("source", "unmanaged") != "unmanaged"]
         if not names:

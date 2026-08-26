@@ -197,7 +197,49 @@ class WindowTests(unittest.TestCase):
 
         self.run_update(fake)
         written = json.loads(core.MANIFEST.read_text())
-        self.assertEqual(written["addons"]["Bound"]["installed"], "v3")
+        self.assertEqual(core.current(written)["addons"]["Bound"]["installed"], "v3")
+
+    # -- several WoW folders -------------------------------------------------
+
+    def second_install(self, name="Wrath"):
+        other = pathlib.Path(self.tmp.name) / name / "Interface" / "AddOns"
+        other.mkdir(parents=True)
+        core.add_install(self.app.state, other, name)
+        self.app.refresh()
+        return other
+
+    def test_the_picker_is_hidden_until_there_is_a_second_install(self):
+        # A dropdown holding one entry is a control that cannot do anything.
+        self.assertEqual(self.app.install_picker.winfo_manager(), "")
+        self.second_install()
+        self.assertEqual(self.app.install_picker.winfo_manager(), "grid")
+
+    def test_switching_shows_the_other_folders_addons(self):
+        """The table must follow the picker, or it shows one game's addons
+        while every button acts on another's files."""
+        other = self.second_install()
+        self.assertEqual(self.app.install_choice.get(), "Wrath")
+        self.assertEqual(list(self.app.tree.get_children()), [])
+        self.assertEqual(self.app.root_dir(), other)
+
+        self.app.install_choice.set(pathlib.Path(self.addons).parts[-3])
+        self.app._switch_install()
+        self.pump()
+        self.assertEqual(sorted(self.app.tree.get_children()), ["Bound", "Loose"])
+        self.assertEqual(self.app.root_dir(), self.addons)
+
+    def test_each_install_keeps_its_own_bindings(self):
+        self.second_install()
+        core.set_source(self.app.install(), "Bound", "github:o/r#Wrath")
+        core.use(self.app.state, pathlib.Path(self.addons).parts[-3])
+        self.assertEqual(self.app.entries()["Bound"]["source"], "github:o/r")
+
+    def test_the_window_acts_on_the_install_it_is_showing(self):
+        # entries() and root_dir() must come from the same install, always --
+        # a mismatch writes one game's addon into another game's folder.
+        self.second_install()
+        self.assertIs(self.app.entries(), self.app.install()["addons"])
+        self.assertEqual(str(self.app.root_dir()), self.app.install()["addons_dir"])
 
     # -- the dialog ----------------------------------------------------------
 
@@ -450,7 +492,7 @@ class WindowTests(unittest.TestCase):
         dlg.backup.set(False)
         dlg._save()
         self.assertFalse(dlg.keep_backup)
-        core.set_source(self.app.state, "Bound", dlg.result[0], backup=dlg.keep_backup)
+        core.set_source(self.app.install(), "Bound", dlg.result[0], backup=dlg.keep_backup)
         self.assertIs(self.app.entries()["Bound"]["backup"], False)
 
     def test_no_caution_for_a_folder_that_is_only_a_link(self):
