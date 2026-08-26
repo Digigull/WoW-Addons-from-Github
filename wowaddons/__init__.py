@@ -16,4 +16,4 @@ once rather than once per front end.
 # title bar, and the release tag is expected to match -- a test checks that the
 # tag being built is the version being shipped, because a binary that lies
 # about which build it is makes every bug report start from nothing.
-__version__ = "0.7.0"
+__version__ = "0.7.1"

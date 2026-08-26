@@ -103,22 +103,22 @@ class SourceResolution(unittest.TestCase):
         addons.http_json = self._real
 
     def test_prefers_an_attached_zip_over_the_source_archive(self):
-        self.responses[f"{self.repo}/releases/latest"] = {
+        self.responses[f"{self.repo}/releases?per_page=1"] = [{
             "tag_name": "v1.2.3",
             "zipball_url": f"{self.repo}/zipball/v1.2.3",
             "assets": [
                 {"name": "notes.txt", "browser_download_url": "http://x/notes.txt"},
                 {"name": "MyAddon-1.2.3.zip", "browser_download_url": "http://x/MyAddon-1.2.3.zip"},
             ],
-        }
+        }]
         self.assertEqual(addons.latest_github("o/r"), ("v1.2.3", "http://x/MyAddon-1.2.3.zip"))
 
     def test_falls_back_to_the_source_archive(self):
-        self.responses[f"{self.repo}/releases/latest"] = {
+        self.responses[f"{self.repo}/releases?per_page=1"] = [{
             "tag_name": "v2.0",
             "zipball_url": f"{self.repo}/zipball/v2.0",
             "assets": [],
-        }
+        }]
         # The release's own zipball_url is a REST call; the tag is fetched off
         # the meter instead.
         self.assertEqual(addons.latest_github("o/r"),
@@ -825,9 +825,9 @@ class VersionFollowsTheFolder(unittest.TestCase):
         # A release asset is packaged for one addon; nothing says its contents
         # line up with a path in the source tree, so honouring both would mean
         # guessing which the user meant.
-        self.responses[f"{self.repo}/releases/latest"] = {
+        self.responses[f"{self.repo}/releases?per_page=1"] = [{
             "tag_name": "v9.9", "zipball_url": "z", "assets": [],
-        }
+        }]
         self.responses[self.repo] = {"default_branch": "main"}
         self.responses[f"{self.repo}/commits?sha=main&path=A&per_page=1"] = [{"sha": "cccccccccccc"}]
         self.assertEqual(addons.latest_github("o/r#A")[0], "cccccccccccc")
@@ -1886,3 +1886,110 @@ class ArchivesOffTheMeter(unittest.TestCase):
         )
         with self.assertRaises(urllib.error.HTTPError):
             addons.download("https://github.com/o/r/releases/download/v1/A.zip")
+
+
+class ARepositoryWithoutReleases(unittest.TestCase):
+    """"This repo publishes no releases" must not cost a call every time.
+
+    The regression, found on the first real run of v0.7.0: a warm "Check for
+    updates" dropped the hourly quota by exactly the number of addons bound to
+    repositories that have never cut a release. `/releases/latest` answers 404
+    for those, and a 404 carries no ETag, so it was the one question that could
+    never be revalidated -- six such addons cost six calls an hour, for ever,
+    to be told six times what had not changed.
+
+    Listing answers 200 and an empty array, which does carry an ETag.
+    """
+
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self.scratch.cleanup)
+        self._config = addons.CONFIG_DIR
+        addons.CONFIG_DIR = pathlib.Path(self.scratch.name)
+        self.real_throttle = addons.THROTTLE
+        addons.THROTTLE = addons.Throttle(sleep=lambda _s: None, clock=lambda: 0.0)
+        addons.forget_github_state()
+        self.addCleanup(addons.forget_github_state)
+        self.addCleanup(lambda: setattr(addons, "THROTTLE", self.real_throttle))
+        self.addCleanup(lambda: setattr(addons, "CONFIG_DIR", self._config))
+
+        self.releases = []
+        self.billed = []
+
+        def fake(request, timeout=0):
+            url = request.full_url
+            tail = url.split("/repos/")[1]
+            if tail.endswith("/releases?per_page=1"):
+                body = json.dumps(self.releases[:1]).encode()
+            elif tail.endswith("/releases/latest"):
+                stable = [r for r in self.releases
+                          if not r.get("draft") and not r.get("prerelease")]
+                if not stable:
+                    self.billed.append("404 " + tail)
+                    raise urllib.error.HTTPError(url, 404, "Not Found", {}, io.BytesIO(b"{}"))
+                body = json.dumps(stable[0]).encode()
+            elif tail.endswith("/r"):
+                body = b'{"default_branch": "main"}'
+            else:
+                body = json.dumps({"sha": "abc123def456"}).encode()
+            tag = f'W/"{abs(hash((url, json.dumps(self.releases)))) & 0xffff:x}"'
+            if request.get_header("If-none-match") == tag:
+                raise urllib.error.HTTPError(url, 304, "Not Modified", {"etag": tag}, io.BytesIO(b""))
+            self.billed.append("200 " + tail)
+            return FakeResponse(body, {"etag": tag, "x-ratelimit-remaining": "50"})
+
+        real = addons.urllib.request.urlopen
+        addons.urllib.request.urlopen = fake
+        self.addCleanup(lambda: setattr(addons.urllib.request, "urlopen", real))
+
+    def check(self):
+        addons.begin_run()
+        found = addons.latest_github("o/r")
+        addons.end_run()
+        return found
+
+    def test_a_second_check_costs_nothing(self):
+        self.check()
+        self.billed.clear()
+        self.check()
+        self.assertEqual(self.billed, [])
+
+    def test_it_still_tracks_the_branch_head(self):
+        version, url = self.check()
+        self.assertEqual(version, "abc123def456")
+        self.assertEqual(url, "https://codeload.github.com/o/r/zip/refs/heads/main")
+
+    def test_a_first_release_is_seen_on_the_very_next_check(self):
+        # No timer and nothing taken on trust: the whole reason for listing
+        # rather than remembering the 404.
+        self.check()
+        self.releases = [{"tag_name": "v1.0", "assets": []}]
+        version, url = self.check()
+        self.assertEqual(version, "v1.0")
+        self.assertEqual(url, "https://codeload.github.com/o/r/zip/refs/tags/v1.0")
+
+    def test_the_newest_release_answers_outright(self):
+        self.releases = [{"tag_name": "v3.0", "assets": []}]
+        self.check()
+        # One call for the listing; the narrower endpoint is not needed at all.
+        self.assertNotIn("200 o/r/releases/latest", self.billed)
+
+    def test_a_pre_release_is_not_installed_over_the_stable_one(self):
+        # The rule /releases/latest exists for. Listing alone would hand back
+        # the pre-release, which is not what somebody updating an addon wants.
+        self.releases = [
+            {"tag_name": "v4.0-beta", "prerelease": True, "assets": []},
+            {"tag_name": "v3.0", "assets": []},
+        ]
+        self.assertEqual(self.check()[0], "v3.0")
+
+    def test_a_draft_is_not_installed_either(self):
+        self.releases = [
+            {"tag_name": "v4.0", "draft": True, "assets": []},
+            {"tag_name": "v3.0", "assets": []},
+        ]
+        self.assertEqual(self.check()[0], "v3.0")
+
+    def test_a_repo_whose_only_release_is_a_pre_release_falls_to_the_branch(self):
+        self.releases = [{"tag_name": "v0.1-rc1", "prerelease": True, "assets": []}]
+        self.assertEqual(self.check()[0], "abc123def456")

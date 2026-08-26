@@ -1190,6 +1190,41 @@ def rest_archive_url(url: str) -> str | None:
     return f"https://api.github.com/repos/{owner}/{repo}/zipball/{ref}"
 
 
+def latest_release(repo: str) -> dict | None:
+    """The newest published release, asked so that "none" costs nothing twice.
+
+    `/releases/latest` is the endpoint that knows the rule -- newest release
+    that is neither a draft nor a pre-release -- and for a repository that has
+    never published one it answers 404. That is the correct answer, and it is
+    the one answer this tool cannot cache: a 404 carries no ETag, so every
+    check paid for it again. Six addons bound to repositories without releases
+    cost six calls an hour, for ever, to be told six times what had not changed.
+
+    Listing instead answers 200 with an empty array, which does carry an ETag,
+    so the second check is free -- and the first entry of the list is the newest
+    release, which is the answer outright in the common case. Only when that
+    newest one is a draft or a pre-release is the narrower endpoint needed, and
+    that answer revalidates for free too.
+
+    No timer, and nothing taken on trust: a release published a minute ago is
+    still seen on the next check.
+    """
+    listed = http_json(f"https://api.github.com/repos/{repo}/releases?per_page=1")
+    if not listed:
+        # Either no releases (200 and an empty list, free from here on) or no
+        # such repo (404). Both mean there is no release to install, and the
+        # caller falls back to the branch head; a missing repo is reported by
+        # `default_branch` a moment later, which words it properly.
+        return None
+    newest = listed[0]
+    if not newest.get("draft") and not newest.get("prerelease"):
+        return newest
+    # The newest is one this tool should not install. Which of the older ones
+    # counts as current is exactly the question /releases/latest exists to
+    # answer, so ask it -- and its answer, 200 or 404, is now the uncommon case.
+    return http_json(f"https://api.github.com/repos/{repo}/releases/latest")
+
+
 def latest_github(repo_spec: str) -> tuple[str, str]:
     """(version, zip url) for the newest thing at owner/repo[@branch][#folder]."""
     repo, branch, folder = split_repo_spec(repo_spec)
@@ -1214,7 +1249,7 @@ def latest_github(repo_spec: str) -> tuple[str, str]:
             die(f"no branch '{branch}' in {repo}")
         return commits["sha"][:12], archive_url(repo, branch)
 
-    release = http_json(f"https://api.github.com/repos/{repo}/releases/latest")
+    release = latest_release(repo)
     if release:
         # Prefer an attached .zip: that is the packaged addon, laid out the way
         # it should sit in AddOns. The source archive is the fallback and needs
