@@ -119,20 +119,23 @@ class SourceResolution(unittest.TestCase):
             "zipball_url": f"{self.repo}/zipball/v2.0",
             "assets": [],
         }
-        self.assertEqual(addons.latest_github("o/r")[0], "v2.0")
+        # The release's own zipball_url is a REST call; the tag is fetched off
+        # the meter instead.
+        self.assertEqual(addons.latest_github("o/r"),
+                         ("v2.0", "https://codeload.github.com/o/r/zip/refs/tags/v2.0"))
 
     def test_no_releases_uses_the_default_branch_head(self):
         self.responses[self.repo] = {"default_branch": "main"}
         self.responses[f"{self.repo}/commits/main"] = {"sha": "abcdef1234567890"}
         version, url = addons.latest_github("o/r")
         self.assertEqual(version, "abcdef123456")
-        self.assertIn("/zipball/main", url)
+        self.assertEqual(url, "https://codeload.github.com/o/r/zip/refs/heads/main")
 
     def test_explicit_branch(self):
         self.responses[f"{self.repo}/commits/dev"] = {"sha": "1122334455667788"}
         version, url = addons.latest_github("o/r@dev")
         self.assertEqual(version, "112233445566")
-        self.assertIn("/zipball/dev", url)
+        self.assertEqual(url, "https://codeload.github.com/o/r/zip/refs/heads/dev")
 
     def test_missing_repo_is_reported(self):
         with self.assertRaises(addons.Fail):
@@ -810,7 +813,7 @@ class VersionFollowsTheFolder(unittest.TestCase):
         ]
         version, url = addons.latest_github("o/r#HonorTracker")
         self.assertEqual(version, "9ba7d5f00000")
-        self.assertIn("/zipball/main", url)
+        self.assertEqual(url, "https://codeload.github.com/o/r/zip/refs/heads/main")
 
     def test_two_folders_in_one_repo_get_different_versions(self):
         self.responses[self.repo] = {"default_branch": "main"}
@@ -833,7 +836,7 @@ class VersionFollowsTheFolder(unittest.TestCase):
         self.responses[f"{self.repo}/commits?sha=dev&path=A&per_page=1"] = [{"sha": "dddddddddddd"}]
         version, url = addons.latest_github("o/r@dev#A")
         self.assertEqual(version, "dddddddddddd")
-        self.assertIn("/zipball/dev", url)
+        self.assertEqual(url, "https://codeload.github.com/o/r/zip/refs/heads/dev")
 
     def test_a_folder_nothing_ever_touched_is_reported(self):
         self.responses[self.repo] = {"default_branch": "main"}
@@ -1458,6 +1461,12 @@ class PacingGitHub(unittest.TestCase):
     """
 
     def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self.scratch.cleanup)
+        self._config = addons.CONFIG_DIR
+        addons.CONFIG_DIR = pathlib.Path(self.scratch.name)
+        self.addCleanup(lambda: setattr(addons, "CONFIG_DIR", self._config))
+
         # A throttle that reports its sleeps rather than taking them, so the
         # pacing can be asserted without the suite sitting through it.
         self.slept = []
@@ -1561,15 +1570,6 @@ class PacingGitHub(unittest.TestCase):
         self.assertIsNone(addons.http_json(url))
         self.assertEqual(len(self.asked), 1)
 
-    def test_a_stale_answer_is_asked_again(self):
-        self.urlopen([FakeResponse(b'{"default_branch": "main"}', {})])
-        url = "https://api.github.com/repos/o/r"
-        addons.http_json(url)
-        self.assertIsNot(addons.cached(url), addons._MISS)
-        self.assertIs(
-            addons.cached(url, clock=lambda: time.time() + addons.CACHE_SECONDS + 1),
-            addons._MISS,
-        )
 
     # -- hitting the wall ----------------------------------------------------
 
@@ -1707,3 +1707,182 @@ class BoundAddonsComeFirst(unittest.TestCase):
 
     def test_an_empty_list_is_empty(self):
         self.assertEqual(self.order(), [])
+
+
+class AskingForFree(unittest.TestCase):
+    """A check that finds nothing new should cost nothing.
+
+    GitHub does not bill a 304 against the hourly quota, so an ETag turns
+    "you may check twice an hour" into "check as often as you like, as long as
+    your addons are not moving". It is also fresher than the timed cache it
+    replaced, which reported a version two minutes out of date -- exactly wrong
+    for somebody pushing a change and immediately updating to test it.
+    """
+
+    URL = "https://api.github.com/repos/o/r"
+
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self.scratch.cleanup)
+        self._config = addons.CONFIG_DIR
+        addons.CONFIG_DIR = pathlib.Path(self.scratch.name)
+        self.real_throttle = addons.THROTTLE
+        addons.THROTTLE = addons.Throttle(sleep=lambda _s: None, clock=lambda: 0.0)
+        addons.forget_github_state()
+        self.addCleanup(addons.forget_github_state)
+        self.addCleanup(lambda: setattr(addons, "THROTTLE", self.real_throttle))
+        self.addCleanup(lambda: setattr(addons, "CONFIG_DIR", self._config))
+
+        self.body = {"default_branch": "main"}
+        self.etag = 'W/"one"'
+        self.conditional_on = []
+        self.served = []
+
+        def fake(request, timeout=0):
+            asked = request.get_header("If-none-match")
+            self.conditional_on.append(asked)
+            if asked == self.etag:
+                self.served.append(304)
+                raise urllib.error.HTTPError(
+                    request.full_url, 304, "Not Modified",
+                    {"etag": self.etag, "x-ratelimit-remaining": "57"}, io.BytesIO(b""),
+                )
+            self.served.append(200)
+            return FakeResponse(json.dumps(self.body).encode(),
+                                {"etag": self.etag, "x-ratelimit-remaining": "56"})
+
+        real = addons.urllib.request.urlopen
+        addons.urllib.request.urlopen = fake
+        self.addCleanup(lambda: setattr(addons.urllib.request, "urlopen", real))
+
+    def test_the_first_look_costs_a_call_and_the_next_run_does_not(self):
+        addons.begin_run()
+        self.assertEqual(addons.http_json(self.URL), {"default_branch": "main"})
+        addons.begin_run()
+        self.assertEqual(addons.http_json(self.URL), {"default_branch": "main"})
+        # Asked GitHub both times -- the second answer is as fresh as the first.
+        self.assertEqual(self.served, [200, 304])
+        self.assertEqual(self.conditional_on, [None, self.etag])
+
+    def test_a_new_answer_is_seen_the_moment_it_changes(self):
+        # The regression the timed cache introduced: push, update, and be told
+        # you are up to date because the answer was two minutes old.
+        addons.begin_run()
+        addons.http_json(self.URL)
+        self.body = {"default_branch": "develop"}
+        self.etag = 'W/"two"'
+        addons.begin_run()
+        self.assertEqual(addons.http_json(self.URL), {"default_branch": "develop"})
+
+    def test_one_run_asks_once_however_many_addons_want_it(self):
+        # Ten rows out of one repository, one branch lookup. A branch cannot
+        # move between two rows of the same pass.
+        addons.begin_run()
+        for _ in range(10):
+            addons.http_json(self.URL)
+        self.assertEqual(self.served, [200])
+
+    def test_what_was_learned_survives_the_process(self):
+        addons.begin_run()
+        addons.http_json(self.URL)
+        addons.end_run()
+        self.assertTrue(addons.cache_path().is_file())
+
+        addons.forget_github_state()          # as if the app had been restarted
+        addons.begin_run()
+        self.assertEqual(addons.http_json(self.URL), {"default_branch": "main"})
+        self.assertEqual(self.served, [200, 304])
+
+    def test_a_404_is_not_remembered_between_runs(self):
+        # "This repo publishes no releases" is true until the day it is not,
+        # and a 404 carries no ETag to find that out with.
+        missing = urllib.error.HTTPError("http://x", 404, "Not Found", {}, io.BytesIO(b"{}"))
+        def fake(request, timeout=0):
+            self.served.append(404)
+            raise missing
+        addons.urllib.request.urlopen = fake
+
+        addons.begin_run()
+        self.assertIsNone(addons.http_json(self.URL))
+        self.assertIsNone(addons.http_json(self.URL))
+        addons.begin_run()
+        self.assertIsNone(addons.http_json(self.URL))
+        self.assertEqual(self.served, [404, 404])
+
+    def test_an_unwritable_config_directory_does_not_fail_the_run(self):
+        addons.CONFIG_DIR = pathlib.Path(self.scratch.name) / "nope.txt"
+        addons.CONFIG_DIR.parent.mkdir(parents=True, exist_ok=True)
+        (pathlib.Path(self.scratch.name) / "nope.txt").write_text("not a directory")
+        addons.begin_run()
+        addons.http_json(self.URL)
+        addons.end_run()          # must not raise
+
+
+class ArchivesOffTheMeter(unittest.TestCase):
+    """The download half of an update need not be spent out of the API quota.
+
+    `api.github.com/repos/o/r/zipball/ref` is a REST call and is billed as one.
+    codeload is the host behind the "Download ZIP" button: same bytes, no quota.
+    It is undocumented, so the REST URL stays as a fallback -- a run that
+    installs the addon and spends a call beats a run that fails for free.
+    """
+
+    def setUp(self):
+        self.real_throttle = addons.THROTTLE
+        self.slept = []
+        addons.THROTTLE = addons.Throttle(sleep=self.slept.append, clock=lambda: 0.0)
+        addons.forget_github_state()
+        self.addCleanup(addons.forget_github_state)
+        self.addCleanup(lambda: setattr(addons, "THROTTLE", self.real_throttle))
+        self.asked = []
+
+    def serve(self, fail_codeload=False):
+        def fake(request, timeout=0):
+            url = request.full_url
+            self.asked.append(url)
+            if fail_codeload and "codeload.github.com" in url:
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, io.BytesIO(b""))
+            return FakeResponse(b"PK\x03\x04", {"x-ratelimit-remaining": "50"})
+        real = addons.urllib.request.urlopen
+        addons.urllib.request.urlopen = fake
+        self.addCleanup(lambda: setattr(addons.urllib.request, "urlopen", real))
+
+    def test_a_branch_archive_goes_to_codeload(self):
+        self.assertEqual(addons.archive_url("o/r", "main"),
+                         "https://codeload.github.com/o/r/zip/refs/heads/main")
+
+    def test_a_tag_archive_goes_to_codeload(self):
+        self.assertEqual(addons.archive_url("o/r", "v1.2", tag=True),
+                         "https://codeload.github.com/o/r/zip/refs/tags/v1.2")
+
+    def test_a_branch_with_a_slash_survives_the_url(self):
+        self.assertEqual(addons.archive_url("o/r", "feature/new"),
+                         "https://codeload.github.com/o/r/zip/refs/heads/feature/new")
+
+    def test_codeload_costs_no_quota_and_no_pause(self):
+        self.serve()
+        addons.download(addons.archive_url("o/r", "main"))
+        addons.download(addons.archive_url("o/r", "main"))
+        self.assertEqual(self.slept, [])
+
+    def test_a_refusal_falls_back_to_the_rest_archive(self):
+        self.serve(fail_codeload=True)
+        self.assertEqual(addons.download(addons.archive_url("o/r", "main")), b"PK\x03\x04")
+        self.assertEqual(self.asked, [
+            "https://codeload.github.com/o/r/zip/refs/heads/main",
+            "https://api.github.com/repos/o/r/zipball/main",
+        ])
+
+    def test_a_tag_falls_back_to_the_right_ref(self):
+        self.serve(fail_codeload=True)
+        addons.download(addons.archive_url("o/r", "v1.2", tag=True))
+        self.assertEqual(self.asked[-1], "https://api.github.com/repos/o/r/zipball/v1.2")
+
+    def test_a_release_asset_has_no_fallback_to_invent(self):
+        # Not a codeload URL, so a failure is a real failure and is reported.
+        self.serve()
+        addons.urllib.request.urlopen = lambda request, timeout=0: (_ for _ in ()).throw(
+            urllib.error.HTTPError(request.full_url, 500, "Boom", {}, io.BytesIO(b""))
+        )
+        with self.assertRaises(urllib.error.HTTPError):
+            addons.download("https://github.com/o/r/releases/download/v1/A.zip")

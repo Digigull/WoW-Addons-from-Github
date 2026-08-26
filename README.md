@@ -247,6 +247,8 @@ Everything the terminal does, in one window:
   is reported and skipped — everything else still updates, and the manifest still saves.
 - **Archives containing `../` paths are refused.** This unpacks zips published by third
   parties.
+- **Nothing but the manifest and a cache is written outside AddOns.** `github-cache.json`
+  sits beside the manifest, holds only what GitHub already told us, and is safe to delete.
 - **Your manifest stays out of the way**, at `$XDG_CONFIG_HOME/wow-addons/manifest.json` —
   in practice `~/.config/wow-addons/manifest.json`, and `%APPDATA%\wow-addons\` on Windows.
   It holds your disk paths, so it does not belong in a repository. `where` prints the
@@ -257,25 +259,63 @@ Restart the client, or `/reload`, to pick changes up.
 ## GitHub's rate limit
 
 Unauthenticated GitHub allows 60 API calls an hour, and separately objects to bursts
-however much of that is left. One addon costs one to three calls to check and one more to
-download, so `Update all` over a longer list is a burst of them fired as fast as the
-network answers — which is how a perfectly ordinary addon list came back **GitHub rate
-limit reached**, and then spent one more doomed call per remaining addon saying so again.
+however much of that is left. Checking one addon costs a call or two and downloading it
+used to cost another, so `Update all` over a longer list was a burst of them fired as
+fast as the network answered — which is how a perfectly ordinary addon list came back
+**GitHub rate limit reached**, and then spent one more doomed call per remaining addon
+saying so again.
 
-Updates are now paced instead:
+Four things now keep a run inside the budget:
 
-- an answer already fetched is reused for a couple of minutes, so two addons out of the
-  same repository do not both pay for the same question;
-- calls are spaced out — a little always, and much more once the quota is nearly gone, so
-  the last of it is rationed rather than emptied in one second;
-- a burst limit, which clears in about a minute, is waited out and the call retried;
-- an exhausted hourly quota fails the run once, immediately, saying when it comes back,
-  rather than being re-hit for every addon left. Both front ends say when they are
-  waiting and why, so a pause never looks like a hang.
+- **A check that finds nothing new is free.** Every answer is stored with the `ETag`
+  GitHub stamped on it, and sent back as `If-None-Match` next time. An unchanged resource
+  replies `304 Not Modified`, and GitHub does not bill a `304`. Check as often as you
+  like, as long as your addons are not moving.
+- **Archives are fetched off the meter.** A zip comes from `codeload.github.com`, the host
+  behind the green *Download ZIP* button, which is not the REST API and does not spend the
+  hourly quota. The REST URL stays as an automatic fallback, so a run that cannot use
+  codeload still installs, for the price of a call.
+- **One question per run.** Ten addons out of one repository share its branch lookup.
+- **The wall is not re-hit.** Once the quota is known to be spent the run fails once,
+  immediately, naming the time it comes back, rather than spending a round trip per
+  remaining addon to be told the same thing.
 
-None of that invents quota. `GITHUB_TOKEN` still does: it is entirely optional, and it
-raises the limit to 5000 calls an hour. Set it to a read-only token if you keep hitting
-the wall with a long list.
+What that costs in practice, per addon, for a full update where the addon really changed:
+
+| Source | First run | Every run after |
+|---|---|---|
+| `local:/path/to/checkout` | **0** | **0** |
+| `github:owner/repo` — repo publishes releases | 1 | **0** |
+| `github:owner/repo@main` — branch pinned | 1 | **0** |
+| `github:owner/repo@main#Folder` — branch and folder pinned | 1 | **0** |
+| `github:owner/repo#Folder` — folder pinned | 2 | **0** |
+| `github:owner/repo` — repo publishes **no** releases | 3 | 1 |
+
+The last row is the only shape that keeps costing something, because "this repo has no
+releases" comes back as a `404`, and a `404` carries no `ETag` to revalidate against.
+Pinning the branch — `github:owner/repo@main` — skips the release lookup entirely and
+takes it to zero.
+
+Both front ends print how many calls are left after a run, and say when they are waiting
+and why, so a pause never looks like a hang. What was learned is kept in
+`github-cache.json` beside the manifest; deleting it costs one cold run and nothing else.
+
+`GITHUB_TOKEN` is still honoured and still entirely optional — it raises the limit to 5000
+calls an hour. With the above it is rarely the thing standing between you and a finished
+update.
+
+### Working on your own addon
+
+If you are editing an addon yourself, bind it to the checkout rather than to GitHub:
+
+```
+addons.py set MyAddon local:~/src/my-addons/MyAddon
+```
+
+That costs no API calls at all, and in the default link mode the client reads your working
+tree directly — save the file, `/reload` in the client, done. There is nothing to press
+between edits and nothing to download. Point the row back at `github:` when you want to
+test what somebody else would actually receive.
 
 ## Linux, Wine and Proton
 

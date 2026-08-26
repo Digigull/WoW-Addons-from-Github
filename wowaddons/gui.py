@@ -337,10 +337,13 @@ class SourceDialog(tk.Toplevel):
         # _drain_lookups picks it up on the main thread. That rule is why this
         # program does not abort with Tcl_AsyncDelete.
         def ask() -> None:
+            core.begin_run()
             try:
                 self.lookups.put((spec, core.addons_in_repo(spec), None))
             except Exception as exc:  # noqa: BLE001 - reported in the dialog
                 self.lookups.put((spec, [], str(exc)))
+            finally:
+                core.end_run()
 
         threading.Thread(target=ask, daemon=True).start()
         self._poll_lookups()
@@ -1030,6 +1033,7 @@ class App(ttk.Frame):
         self.counter.configure(text=f"0/{len(names)}")
         self.say("Checking…" if check else "Working…")
 
+        core.begin_run()
         self.worker = _Worker(names, self.entries(), root, self.outbox, check=check)
         self.worker.start()
         self._sync_buttons()
@@ -1114,17 +1118,25 @@ class App(ttk.Frame):
         # Saved either way: a check writes no addon files, but the versions it
         # learned are worth keeping so the Latest column is not blank next time.
         core.save(self.state)
+        # The ETags this run learned are what make the next one cost nothing,
+        # so they are kept whether or not anything was installed.
+        core.end_run()
         self.worker = None
         self.counter.configure(text="")
         self.progress.configure(value=0)
         tail = f", {self.failures} failed" if self.failures else ""
+        # What is left of the hour, when we have been told. Seeing the number
+        # fall is how somebody learns that pinning a branch, or binding the
+        # addon they are working on locally, costs nothing at all.
+        left = core.quota_left()
+        budget = f" {left} GitHub call(s) left this hour." if left is not None else ""
 
         if self.checking:
             found = f"{self.outdated} update(s) available" if self.outdated else "everything is up to date"
-            self.say(f"Checked — {found}{tail}. Nothing was downloaded.")
+            self.say(f"Checked — {found}{tail}. Nothing was downloaded.{budget}")
         else:
             done = f"Done — {self.updated} updated{tail}."
-            self.say(done + (" Restart the client, or /reload." if self.updated else ""))
+            self.say(done + (" Restart the client, or /reload." if self.updated else "") + budget)
         self._sync_buttons()
 
 

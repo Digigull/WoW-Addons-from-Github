@@ -875,29 +875,130 @@ class Throttle:
 
 
 THROTTLE = Throttle()
-_cache: dict[str, tuple[float, dict | None]] = {}
+
+
+# -- what we already know ----------------------------------------------------
+#
+# Two caches, because they answer two different questions.
+#
+# The run cache is "did we already ask this, a moment ago, in this same pass?"
+# Ten addons out of one repository all want its default branch, and a branch
+# cannot meaningfully move between two rows of the same run. It lives for one
+# run and is thrown away, so a second run never reads a stale answer.
+#
+# The ETag store is "has this changed since the last time we looked?" GitHub
+# stamps every response with an ETag; send it back as If-None-Match and an
+# unchanged resource answers 304 with no body -- and, crucially, a 304 is NOT
+# billed against the hourly quota. So a check that finds nothing new is free,
+# however often it is run. It is also fresher than a timed cache: the answer
+# always comes from GitHub, so a commit pushed ten seconds ago shows up.
+
+CACHE_ENTRIES = 400
+"""Most URLs kept between runs. A big list is a few dozen; this is slack."""
+
+CACHE_MAX_BODY = 256 * 1024
+"""Bodies larger than this are revalidated but not stored, to bound the file."""
+
+_run_cache: dict[str, dict | None] = {}
+_store: dict[str, dict] | None = None
+_store_dirty = False
+
+_MISS = object()
+"""Distinguishes "not asked yet" from an answer of None, which 404 is."""
+
+
+def cache_path() -> Path:
+    """Beside the manifest: same directory, same lifetime, easy to delete."""
+    return CONFIG_DIR / "github-cache.json"
+
+
+def store() -> dict[str, dict]:
+    """The ETag store, read from disk once per process.
+
+    A damaged or unreadable file is not worth a word to the user: the only
+    thing lost is some free revalidation, and the run works without it.
+    """
+    global _store
+    if _store is None:
+        _store = {}
+        try:
+            loaded = json.loads(cache_path().read_text())
+            if isinstance(loaded, dict):
+                _store = {k: v for k, v in loaded.items() if isinstance(v, dict)}
+        except Exception:
+            _store = {}
+    return _store
+
+
+def remember(url: str, etag: str | None, body: dict | None) -> None:
+    """Keep an answer and the tag that will tell us whether it still holds."""
+    global _store_dirty
+    if not etag:
+        return
+    try:
+        if len(json.dumps(body)) > CACHE_MAX_BODY:
+            return
+    except Exception:
+        return
+    store()[url] = {"etag": etag, "body": body, "at": time.time()}
+    _store_dirty = True
+
+
+def touch(url: str) -> None:
+    """Mark an entry as still in use, so pruning keeps what is being used."""
+    global _store_dirty
+    entry = store().get(url)
+    if entry is not None:
+        entry["at"] = time.time()
+        _store_dirty = True
+
+
+def begin_run() -> None:
+    """Starting a fresh pass: forget what was asked during the last one.
+
+    This is what keeps `Update` honest straight after a push. Nothing is
+    served from a timer -- every run revalidates, and pays nothing for the
+    answers that have not changed.
+    """
+    _run_cache.clear()
+
+
+def end_run() -> None:
+    """Write the ETag store, if anything was learned. Never raises."""
+    global _store_dirty
+    if not _store_dirty or _store is None:
+        return
+    keep = sorted(_store.items(), key=lambda kv: kv[1].get("at", 0), reverse=True)
+    pruned = dict(keep[:CACHE_ENTRIES])
+    try:
+        cache_path().parent.mkdir(parents=True, exist_ok=True)
+        cache_path().write_text(json.dumps(pruned))
+        _store.clear()
+        _store.update(pruned)
+        _store_dirty = False
+    except OSError:
+        # An unwritable config directory costs free revalidation next time and
+        # nothing else. Not worth failing an otherwise good run over.
+        pass
 
 
 def forget_github_state() -> None:
-    """Drop the cache and the quota bookkeeping, for a genuinely fresh look."""
-    _cache.clear()
+    """Drop everything remembered about GitHub, in memory. For a fresh look."""
+    global _store, _store_dirty
+    _run_cache.clear()
+    _store = None
+    _store_dirty = False
     THROTTLE.forget()
 
 
-_MISS = object()
-"""Distinguishes "not cached" from a cached None, which 404 legitimately is."""
+def quota_left() -> int | None:
+    """GitHub calls left this hour, as of the last response. None until asked.
 
-
-def cached(url: str, clock=time.time):
-    """A recent answer for this URL, or `_MISS` if there is not one."""
-    found = _cache.get(url)
-    if found is None:
-        return _MISS
-    when, answer = found
-    if clock() - when > CACHE_SECONDS:
-        del _cache[url]
-        return _MISS
-    return answer
+    Worth showing: the number is the whole reason a run fails, and seeing it
+    fall is how somebody learns that pinning a branch or binding a folder
+    locally is cheaper than not.
+    """
+    return None if THROTTLE.remaining is None else int(THROTTLE.remaining)
 
 
 def rate_limit_message(reset_at: float | None) -> str:
@@ -926,10 +1027,18 @@ def is_rate_limit(headers, message: str) -> bool:
 
 
 def http_json(url: str) -> dict | None:
-    """One GitHub API call: cached if it can be, paced if it cannot."""
-    answer = cached(url)
-    if answer is not _MISS:
-        return answer
+    """One GitHub API call -- asked once per run, and free when nothing changed.
+
+    The ETag round trip still happens; what it does not do is cost quota. That
+    is the difference between "you may check twice an hour" and "check as often
+    as you like, as long as your addons are not moving".
+    """
+    memo = _run_cache.get(url, _MISS)
+    if memo is not _MISS:
+        return memo
+
+    known = store().get(url)
+    conditional = bool(known and known.get("etag") and "body" in known)
 
     for attempt in (1, 2):
         if THROTTLE.spent():
@@ -947,20 +1056,29 @@ def http_json(url: str) -> dict | None:
             # personal addon list can still reach on a big update; set this if
             # you do.
             request.add_header("Authorization", f"Bearer {token}")
+        if conditional:
+            request.add_header("If-None-Match", known["etag"])
 
         THROTTLE.wait_turn()
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 THROTTLE.observe(response.headers)
                 answer = json.loads(response.read().decode())
-                _cache[url] = (time.time(), answer)
+                remember(url, header(response.headers, "etag"), answer)
+                _run_cache[url] = answer
                 return answer
         except urllib.error.HTTPError as exc:
             THROTTLE.observe(exc.headers)
+            if exc.code == 304:
+                # Unchanged, and not billed. The stored body is the answer.
+                touch(url)
+                _run_cache[url] = known["body"]
+                return known["body"]
             if exc.code == 404:
-                # Worth remembering: "no release" is asked once per addon and
-                # is a perfectly good answer to cache.
-                _cache[url] = (time.time(), None)
+                # Remembered for this run only: a repository that publishes no
+                # releases today may publish one tomorrow, and a 404 carries no
+                # ETag to revalidate against.
+                _run_cache[url] = None
                 return None
             if exc.code in (403, 429):
                 message = github_message(exc)
@@ -1035,6 +1153,43 @@ def latest_folder_commit(repo: str, branch: str, folder: str) -> str:
     return commits[0]["sha"][:12]
 
 
+def archive_url(repo: str, ref: str, *, tag: bool = False) -> str:
+    """Where to fetch a whole ref as a zip, off the API's meter.
+
+    `api.github.com/repos/o/r/zipball/ref` is a REST call and is billed as one,
+    which made the download half of an update as expensive as the checking
+    half. codeload is the host behind the green "Download ZIP" button: it is
+    not the REST API, does not spend the hourly quota, and is limited far more
+    liberally. It is not unlimited and it is not documented, which is why
+    `download` keeps the REST URL as a fallback rather than trusting this
+    outright.
+    """
+    kind = "tags" if tag else "heads"
+    return f"https://codeload.github.com/{repo}/zip/refs/{kind}/{urllib.parse.quote(ref)}"
+
+
+def rest_archive_url(url: str) -> str | None:
+    """The REST equivalent of a codeload URL, for when codeload will not serve.
+
+    Costs a call, which is the whole thing we are avoiding -- but a run that
+    installs the addon and spends a call beats a run that fails for free.
+    """
+    prefix = "https://codeload.github.com/"
+    if not url.startswith(prefix):
+        return None
+    rest = url[len(prefix):]
+    owner, _, rest = rest.partition("/")
+    repo, _, rest = rest.partition("/")
+    if not (owner and repo and rest.startswith("zip/")):
+        return None
+    ref = rest[len("zip/"):]
+    for lead in ("refs/heads/", "refs/tags/"):
+        if ref.startswith(lead):
+            ref = ref[len(lead):]
+            break
+    return f"https://api.github.com/repos/{owner}/{repo}/zipball/{ref}"
+
+
 def latest_github(repo_spec: str) -> tuple[str, str]:
     """(version, zip url) for the newest thing at owner/repo[@branch][#folder]."""
     repo, branch, folder = split_repo_spec(repo_spec)
@@ -1051,13 +1206,13 @@ def latest_github(repo_spec: str) -> tuple[str, str]:
             # folders does -- otherwise ticking a second folder would quietly
             # stop that folder ever reporting an update.
             version = f"{version}+{latest_folder_commit(repo, ref, extra)[:7]}"
-        return version, f"https://api.github.com/repos/{repo}/zipball/{ref}"
+        return version, archive_url(repo, ref)
 
     if branch:
         commits = http_json(f"https://api.github.com/repos/{repo}/commits/{branch}")
         if not commits:
             die(f"no branch '{branch}' in {repo}")
-        return commits["sha"][:12], f"https://api.github.com/repos/{repo}/zipball/{branch}"
+        return commits["sha"][:12], archive_url(repo, branch)
 
     release = http_json(f"https://api.github.com/repos/{repo}/releases/latest")
     if release:
@@ -1067,12 +1222,12 @@ def latest_github(repo_spec: str) -> tuple[str, str]:
         for asset in release.get("assets", []):
             if asset["name"].lower().endswith(".zip"):
                 return release["tag_name"], asset["browser_download_url"]
-        return release["tag_name"], release["zipball_url"]
+        return release["tag_name"], archive_url(repo, release["tag_name"], tag=True)
 
     ref = default_branch(repo)
     commits = http_json(f"https://api.github.com/repos/{repo}/commits/{ref}")
     sha = commits["sha"][:12] if commits else ref
-    return sha, f"https://api.github.com/repos/{repo}/zipball/{ref}"
+    return sha, archive_url(repo, ref)
 
 
 def addons_in_repo(repo_spec: str) -> list[str]:
@@ -1140,13 +1295,25 @@ def likely_addon(name: str, folders: list[str]) -> str | None:
 
 
 def download(url: str) -> bytes:
-    """Fetch one archive, paced with the rest when it goes through the API.
+    """Fetch one archive: off the API's meter where possible, paced where not.
 
-    A zipball from api.github.com is spent out of the same hourly quota as
-    every version check, so an update installing thirty addons is thirty calls
-    the pacing has to count. A release asset served from elsewhere is not, and
-    is fetched at full speed.
+    An archive from codeload costs no quota, so it is tried first and fetched
+    at full speed. A release asset served from github.com is the same. Only a
+    REST zipball is spent out of the hourly budget, and only that is paced.
     """
+    try:
+        return fetch(url)
+    except (urllib.error.HTTPError, urllib.error.URLError):
+        # codeload declining is not the end of the road: the REST API can serve
+        # the same ref, for the price of a call. Silent on purpose -- which
+        # host answered is a transport detail, and the addon still installs.
+        fallback = rest_archive_url(url)
+        if fallback is None:
+            raise
+        return fetch(fallback)
+
+
+def fetch(url: str) -> bytes:
     through_the_api = "api.github.com" in url
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     token = os.environ.get("GITHUB_TOKEN")
