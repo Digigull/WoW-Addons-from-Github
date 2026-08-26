@@ -347,3 +347,20 @@ fails if the committed PNG has drifted.
 ## Licence
 
 MIT — see [LICENSE](LICENSE).
+
+## Cutting a release
+
+Entirely from the browser, no git checkout needed. **Actions → release → Run workflow**,
+leave the branch on `main`, then:
+
+| | Tag | Build from |
+|---|---|---|
+| **a new release** | `v0.5.0` | `main` |
+| **rebuild one whose build failed** | the existing tag | *(blank)* |
+| **just check the builds** | *(blank)* | *(blank)* |
+
+A new tag is created at the commit that was actually built, and the release gets its title,
+notes, pre-release label and both binaries. Rebuilding edits the existing release in place —
+same tag, same URL, nothing duplicated — which is what makes a failed release repairable
+without moving a tag, something the web UI cannot do.
+
