@@ -192,12 +192,29 @@ jobs:
           RELEASE_COMMIT=$(git rev-parse HEAD)
           echo "publishing ${RELEASE_TAG} at ${RELEASE_COMMIT}"
 
+          # GitHub renders its own Assets block at the foot of the page, and
+          # nothing in the notes can move it or open it. So the notes carry
+          # their own download table at the very top, with direct links -- and
+          # those links need the tag, which a file checked into the repository
+          # cannot know. Substituted here, into a copy: every release then
+          # links to its OWN assets rather than to whatever is newest.
+          #
+          # `/releases/latest/download/...` would need no substitution and is
+          # wrong here: every release this workflow publishes is flagged as a
+          # pre-release, and `latest` skips pre-releases, so those links would
+          # 404 for as long as that is true.
+          sed "s|__TAG__|${RELEASE_TAG}|g" .github/release-notes.md > notes.md
+          if grep -q "__TAG__" notes.md; then
+            echo "::error::the download links in release-notes.md were not substituted"
+            exit 1
+          fi
+
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             echo "release already exists; applying title, notes and pre-release flag"
             gh release edit "${RELEASE_TAG}" \
               --title "${RELEASE_TAG}" \
               --prerelease \
-              --notes-file .github/release-notes.md
+              --notes-file notes.md
           else
             # --target names the commit to tag. Without it gh tags the
             # repository's default branch as it is at that moment, which is not
@@ -206,7 +223,7 @@ jobs:
               --target "${RELEASE_COMMIT}" \
               --title "${RELEASE_TAG}" \
               --prerelease \
-              --notes-file .github/release-notes.md
+              --notes-file notes.md
           fi
           gh release upload "${RELEASE_TAG}" dist/* --clobber
 

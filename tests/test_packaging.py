@@ -440,9 +440,46 @@ class Releasing(unittest.TestCase):
         # gh release create --notes-file fails the publish if this is missing,
         # after both builds have already run.
         workflow = self.WORKFLOW.read_text()
-        self.assertIn("--notes-file .github/release-notes.md", workflow)
+        self.assertIn("--notes-file notes.md", workflow)
         self.assertTrue(self.NOTES.is_file())
         self.assertGreater(len(self.NOTES.read_text()), 500, "notes look like a stub")
+
+    def test_the_published_notes_are_built_from_the_ones_in_the_repo(self):
+        """`--notes-file notes.md` is only safe if something writes notes.md.
+
+        The download table at the top of the notes links straight at the
+        assets, which needs the tag -- and a file in the repository cannot know
+        the tag. The publish step substitutes it into a copy. If that step is
+        dropped or renamed, `--notes-file` starts pointing at a file nobody
+        creates and the release publishes with no notes at all.
+        """
+        commands = self.workflow_commands()
+        self.assertIn("release-notes.md > notes.md", commands)
+        self.assertLess(
+            commands.index("release-notes.md > notes.md"),
+            commands.index("--notes-file notes.md"),
+            "notes.md is used before anything writes it",
+        )
+
+    def test_the_download_links_are_per_release(self):
+        """Each release must link to its own assets, not to whatever is newest.
+
+        `/releases/latest/download/...` would need no substitution and is wrong
+        here: every release this workflow publishes is marked a pre-release, and
+        `latest` skips pre-releases, so those links would 404 for as long as
+        that stays true.
+        """
+        notes = self.NOTES.read_text()
+        self.assertIn("/releases/download/__TAG__/", notes)
+        self.assertNotIn("/releases/latest/download/", notes)
+
+    def test_the_notes_lead_with_the_download(self):
+        # GitHub renders its own Assets block at the foot of the page and
+        # nothing can move it, so the notes carry the links themselves -- above
+        # the changelog, or they are four versions of history down the page.
+        headings = [line for line in self.NOTES.read_text().splitlines()
+                    if line.startswith("## ")]
+        self.assertEqual(headings[0], "## Download")
 
     def test_the_notes_name_the_files_the_builds_actually_produce(self):
         # Release notes telling somebody to download a filename that does not
@@ -477,7 +514,7 @@ class Releasing(unittest.TestCase):
         self.assertIn("gh release edit", commands, "nothing applies metadata to an existing release")
         self.assertNotIn("|| gh release create", commands, "the bug that shipped v0.3.0 is back")
         # Both branches must set all three, or one route silently differs.
-        self.assertEqual(commands.count("--notes-file .github/release-notes.md"), 2)
+        self.assertEqual(commands.count("--notes-file notes.md"), 2)
         self.assertEqual(commands.count("--prerelease"), 2)
 
     def test_the_publish_verifies_what_it_published(self):

@@ -2,6 +2,44 @@ Update your World of Warcraft addons from repositories **you** choose. No catalo
 account, and no telemetry of any kind — it contacts exactly the hosts named in your own
 manifest and nothing else.
 
+## Download
+
+| You are on | Get | Then |
+|---|---|---|
+| **Linux** | **[WoW-Addons-from-GitHub-x86_64.AppImage](https://github.com/Digigull/WoW-Addons-from-Github/releases/download/__TAG__/WoW-Addons-from-GitHub-x86_64.AppImage)** | `chmod +x` it and open it |
+| **Windows** | **[WoW-Addons-from-GitHub-windows-x64.zip](https://github.com/Digigull/WoW-Addons-from-Github/releases/download/__TAG__/WoW-Addons-from-GitHub-windows-x64.zip)** | unzip anywhere, run **WoW Addons from GitHub.exe** |
+
+Both carry their own Python and their own Tk. Nothing to install, nothing to keep updated,
+and deleting the file (or the folder) uninstalls it.
+[`SHA256SUMS.txt`](https://github.com/Digigull/WoW-Addons-from-Github/releases/download/__TAG__/SHA256SUMS.txt) is there if you want to check what you downloaded.
+
+The same download is also the command line — give it arguments and it behaves like the
+script:
+
+```
+./WoW-Addons-from-GitHub-x86_64.AppImage update --check
+"WoW Addons from GitHub.exe" update --check
+```
+
+## Fixed in v0.7.1
+
+**A repeated "Check for updates" still cost calls.** v0.7.0 made an unchanged check free
+by asking GitHub "has this moved since last time?" — except for one question it could
+never ask that way. A repository that has never published a release answers *404* to the
+release lookup, and a 404 carries no tag to check against, so that one question was paid
+for on every single run. Six addons bound to repositories without releases quietly cost
+six calls an hour, for ever, to be told six times what had not changed.
+
+It now asks for the release *list* instead, which answers with an empty list rather than a
+404 — and an empty list can be checked against, so the second check costs nothing. Every
+kind of binding is now free once nothing has changed. A repository's first ever release is
+still seen on the very next check: nothing is remembered on a timer, and a pre-release or
+a draft is still never installed over the stable release beneath it.
+
+**The downloads are at the top of this page.** GitHub puts its own Assets block at the
+foot of a release and nothing can move it, so the notes now carry the links themselves,
+above the history.
+
 ## New in v0.7.0
 
 **Updating no longer runs into GitHub's rate limit.** Unauthenticated GitHub allows 60 API
@@ -120,25 +158,6 @@ Also in this release:
   branch — which is understood as that branch. `owner/repo` still works.
 - **Check for updates**, with a **Latest** column beside Installed. It downloads nothing
   and writes nothing, so seeing what is out of date does not commit you to installing it.
-
-## Download
-
-| You are on | Get | Then |
-|---|---|---|
-| **Linux** | `WoW-Addons-from-GitHub-x86_64.AppImage` | `chmod +x` it and open it |
-| **Windows** | `WoW-Addons-from-GitHub-windows-x64.zip` | unzip anywhere, run **WoW Addons from GitHub.exe** |
-
-Both carry their own Python and their own Tk. Nothing to install, nothing to keep updated,
-and deleting the file (or the folder) uninstalls it. `SHA256SUMS.txt` is attached if you
-want to check what you downloaded.
-
-The same download is also the command line — give it arguments and it behaves like the
-script:
-
-```
-./WoW-Addons-from-GitHub-x86_64.AppImage update --check
-"WoW Addons from GitHub.exe" update --check
-```
 
 ## Two things that will look like faults and are not
 
