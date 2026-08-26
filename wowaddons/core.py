@@ -961,6 +961,11 @@ def begin_run() -> None:
     answers that have not changed.
     """
     _run_cache.clear()
+    # Refetched every run on purpose: comparing this run's listing against the
+    # one kept from last run is what says whether anything moved, and a
+    # listing held over from the previous pass would answer "no" for ever.
+    _refs_now.clear()
+    _refs_before.clear()
 
 
 def end_run() -> None:
@@ -986,6 +991,8 @@ def forget_github_state() -> None:
     """Drop everything remembered about GitHub, in memory. For a fresh look."""
     global _store, _store_dirty
     _run_cache.clear()
+    _refs_now.clear()
+    _refs_before.clear()
     _store = None
     _store_dirty = False
     THROTTLE.forget()
@@ -1129,7 +1136,201 @@ def wanted_folders(folder: str | None) -> list[str]:
     return [part.strip().strip("/") for part in folder.split(",") if part.strip().strip("/")]
 
 
+# -- asking git instead of the API -------------------------------------------
+#
+# Every question this tool asks about a repository used to go to the REST API,
+# which allows 60 calls an hour without a token. Most of them do not need to.
+#
+# Before a clone, git asks the server to list what it has, at
+#
+#     https://github.com/owner/repo.git/info/refs?service=git-upload-pack
+#
+# That is the git wire protocol, not the REST API: it is served from github.com,
+# it carries no x-ratelimit headers, and it is not billed against the hourly
+# quota -- it is the request every `git fetch` in the world begins with. One of
+# them yields, for a whole repository at once:
+#
+#     the default branch      advertised as symref=HEAD:refs/heads/<name>
+#     every branch, with the commit it points at
+#     every tag, with the commit it points at
+#
+# Which answers outright the two questions that cost the most calls, and rules
+# out a third: a published release always has a tag, so a repository with no
+# tags cannot have a release, and the release endpoint need not be asked at all.
+#
+# What it cannot answer is history -- "which commit last touched this folder" is
+# not in a ref listing. But a folder cannot change unless the branch containing
+# it moves, so comparing this listing against the last one tells us when that
+# question can be skipped rather than asked.
+#
+# Everything here fails soft. A repository that is private, or a network that
+# blocks this, simply falls back to the REST path, exactly as a codeload archive
+# falls back to the API zipball.
+
+GIT_REFS_URL = "https://github.com/{repo}.git/info/refs?service=git-upload-pack"
+
+REFS_MAX_BYTES = 4 * 1024 * 1024
+"""A busy repository advertises a lot of refs; stop reading well before silly."""
+
+_refs_now: dict[str, dict | None] = {}
+_refs_before: dict[str, dict | None] = {}
+
+
+def pkt_lines(raw: bytes):
+    """Split a git pkt-line stream: four hex length bytes, then that many bytes.
+
+    A length of 0000 is a section terminator and carries no payload. Anything
+    malformed ends the walk rather than raising -- this is a best-effort read of
+    an optional shortcut, not a parser anybody depends on being strict.
+    """
+    at = 0
+    while at + 4 <= len(raw):
+        try:
+            size = int(raw[at:at + 4], 16)
+        except ValueError:
+            return
+        if size == 0:
+            at += 4
+            continue
+        if size < 4 or at + size > len(raw):
+            return
+        yield raw[at + 4:at + size]
+        at += size
+
+
+def read_advertisement(raw: bytes) -> dict:
+    """The refs a server advertised, as {'head': branch, 'refs': {name: sha}}.
+
+    Only branches and tags are kept. GitHub also advertises every pull request
+    as refs/pull/N/head, which on a busy repository is most of the response and
+    none of the answer. Peeled tags (refs/tags/x^{}) name the commit a tag
+    object points at; the tag's own entry is the one that matches a release.
+    """
+    head, refs = None, {}
+    for line in pkt_lines(raw):
+        text = line.decode("utf-8", "replace").strip()
+        if not text or text.startswith("#"):
+            continue
+        payload, _, capabilities = text.partition("\x00")
+        for capability in capabilities.split():
+            if capability.startswith("symref=HEAD:refs/heads/"):
+                head = capability.split("refs/heads/", 1)[1]
+        sha, _, name = payload.strip().partition(" ")
+        if name.endswith("^{}"):
+            continue
+        if name.startswith(("refs/heads/", "refs/tags/")):
+            refs[name] = sha
+    return {"head": head, "refs": refs}
+
+
+def git_refs(repo: str) -> dict | None:
+    """What the repository advertises, asked once per run. None if unavailable.
+
+    Also remembers the previous run's answer before overwriting it, because
+    "did anything move since last time" is the question that lets the expensive
+    calls be skipped.
+    """
+    if repo in _refs_now:
+        return _refs_now[repo]
+
+    _refs_now[repo] = None
+    request = urllib.request.Request(
+        GIT_REFS_URL.format(repo=repo),
+        # git's own User-Agent: this is the git protocol, and a server may
+        # reasonably treat it differently from a browser.
+        headers={"User-Agent": "git/2.40 (wow-addons-sync)"},
+    )
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        # Basic, not Bearer: the git transport authenticates the way git does,
+        # which is what makes a private repository work here at all.
+        import base64
+
+        pair = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        request.add_header("Authorization", f"Basic {pair}")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            found = read_advertisement(response.read(REFS_MAX_BYTES))
+    except Exception:
+        # Private, blocked, offline, or something new: the REST path still
+        # works and is what every caller falls back to.
+        return None
+    if not found["refs"]:
+        return None
+
+    _refs_before[repo] = store().get(f"refs:{repo}")
+    remember_refs(repo, found)
+    _refs_now[repo] = found
+    return found
+
+
+def remember_refs(repo: str, found: dict) -> None:
+    """Keep this listing, so the next run can see what moved."""
+    global _store_dirty
+    store()[f"refs:{repo}"] = {"refs": found["refs"], "head": found["head"], "at": time.time()}
+    _store_dirty = True
+
+
+def ref_sha(repo: str, ref: str) -> str | None:
+    """The commit a branch or tag points at, without spending a call."""
+    found = git_refs(repo)
+    if not found:
+        return None
+    for name in (f"refs/heads/{ref}", f"refs/tags/{ref}", ref):
+        if name in found["refs"]:
+            return found["refs"][name]
+    return None
+
+
+def names_a_tag(repo: str, ref: str) -> bool:
+    """Whether `ref` is a tag rather than a branch, per the advertisement."""
+    found = git_refs(repo)
+    if not found:
+        return False
+    return (f"refs/tags/{ref}" in found["refs"]
+            and f"refs/heads/{ref}" not in found["refs"])
+
+
+def ref_moved(repo: str, ref: str) -> bool:
+    """Whether `ref` points somewhere new since the last run.
+
+    True whenever we cannot tell -- an unknown answer must never be reported as
+    "nothing changed", because the cost of that mistake is an addon that
+    silently stops updating.
+    """
+    now = ref_sha(repo, ref)
+    if now is None:
+        return True
+    before = (_refs_before.get(repo) or {}).get("refs", {})
+    for name in (f"refs/heads/{ref}", f"refs/tags/{ref}", ref):
+        if name in before:
+            return before[name] != now
+    return True
+
+
+def repo_has_tags(repo: str) -> bool | None:
+    """Whether the repository has any tags. None when we could not find out.
+
+    A published release always has a tag behind it, so "no tags" is a complete
+    answer to "is there a release" -- and a free one.
+    """
+    found = git_refs(repo)
+    if not found:
+        return None
+    return any(name.startswith("refs/tags/") for name in found["refs"])
+
+
 def default_branch(repo: str) -> str:
+    """Which branch this repository calls its main one.
+
+    Advertised by git, so this normally costs nothing. The REST call is the
+    fallback -- and still the thing that reports a private or missing
+    repository properly, which is why it is not skipped when the shortcut
+    fails.
+    """
+    found = git_refs(repo)
+    if found and found.get("head"):
+        return found["head"]
     info = http_json(f"https://api.github.com/repos/{repo}")
     if not info:
         die(f"no such repo, or it is private: {repo}")
@@ -1147,7 +1348,23 @@ def latest_folder_commit(repo: str, branch: str, folder: str) -> str:
     GitHub answers the narrower question directly, and for the same one request.
     """
     query = urllib.parse.urlencode({"sha": branch, "path": folder, "per_page": 1})
-    commits = http_json(f"https://api.github.com/repos/{repo}/commits?{query}")
+    url = f"https://api.github.com/repos/{repo}/commits?{query}"
+
+    if not ref_moved(repo, branch):
+        # The branch this folder lives on points exactly where it did last run,
+        # so nothing under it can have changed and the answer we were given
+        # then is still the answer. This is the one that matters for a
+        # monorepo: ten folders on an unmoved branch used to be ten calls.
+        remembered = store().get(url)
+        try:
+            settled = remembered["body"][0]["sha"][:12]
+        except (TypeError, KeyError, IndexError):
+            settled = None
+        if settled:
+            touch(url)
+            return settled
+
+    commits = http_json(url)
     if not commits:
         die(f"nothing in {repo} touches '{folder}' -- check the folder name")
     return commits[0]["sha"][:12]
@@ -1209,6 +1426,12 @@ def latest_release(repo: str) -> dict | None:
     No timer, and nothing taken on trust: a release published a minute ago is
     still seen on the next check.
     """
+    if repo_has_tags(repo) is False:
+        # A published release always has a tag behind it. No tags is therefore a
+        # complete answer, and git gave it to us for free -- this is the whole
+        # of the cost for an addon bound to a repository that cuts no releases.
+        return None
+
     listed = http_json(f"https://api.github.com/repos/{repo}/releases?per_page=1")
     if not listed:
         # Either no releases (200 and an empty list, free from here on) or no
@@ -1244,6 +1467,13 @@ def latest_github(repo_spec: str) -> tuple[str, str]:
         return version, archive_url(repo, ref)
 
     if branch:
+        advertised = ref_sha(repo, branch)
+        if advertised:
+            # `@something` accepts a tag as readily as a branch, and the two
+            # live at different archive paths. Guessing wrong costs a refused
+            # request and a fall back to the REST zipball; the advertisement
+            # already says which it is, so there is no need to guess.
+            return advertised[:12], archive_url(repo, branch, tag=names_a_tag(repo, branch))
         commits = http_json(f"https://api.github.com/repos/{repo}/commits/{branch}")
         if not commits:
             die(f"no branch '{branch}' in {repo}")
@@ -1260,6 +1490,9 @@ def latest_github(repo_spec: str) -> tuple[str, str]:
         return release["tag_name"], archive_url(repo, release["tag_name"], tag=True)
 
     ref = default_branch(repo)
+    advertised = ref_sha(repo, ref)
+    if advertised:
+        return advertised[:12], archive_url(repo, ref)
     commits = http_json(f"https://api.github.com/repos/{repo}/commits/{ref}")
     sha = commits["sha"][:12] if commits else ref
     return sha, archive_url(repo, ref)

@@ -35,6 +35,30 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from wowaddons import core as addons  # noqa: E402
 
 
+def setUpModule():
+    """No test in this file may reach the network, including through git.
+
+    The engine now asks github.com for a repository's refs before it asks the
+    REST API anything, because that request is not billed against the hourly
+    quota. Left alone here it is still a real request, to a repository called
+    `o/r` that does not exist -- fifty of them across this file, slow and
+    dependent on somebody's connection, in a suite whose first promise is that
+    it runs offline.
+
+    Stubbed to "could not find out", which is exactly what an offline machine
+    would get, and which sends every caller down the REST path these tests were
+    written against. The tests that are *about* the shortcut put their own stub
+    in and take it out again.
+    """
+    global _real_git_refs
+    _real_git_refs = addons.git_refs
+    addons.git_refs = lambda repo: None
+
+
+def tearDownModule():
+    addons.git_refs = _real_git_refs
+
+
 def mkzip(files: dict) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as archive:
@@ -1441,8 +1465,11 @@ class FakeResponse:
         self.body = body
         self.headers = headers or {}
 
-    def read(self) -> bytes:
-        return self.body
+    def read(self, size: int = -1) -> bytes:
+        # Real responses take a size, and the engine passes one when it wants
+        # to cap how much of a ref advertisement it will read. A double that
+        # refuses the argument turns that into a silent fall back to the API.
+        return self.body if size is None or size < 0 else self.body[:size]
 
     def __enter__(self):
         return self
@@ -1993,3 +2020,191 @@ class ARepositoryWithoutReleases(unittest.TestCase):
     def test_a_repo_whose_only_release_is_a_pre_release_falls_to_the_branch(self):
         self.releases = [{"tag_name": "v0.1-rc1", "prerelease": True, "assets": []}]
         self.assertEqual(self.check()[0], "abc123def456")
+
+
+def advertisement(head: str, refs: dict) -> bytes:
+    """A git ref advertisement, in the pkt-line format a server really sends."""
+    def pkt(text: str) -> bytes:
+        line = text.encode()
+        return b"%04x" % (len(line) + 4) + line
+
+    out = pkt("# service=git-upload-pack\n") + b"0000"
+    first = True
+    for name, sha in refs.items():
+        if first:
+            caps = f"multi_ack symref=HEAD:refs/heads/{head} agent=git/github"
+            out += pkt(f"{sha} {name}\x00{caps}\n")
+            first = False
+        else:
+            out += pkt(f"{sha} {name}\n")
+    return out + b"0000"
+
+
+class AskingGitInsteadOfTheAPI(unittest.TestCase):
+    """The ref advertisement is free; most of what we asked the API is in it.
+
+    `github.com/o/r.git/info/refs?service=git-upload-pack` is the request every
+    clone begins with. It is not the REST API, carries no x-ratelimit headers
+    and is not billed against the hourly quota -- and it answers, for a whole
+    repository at once, the default branch, every branch head and every tag.
+    """
+
+    HEADS = {
+        "refs/heads/main": "1111111111111111111111111111111111111111",
+        "refs/heads/dev": "2222222222222222222222222222222222222222",
+    }
+
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self.scratch.cleanup)
+        self._config = addons.CONFIG_DIR
+        addons.CONFIG_DIR = pathlib.Path(self.scratch.name)
+        self.real_throttle = addons.THROTTLE
+        addons.THROTTLE = addons.Throttle(sleep=lambda _s: None, clock=lambda: 0.0)
+        # These tests are about the shortcut, so the module-wide stub comes off.
+        self.stub = addons.git_refs
+        addons.git_refs = _real_git_refs
+        addons.forget_github_state()
+        self.addCleanup(addons.forget_github_state)
+        self.addCleanup(lambda: setattr(addons, "git_refs", self.stub))
+        self.addCleanup(lambda: setattr(addons, "THROTTLE", self.real_throttle))
+        self.addCleanup(lambda: setattr(addons, "CONFIG_DIR", self._config))
+
+        self.refs = dict(self.HEADS)
+        self.api = []
+        self.git = []
+
+        def fake(request, timeout=0):
+            url = request.full_url
+            if "info/refs" in url:
+                self.git.append(url)
+                return FakeResponse(advertisement("main", self.refs))
+            self.api.append(url.split("/repos/")[1])
+            tail = url
+            if tail.endswith("/releases?per_page=1"): body = b"[]"
+            elif "/commits?" in tail: body = json.dumps([{"sha": "f0" * 20}]).encode()
+            elif tail.rstrip("/").endswith("o/r"): body = b'{"default_branch": "main"}'
+            else: body = json.dumps({"sha": "f0" * 20}).encode()
+            return FakeResponse(body, {"etag": 'W/"x"', "x-ratelimit-remaining": "50"})
+
+        real = addons.urllib.request.urlopen
+        addons.urllib.request.urlopen = fake
+        self.addCleanup(lambda: setattr(addons.urllib.request, "urlopen", real))
+
+    def check(self, source="o/r"):
+        addons.begin_run()
+        found = addons.latest_github(source)
+        addons.end_run()
+        return found
+
+    # -- reading the advertisement -------------------------------------------
+
+    def test_the_default_branch_is_advertised_not_asked_for(self):
+        self.assertEqual(addons.default_branch("o/r"), "main")
+        self.assertEqual(self.api, [])
+
+    def test_a_branch_head_is_advertised_not_asked_for(self):
+        version, url = self.check("o/r@dev")
+        self.assertEqual(version, "222222222222")
+        self.assertEqual(url, "https://codeload.github.com/o/r/zip/refs/heads/dev")
+        self.assertEqual(self.api, [])
+
+    def test_pull_request_refs_are_not_kept(self):
+        # GitHub advertises every PR as refs/pull/N/head. On a busy repository
+        # that is most of the response and none of the answer.
+        self.refs["refs/pull/7/head"] = "9" * 40
+        addons.begin_run()
+        self.assertNotIn("refs/pull/7/head", addons.git_refs("o/r")["refs"])
+
+    def test_a_peeled_tag_does_not_shadow_the_tag(self):
+        self.refs["refs/tags/v1"] = "3" * 40
+        self.refs["refs/tags/v1^{}"] = "4" * 40
+        addons.begin_run()
+        self.assertEqual(addons.git_refs("o/r")["refs"]["refs/tags/v1"], "3" * 40)
+        self.assertNotIn("refs/tags/v1^{}", addons.git_refs("o/r")["refs"])
+
+    # -- what it lets us not ask ---------------------------------------------
+
+    def test_a_repo_with_no_tags_never_asks_about_releases(self):
+        # A published release always has a tag behind it, so no tags is a
+        # complete answer -- and the whole cost of the binding shape that used
+        # to pay for a 404 on every single run.
+        self.check()
+        self.assertEqual(self.api, [])
+
+    def test_a_repo_with_tags_still_asks(self):
+        self.refs["refs/tags/v1"] = "3" * 40
+        self.check()
+        self.assertTrue(any("releases" in call for call in self.api))
+
+    def test_an_unmoved_branch_costs_nothing_for_a_folder(self):
+        # The monorepo case: ten folders on a branch that has not moved used to
+        # be ten history queries.
+        self.check("o/r#Alpha")
+        self.assertEqual(self.api, ["o/r/commits?sha=main&path=Alpha&per_page=1"])
+        self.api.clear()
+        self.check("o/r#Alpha")
+        self.assertEqual(self.api, [])
+
+    def test_a_moved_branch_asks_again(self):
+        # And it must, or the addon silently stops updating.
+        self.check("o/r#Alpha")
+        self.api.clear()
+        self.refs["refs/heads/main"] = "5" * 40
+        self.check("o/r#Alpha")
+        self.assertEqual(self.api, ["o/r/commits?sha=main&path=Alpha&per_page=1"])
+
+    def test_ten_folders_share_one_advertisement(self):
+        addons.begin_run()
+        for i in range(10):
+            addons.latest_github(f"o/r#Addon{i}")
+        addons.end_run()
+        self.assertEqual(len(self.git), 1)
+
+    def test_a_tag_pinned_source_gets_the_tag_archive_path(self):
+        # `@v1.0` is a tag, and a tag archive does not live under refs/heads.
+        # Getting it wrong is not fatal -- codeload refuses and the REST
+        # zipball serves it -- but it is a wasted round trip on every install.
+        self.refs["refs/tags/v1.0"] = "7" * 40
+        version, url = self.check("o/r@v1.0")
+        self.assertEqual(version, "777777777777")
+        self.assertEqual(url, "https://codeload.github.com/o/r/zip/refs/tags/v1.0")
+
+    def test_a_branch_still_gets_the_branch_archive_path(self):
+        self.assertEqual(self.check("o/r@dev")[1],
+                         "https://codeload.github.com/o/r/zip/refs/heads/dev")
+
+    # -- and when it is not there --------------------------------------------
+
+    def test_everything_falls_back_when_git_is_unreachable(self):
+        def refuse(request, timeout=0):
+            if "info/refs" in request.full_url:
+                raise urllib.error.URLError("blocked")
+            self.api.append(request.full_url.split("/repos/")[1])
+            return FakeResponse(b'{"default_branch": "main"}',
+                                {"etag": 'W/"x"', "x-ratelimit-remaining": "50"})
+        addons.urllib.request.urlopen = refuse
+        addons.begin_run()
+        self.assertEqual(addons.default_branch("o/r"), "main")
+        # The point is not that it survived -- it is that it went and asked the
+        # API, which is the path this whole shortcut exists to skip.
+        self.assertEqual(self.api, ["o/r"])
+
+    def test_an_unreadable_advertisement_is_not_trusted(self):
+        def rubbish(request, timeout=0):
+            if "info/refs" in request.full_url:
+                return FakeResponse(b"<html>not git</html>")
+            self.api.append(request.full_url.split("/repos/")[1])
+            return FakeResponse(b'{"default_branch": "main"}',
+                                {"etag": 'W/"x"', "x-ratelimit-remaining": "50"})
+        addons.urllib.request.urlopen = rubbish
+        addons.begin_run()
+        self.assertIsNone(addons.git_refs("o/r"))
+        self.assertEqual(addons.default_branch("o/r"), "main")
+        self.assertEqual(self.api, ["o/r"])
+
+    def test_a_ref_we_cannot_see_is_never_called_unchanged(self):
+        # "I do not know" must not be reported as "nothing moved": the cost of
+        # that mistake is an addon that quietly stops updating.
+        addons.begin_run()
+        self.assertTrue(addons.ref_moved("o/r", "no-such-branch"))
