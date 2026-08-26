@@ -99,7 +99,7 @@ Running from a checkout instead needs **Python 3.9 or newer**, and that is the w
 |---|---|
 | `init <path>` | Remember where the client is. Accepts your WoW folder, its `Interface` folder, or `Interface/AddOns` itself. |
 | `scan` | Read every addon already installed and record it, guessing a source from each `.toc` where it can. |
-| `list` | Every addon, its source, and its installed version. |
+| `list` | Every addon, its source, and its installed version. Bound addons first, then the rest, each alphabetically. |
 | `set <Addon> <source>` | Bind one addon to where its updates come from. |
 | `accept` | Take every source that `scan` suggested, in one go. |
 | `update [Addon...]` | Bring bound addons up to date. Defaults to all of them. |
@@ -205,12 +205,90 @@ directory, laid out as `src/MyAddon/MyAddon.toc` beside a `docs/` folder, or as 
 whose root *is* the addon. An addon's own bundled libraries are never mistaken for the addon
 itself.
 
+## Working on your own addon
+
+If you write addons, the loop you want is not download-a-zip-and-copy-folders. There are
+two shapes, depending on where you edit.
+
+### You edit on the same machine the client runs on
+
+Bind the addon to your checkout. This is the cheapest thing the tool does — **no GitHub
+calls, no downloads, nothing to press between edits**:
+
+```
+git clone https://github.com/you/my-addons ~/src/my-addons     # once
+addons.py set HonorTracker local:~/src/my-addons/HonorTracker
+addons.py update HonorTracker
+```
+
+By default that installs a **symlink**, so `Interface/AddOns/HonorTracker` *is* your
+working tree. Save a file, `/reload` in the client, and you are looking at the change.
+There is no second update step, and the client cannot be running something other than what
+is checked out. `git pull` in the checkout is the whole update.
+
+Point the source at the **checkout root** and name the addon, and it finds the folder
+itself — handy when one repository holds several:
+
+```
+addons.py set HonorTracker local:~/src/my-addons     # finds HonorTracker/HonorTracker.toc
+addons.py set LootLog      local:~/src/my-addons
+```
+
+In the window it is the same thing: **Set source…**, *A folder on disk*, Browse.
+
+If you would rather have real files than a link — to check what a user's install actually
+looks like, or because something in your toolchain dislikes links — add `--copy`, or tick
+the box in the dialog. Then `update` copies the folder each time, and you do press Update
+after an edit.
+
+### You edit somewhere else and push to GitHub
+
+Then you do **not** need a clone, a zip, or a git command on the WoW machine. Bind the row
+to the repository once and press Update whenever you want the pushed version:
+
+```
+addons.py set HonorTracker github:you/my-addons#HonorTracker
+addons.py update HonorTracker
+```
+
+Fetching and unpacking the archive and replacing the folder is exactly what this tool is
+for; downloading the zip by hand and copying folders into `AddOns` is the job it removes.
+Naming the folder with `#HonorTracker` matters in a repository that holds several addons —
+without it the row installs all of them, and every one of them reports an update whenever
+any one of them changes.
+
+After the first fetch this is nearly free too: an unchanged repo answers `304`, which
+GitHub does not bill, and the archive comes from a host that is not the API. See
+[GitHub's rate limit](#githubs-rate-limit).
+
+### Going back and forth
+
+Switch a row between the two whenever it suits — `local:` while you are working on it,
+`github:` when you want to see what somebody else would actually receive:
+
+```
+addons.py set HonorTracker github:you/my-addons#HonorTracker   # test the pushed version
+addons.py set HonorTracker local:~/src/my-addons               # back to the checkout
+```
+
+Two things worth knowing before the first bind:
+
+- **If a real folder is already there, it is moved aside, not deleted** — to
+  `HonorTracker.replaced`, once, and later updates leave that first copy alone. The window
+  names the folder it would create *before* you click Save.
+- **On Windows a `local:` source installs as a directory junction**, not a symlink, so it
+  needs neither administrator rights nor Developer Mode. The client cannot tell the
+  difference.
+
 ## The window
 
 ![the window](docs/window.png)
 
 Everything the terminal does, in one window:
 
+- **The addons you have bound are listed first**, then everything still unmanaged, each
+  group alphabetically. On a real install most rows are addons this tool does not manage,
+  and a single alphabetical list buries the handful it does among them.
 - **Set source…** opens a dialog over the selected addon: a local folder (with Browse),
   a GitHub repo, an optional branch to track, an optional folder inside the repo, or
   unmanaged. Pasting a github.com link to a folder fills all three in.
@@ -244,15 +322,65 @@ Everything the terminal does, in one window:
   is reported and skipped — everything else still updates, and the manifest still saves.
 - **Archives containing `../` paths are refused.** This unpacks zips published by third
   parties.
+- **Nothing but the manifest and a cache is written outside AddOns.** `github-cache.json`
+  sits beside the manifest, holds only what GitHub already told us, and is safe to delete.
 - **Your manifest stays out of the way**, at `$XDG_CONFIG_HOME/wow-addons/manifest.json` —
   in practice `~/.config/wow-addons/manifest.json`, and `%APPDATA%\wow-addons\` on Windows.
   It holds your disk paths, so it does not belong in a repository. `where` prints the
   resolved location.
 
-`GITHUB_TOKEN` is honoured if set, and is entirely optional: unauthenticated GitHub allows 60
-requests an hour, which is far more than a personal addon list needs.
-
 Restart the client, or `/reload`, to pick changes up.
+
+## GitHub's rate limit
+
+Unauthenticated GitHub allows 60 API calls an hour, and separately objects to bursts
+however much of that is left. Checking one addon costs a call or two and downloading it
+used to cost another, so `Update all` over a longer list was a burst of them fired as
+fast as the network answered — which is how a perfectly ordinary addon list came back
+**GitHub rate limit reached**, and then spent one more doomed call per remaining addon
+saying so again.
+
+Four things now keep a run inside the budget:
+
+- **A check that finds nothing new is free.** Every answer is stored with the `ETag`
+  GitHub stamped on it, and sent back as `If-None-Match` next time. An unchanged resource
+  replies `304 Not Modified`, and GitHub does not bill a `304`. Check as often as you
+  like, as long as your addons are not moving.
+- **Archives are fetched off the meter.** A zip comes from `codeload.github.com`, the host
+  behind the green *Download ZIP* button, which is not the REST API and does not spend the
+  hourly quota. The REST URL stays as an automatic fallback, so a run that cannot use
+  codeload still installs, for the price of a call.
+- **One question per run.** Ten addons out of one repository share its branch lookup.
+- **The wall is not re-hit.** Once the quota is known to be spent the run fails once,
+  immediately, naming the time it comes back, rather than spending a round trip per
+  remaining addon to be told the same thing.
+
+What that costs in practice, per addon, for a full update where the addon really changed:
+
+| Source | First run | Every run after |
+|---|---|---|
+| `local:/path/to/checkout` | **0** | **0** |
+| `github:owner/repo` — repo publishes releases | 1 | **0** |
+| `github:owner/repo@main` — branch pinned | 1 | **0** |
+| `github:owner/repo@main#Folder` — branch and folder pinned | 1 | **0** |
+| `github:owner/repo#Folder` — folder pinned | 2 | **0** |
+| `github:owner/repo` — repo publishes **no** releases | 3 | 1 |
+
+The last row is the only shape that keeps costing something, because "this repo has no
+releases" comes back as a `404`, and a `404` carries no `ETag` to revalidate against.
+Pinning the branch — `github:owner/repo@main` — skips the release lookup entirely and
+takes it to zero.
+
+Both front ends print how many calls are left after a run, and say when they are waiting
+and why, so a pause never looks like a hang. What was learned is kept in
+`github-cache.json` beside the manifest; deleting it costs one cold run and nothing else.
+
+`GITHUB_TOKEN` is still honoured and still entirely optional — it raises the limit to 5000
+calls an hour. With the above it is rarely the thing standing between you and a finished
+update.
+
+An addon you are writing yourself costs nothing at all — see
+[Working on your own addon](#working-on-your-own-addon).
 
 ## Linux, Wine and Proton
 
@@ -327,7 +455,8 @@ guards whose failure would otherwise be silent: an archive whose root is the add
 installing under GitHub's wrapper name (which the client ignores), a `403` reported as a
 rate limit when the real cause was a blocked proxy or a private repository, and an
 AppImage entry point that stops going through the wrapper that sets up Tcl/Tk — which
-would produce a build that passes every check except opening a window.
+would produce a build that passes every check except opening a window, and an update run
+that spends its GitHub quota in one burst and then keeps asking after it is gone.
 
 ### Building the downloads
 
