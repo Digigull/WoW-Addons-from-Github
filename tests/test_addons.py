@@ -2208,3 +2208,268 @@ class AskingGitInsteadOfTheAPI(unittest.TestCase):
         # that mistake is an addon that quietly stops updating.
         addons.begin_run()
         self.assertTrue(addons.ref_moved("o/r", "no-such-branch"))
+
+
+class CheckingWithoutTheAPI(unittest.TestCase):
+    """The opt-in mode that spends no REST quota at all, ever.
+
+    Two questions still reach the API in the ordinary path -- which commit last
+    touched a folder, and what a release has attached to it. The first has a
+    free answer: the archive comes from codeload, which is not the API, so the
+    folder can be hashed instead of asked about. The second does not, and this
+    mode gives it up: a release asset is a file the author uploaded, it is not
+    in the repository, and no amount of downloading the repository will find
+    it. Addons checked this way follow their default branch instead.
+    """
+
+    REPO = {
+        "repo-main/AscensionHonorTracker/AscensionHonorTracker.toc": "a",
+        "repo-main/AscensionHonorTracker/main.lua": "print(1)",
+        "repo-main/GnomeWorks/GnomeWorks.toc": "b",
+        "repo-main/README.md": "docs",
+    }
+
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self.scratch.cleanup)
+        self._config = addons.CONFIG_DIR
+        addons.CONFIG_DIR = pathlib.Path(self.scratch.name)
+        self.real_throttle = addons.THROTTLE
+        addons.THROTTLE = addons.Throttle(sleep=lambda _s: None, clock=lambda: 0.0)
+        self.stub = addons.git_refs
+        addons.git_refs = _real_git_refs
+        addons.forget_github_state()
+        self.addCleanup(addons.forget_github_state)
+        self.addCleanup(lambda: setattr(addons, "git_refs", self.stub))
+        self.addCleanup(lambda: setattr(addons, "THROTTLE", self.real_throttle))
+        self.addCleanup(lambda: setattr(addons, "CONFIG_DIR", self._config))
+
+        self.files = dict(self.REPO)
+        self.head = "1" * 40
+        self.api, self.downloads = [], []
+
+        def fake(request, timeout=0):
+            url = request.full_url
+            if "info/refs" in url:
+                return FakeResponse(advertisement("main", {"refs/heads/main": self.head}))
+            if "codeload" in url:
+                self.downloads.append(url)
+                return FakeResponse(mkzip(self.files))
+            self.api.append(url)
+            return FakeResponse(b"{}", {"x-ratelimit-remaining": "50"})
+
+        real = addons.urllib.request.urlopen
+        addons.urllib.request.urlopen = fake
+        self.addCleanup(lambda: setattr(addons.urllib.request, "urlopen", real))
+
+    # -- what counts as an addon in an archive -------------------------------
+
+    def test_only_folders_holding_their_own_toc_are_addons(self):
+        digests = addons.digests_in_archive(mkzip(self.files))
+        self.assertEqual(sorted(digests), ["AscensionHonorTracker", "GnomeWorks"])
+
+    def test_a_folder_one_level_down_still_counts(self):
+        # src/MyAddon/MyAddon.toc beside a docs/ folder is a real layout.
+        digests = addons.digests_in_archive(mkzip({
+            "repo-main/src/MyAddon/MyAddon.toc": "x",
+            "repo-main/docs/guide.md": "y",
+        }))
+        self.assertEqual(sorted(digests), ["src/MyAddon"])
+
+    def test_a_bundled_library_is_not_offered_as_an_addon(self):
+        # MyAddon/Libs/AceGUI-3.0 holds AceGUI-3.0.toc and is an addon by the
+        # letter of the rule. Nobody choosing what to install means it.
+        digests = addons.digests_in_archive(mkzip({
+            "repo-main/MyAddon/MyAddon.toc": "x",
+            "repo-main/MyAddon/Libs/AceGUI-3.0/AceGUI-3.0.toc": "lib",
+        }))
+        self.assertEqual(sorted(digests), ["MyAddon"])
+
+    def test_a_bundled_library_counts_toward_its_addon(self):
+        # It is not offered as an addon of its own, but a change inside it IS a
+        # change to the addon that ships it. An addon that did not notice its
+        # own bundled code moving would be worse than having no digest at all.
+        before = addons.digests_in_archive(mkzip({
+            "repo-main/MyAddon/MyAddon.toc": "x",
+            "repo-main/MyAddon/Libs/AceGUI-3.0/AceGUI-3.0.toc": "lib",
+        }))
+        after = addons.digests_in_archive(mkzip({
+            "repo-main/MyAddon/MyAddon.toc": "x",
+            "repo-main/MyAddon/Libs/AceGUI-3.0/AceGUI-3.0.toc": "lib updated",
+        }))
+        self.assertNotEqual(before["MyAddon"], after["MyAddon"])
+
+    def test_a_toc_named_differently_from_its_folder_is_not_an_addon(self):
+        self.assertEqual(addons.digests_in_archive(mkzip({
+            "repo-main/Something/Other.toc": "x",
+        })), {})
+
+    # -- the digest is a version ---------------------------------------------
+
+    def test_the_same_contents_give_the_same_version(self):
+        first = addons.digests_in_archive(mkzip(self.files))
+        second = addons.digests_in_archive(mkzip(dict(self.files)))
+        self.assertEqual(first, second)
+
+    def test_changing_a_file_moves_that_addon_and_only_that_addon(self):
+        # The whole point over "the last commit that touched it": an addon
+        # reports an update when its OWN files move, and not when its
+        # neighbour's do.
+        before = addons.digests_in_archive(mkzip(self.files))
+        moved = dict(self.files)
+        moved["repo-main/GnomeWorks/GnomeWorks.toc"] = "changed"
+        after = addons.digests_in_archive(mkzip(moved))
+        self.assertNotEqual(before["GnomeWorks"], after["GnomeWorks"])
+        self.assertEqual(before["AscensionHonorTracker"], after["AscensionHonorTracker"])
+
+    # -- what it costs -------------------------------------------------------
+
+    def test_a_whole_repo_binding_downloads_nothing_to_check(self):
+        # The ref advertisement already carries the commit, so there is nothing
+        # to fetch and nothing to hash.
+        addons.begin_run()
+        version, _url = addons.version_without_api("o/r")
+        addons.end_run()
+        self.assertEqual(version, "1" * 12)
+        self.assertEqual(self.downloads, [])
+        self.assertEqual(self.api, [])
+
+    def test_a_folder_binding_downloads_once_and_asks_the_api_nothing(self):
+        addons.begin_run()
+        addons.version_without_api("o/r#GnomeWorks")
+        addons.end_run()
+        self.assertEqual(len(self.downloads), 1)
+        self.assertEqual(self.api, [])
+
+    def test_every_folder_in_one_repo_shares_that_download(self):
+        # Nine addons in one repository must not be nine downloads of the same
+        # archive; the digests for all of them come out of the one pass.
+        addons.begin_run()
+        for folder in ("AscensionHonorTracker", "GnomeWorks"):
+            addons.version_without_api(f"o/r#{folder}")
+        addons.end_run()
+        self.assertEqual(len(self.downloads), 1)
+
+    def test_a_later_run_downloads_nothing_while_the_commit_stands(self):
+        # A digest is kept against the commit it was taken from, so it is never
+        # stale and never computed twice.
+        addons.begin_run(); addons.version_without_api("o/r#GnomeWorks"); addons.end_run()
+        self.downloads.clear()
+        addons.begin_run(); addons.version_without_api("o/r#GnomeWorks"); addons.end_run()
+        self.assertEqual(self.downloads, [])
+
+    def test_a_new_commit_is_fetched_again(self):
+        addons.begin_run(); first = addons.version_without_api("o/r#GnomeWorks")[0]; addons.end_run()
+        self.head = "2" * 40
+        self.files["repo-main/GnomeWorks/GnomeWorks.toc"] = "changed"
+        self.downloads.clear()
+        addons.begin_run(); second = addons.version_without_api("o/r#GnomeWorks")[0]; addons.end_run()
+        self.assertEqual(len(self.downloads), 1)
+        self.assertNotEqual(first, second)
+
+    def test_a_named_folder_that_is_not_there_is_reported(self):
+        addons.begin_run()
+        with self.assertRaises(addons.Fail) as caught:
+            addons.version_without_api("o/r#Nonexistent")
+        self.assertIn("Nonexistent", str(caught.exception))
+
+    def test_the_dialog_can_list_folders_without_the_api(self):
+        addons.begin_run()
+        found = addons.addons_in_repo("o/r", no_api=True)
+        addons.end_run()
+        self.assertEqual(found, ["AscensionHonorTracker", "GnomeWorks"])
+        self.assertEqual(self.api, [])
+
+    # -- and through the front door ------------------------------------------
+
+    def test_update_addon_without_the_api_installs_and_spends_no_quota(self):
+        root = pathlib.Path(self.scratch.name) / "AddOns"
+        root.mkdir()
+        entry = {"source": "github:o/r#GnomeWorks", "mode": "link"}
+        addons.begin_run()
+        result = addons.update_addon("GnomeWorks", entry, root, no_api=True)
+        addons.end_run()
+        self.assertEqual(result.outcome, addons.CHANGED, result.detail)
+        self.assertTrue((root / "GnomeWorks" / "GnomeWorks.toc").is_file())
+        self.assertEqual(self.api, [])
+
+    def test_the_check_and_the_install_share_one_download(self):
+        # The check has just fetched this exact archive to work the version
+        # out; the install should not pay for it a second time.
+        root = pathlib.Path(self.scratch.name) / "AddOns2"
+        root.mkdir()
+        addons.begin_run()
+        addons.update_addon("GnomeWorks", {"source": "github:o/r#GnomeWorks"}, root, no_api=True)
+        addons.end_run()
+        self.assertEqual(len(self.downloads), 1)
+
+    def test_the_setting_is_remembered_per_install(self):
+        install = addons.blank_install()
+        self.assertFalse(addons.checks_without_api(install))
+        addons.set_checks_without_api(install, True)
+        self.assertTrue(addons.checks_without_api(install))
+
+
+class RescanForgetsWhatYouDeleted(unittest.TestCase):
+    """A rescan must clear out addons you deleted -- but not your bindings.
+
+    Reported after v0.8.0: deleting an addon folder by hand and rescanning left
+    the row in the list for ever, because nothing else in this tool removes
+    one. The fix cannot be "drop every row whose folder is gone": a bound row
+    with no folder is how an addon you have bound but not yet fetched appears,
+    and the binding is the one thing in the manifest that scanning cannot
+    recreate.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name) / "AddOns"
+        self.root.mkdir()
+        for name in ("HandInstalled", "BoundOne", "Stays"):
+            (self.root / name).mkdir()
+            (self.root / name / f"{name}.toc").write_text(f"## Title: {name}\n")
+        self.state = addons.migrate(addons.blank_install())
+        self.install = addons.current(self.state)
+        self.install["addons_dir"] = str(self.root)
+        addons.rescan(self.install, self.root)
+        addons.set_source(self.install, "BoundOne", "github:someone/BoundOne")
+
+    def entries(self):
+        return self.install["addons"]
+
+    def test_an_unmanaged_addon_you_deleted_is_dropped(self):
+        shutil.rmtree(self.root / "HandInstalled")
+        _installed, _guessed, forgotten = addons.rescan(self.install, self.root)
+        self.assertEqual(forgotten, 1)
+        self.assertNotIn("HandInstalled", self.entries())
+
+    def test_a_bound_addon_you_deleted_keeps_its_binding(self):
+        shutil.rmtree(self.root / "BoundOne")
+        _installed, _guessed, forgotten = addons.rescan(self.install, self.root)
+        self.assertEqual(forgotten, 0)
+        self.assertIn("BoundOne", self.entries())
+        self.assertTrue(self.entries()["BoundOne"]["missing"])
+        self.assertEqual(self.entries()["BoundOne"]["source"], "github:someone/BoundOne")
+
+    def test_what_is_still_there_is_left_alone(self):
+        shutil.rmtree(self.root / "HandInstalled")
+        addons.rescan(self.install, self.root)
+        self.assertIn("Stays", self.entries())
+        self.assertNotIn("missing", self.entries()["Stays"])
+
+    def test_unmanaging_a_row_is_how_you_get_rid_of_it(self):
+        # The escape hatch, and the reason keeping bound rows is not a trap:
+        # set the source to unmanaged, rescan, and the row goes.
+        shutil.rmtree(self.root / "BoundOne")
+        addons.rescan(self.install, self.root)
+        addons.set_source(self.install, "BoundOne", "unmanaged")
+        _installed, _guessed, forgotten = addons.rescan(self.install, self.root)
+        self.assertEqual(forgotten, 1)
+        self.assertNotIn("BoundOne", self.entries())
+
+    def test_a_deleted_addon_does_not_come_back_as_a_suggestion(self):
+        shutil.rmtree(self.root / "HandInstalled")
+        addons.rescan(self.install, self.root)
+        addons.rescan(self.install, self.root)
+        self.assertNotIn("HandInstalled", self.entries())

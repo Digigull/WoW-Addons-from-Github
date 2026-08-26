@@ -21,6 +21,37 @@ script:
 "WoW Addons from GitHub.exe" update --check
 ```
 
+## New in v0.9.0
+
+**A rescan now clears out addons you deleted.** Deleting an addon folder by hand and
+rescanning used to leave the row in the list for ever, flagged *not installed*, with
+nothing anywhere in the tool able to remove it. Unmanaged rows whose folder is gone are
+now dropped — there is nothing in them worth keeping.
+
+Rows you have **bound** to a source are still kept and still flagged, because "not
+installed" is a real state: it is how an addon you have bound but not yet fetched appears,
+and how one you deleted to force a clean reinstall appears in between. Dropping those
+would throw away the binding, which is the one thing in the manifest that scanning cannot
+work out again. To get rid of a bound row, set its source to **unmanaged** and rescan.
+
+**A checkbox to check without the GitHub API at all.** Unauthenticated GitHub allows 60
+API calls an hour, per address — so on a shared or office connection something else can
+spend yours. Tick *Check without the GitHub API* (or `--no-api` in the terminal) and no
+call is made under any circumstance:
+
+- an addon's version comes from hashing its folder inside the repository's archive, which
+  is served from the same host as the *Download ZIP* button and costs no quota;
+- the digest is kept against the commit it came from, so it is computed once ever, and the
+  free ref listing means an archive is only fetched when the branch has actually moved;
+- an addon bound to a whole repository needs no download at all — the ref listing already
+  carries the commit.
+
+The trade, and the reason it is a checkbox rather than the default: **it cannot see
+releases.** A release asset is a file the author uploaded; it is not in the repository, so
+no amount of downloading the repository will find it. Addons checked this way follow their
+default branch and install the source tree instead of the author's packaged zip. Bandwidth
+replaces quota. Leave it off unless you are actually hitting the limit.
+
 ## New in v0.8.0
 
 **Checking for updates barely touches GitHub's quota any more.** Before a clone, git asks
