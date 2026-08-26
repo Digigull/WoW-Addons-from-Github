@@ -4,14 +4,21 @@ name: release
 # slow build on every commit is how people stop watching CI. It runs on a tag,
 # on demand, and on changes to the things that can break the builds themselves.
 #
-# The `tag` input is how a release gets rebuilt without touching git. Actions ->
-# release -> Run workflow, leave the branch on main, type the tag: the builds
-# check that tag out, and the publish job edits that tag's existing release in
-# place. That matters because the workflow that RUNS always comes from the ref
-# you dispatch from, not from the tag -- so a release whose build failed on a
-# bug since fixed on main can be republished without moving or recreating the
-# tag, which the web UI cannot do. Blank builds both binaries and publishes
-# nothing.
+# The `tag` input is how a release is cut or repaired without touching git.
+# Actions -> release -> Run workflow, leave the branch on main, type the tag.
+#
+#   the tag already exists   leave build_from blank; the builds check that tag
+#                            out and publish edits its existing release in place
+#   the tag is new           set build_from to main; the builds use that commit
+#                            and publish creates the tag there
+#
+# Both matter to somebody working only in a browser. Rebuilding is how a release
+# whose build failed on a bug since fixed gets republished without moving the
+# tag, which the web UI cannot do -- and it works because the workflow that RUNS
+# always comes from the ref you dispatch from, not from the tag. Creating is how
+# a release happens at all without a git checkout to make the tag with.
+#
+# Blank tag builds both binaries and publishes nothing.
 on:
   push:
     tags: ["v*"]
@@ -24,7 +31,11 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and publish, e.g. v0.3.1 (blank = build only)"
+        description: "Tag to build and publish, e.g. v0.5.0 (blank = build only, publish nothing)"
+        required: false
+        default: ""
+      build_from:
+        description: "Branch or commit to build, if the tag does not exist yet — usually: main"
         required: false
         default: ""
 
@@ -37,7 +48,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ inputs.build_from || inputs.tag }}
 
       - uses: actions/setup-python@v5
         with:
@@ -71,7 +82,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ inputs.build_from || inputs.tag }}
 
       - uses: actions/setup-python@v5
         with:
@@ -105,7 +116,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ inputs.build_from || inputs.tag }}
       - name: The tag and wowaddons.__version__ must agree
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
@@ -135,7 +146,7 @@ jobs:
       # checkout cleans the workspace, artifacts and all.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ inputs.build_from || inputs.tag }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -174,6 +185,13 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
+          # The commit to tag, read from the checkout rather than from a
+          # context: github.sha is the DISPATCH ref's head, which is not the
+          # same thing as build_from when the two name different branches.
+          # Asking the working tree cannot drift from what was built.
+          RELEASE_COMMIT=$(git rev-parse HEAD)
+          echo "publishing ${RELEASE_TAG} at ${RELEASE_COMMIT}"
+
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             echo "release already exists; applying title, notes and pre-release flag"
             gh release edit "${RELEASE_TAG}" \
@@ -181,7 +199,11 @@ jobs:
               --prerelease \
               --notes-file .github/release-notes.md
           else
+            # --target names the commit to tag. Without it gh tags the
+            # repository's default branch as it is at that moment, which is not
+            # necessarily what these binaries were just built from.
             gh release create "${RELEASE_TAG}" \
+              --target "${RELEASE_COMMIT}" \
               --title "${RELEASE_TAG}" \
               --prerelease \
               --notes-file .github/release-notes.md

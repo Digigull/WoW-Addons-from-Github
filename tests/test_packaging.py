@@ -488,15 +488,44 @@ class Releasing(unittest.TestCase):
             "use RELEASE_TAG: a dispatched run would publish a release named after the branch",
         )
 
-    def test_the_builds_check_out_the_tag_they_are_publishing(self):
-        # Otherwise a dispatched rebuild ships main's code under the tag's name
-        # -- the exact mismatch version-matches-tag exists to prevent.
+    def test_the_builds_check_out_what_is_being_released(self):
+        """The tag when it exists, the named commit when it does not.
+
+        Otherwise a dispatched rebuild ships main's code under the tag's name --
+        the exact mismatch version-matches-tag exists to prevent.
+        """
         jobs = self.workflow_jobs()
         for job in ("appimage", "windows", "version-matches-tag", "publish"):
             self.assertIn(
-                "ref: ${{ inputs.tag }}", jobs[job],
-                f"job {job!r} would build the dispatch ref instead of the tag",
+                "ref: ${{ inputs.build_from || inputs.tag }}", jobs[job],
+                f"job {job!r} would build the dispatch ref instead of the release",
             )
+
+    def test_a_brand_new_tag_can_be_cut_from_the_actions_tab(self):
+        """Someone who works only in a browser has no way to make a tag.
+
+        The `tag` input alone could only rebuild one that already existed --
+        the build jobs check it out, so a tag that does not exist yet fails at
+        checkout before anything else runs. `build_from` names the commit to
+        build and tag instead.
+        """
+        workflow = self.WORKFLOW.read_text()
+        self.assertRegex(workflow, r"inputs:\s*\n\s+tag:")
+        self.assertIn("build_from:", workflow)
+        self.assertIn("--target", self.workflow_commands(),
+                      "gh release create must be told which commit to tag")
+
+    def test_the_commit_to_tag_is_read_from_the_checkout(self):
+        """Not from github.sha, which is a different commit.
+
+        github.sha is the DISPATCH ref's head. Set build_from to anything other
+        than the branch the workflow was dispatched from and the two differ --
+        so the release would be tagged at one commit while carrying binaries
+        built from another, with nothing to show they disagreed.
+        """
+        commands = self.workflow_commands()
+        self.assertIn("RELEASE_COMMIT=$(git rev-parse HEAD)", commands)
+        self.assertNotIn("RELEASE_COMMIT: ${{ github.sha }}", commands)
 
     def test_the_publish_waits_for_the_version_check(self):
         # Otherwise a mismatched tag still publishes; the check would just go
