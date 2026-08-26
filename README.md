@@ -493,8 +493,15 @@ MIT — see [LICENSE](LICENSE).
 
 ## Cutting a release
 
-Entirely from the browser, no git checkout needed. **Actions → release → Run workflow**,
-leave the branch on `main`, then:
+**First, in the commit that finishes the work:** bump `__version__` in
+`wowaddons/__init__.py` and add a `## New in vX.Y.Z` section to
+`.github/release-notes.md`. The tag you build must match the version the code reports —
+the `version-matches-tag` job refuses the release otherwise, because a binary that lies
+about which build it is makes every bug report start from nothing. A test checks the notes
+and the version agree on every push, so forgetting is caught long before you get here.
+
+Then, entirely from the browser, no git checkout needed. **Actions → release → Run
+workflow**, leave the branch on `main`, then:
 
 | | Tag | Build from |
 |---|---|---|

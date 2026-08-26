@@ -2,6 +2,36 @@ Update your World of Warcraft addons from repositories **you** choose. No catalo
 account, and no telemetry of any kind — it contacts exactly the hosts named in your own
 manifest and nothing else.
 
+## New in v0.7.0
+
+**Updating no longer runs into GitHub's rate limit.** Unauthenticated GitHub allows 60 API
+calls an hour, and separately objects to bursts however much of that is left. Checking one
+addon cost a call or two and downloading it cost another, all fired as fast as the network
+answered — which is how an ordinary addon list came back *GitHub rate limit reached*, and
+then spent one more doomed call per remaining addon saying so again.
+
+A check that finds nothing new is now **free**. Every answer is stored with the tag GitHub
+stamps on it and handed back next time; an unchanged repository replies "not modified",
+which GitHub does not count. Archives are fetched from the host behind the green *Download
+ZIP* button, which is not the API and does not spend the quota either. Ten addons out of
+one repository: eleven calls the first time, none at all for every check after it until
+something is actually pushed.
+
+Calls are also spaced out, so a long list is not refused for arriving too fast, and a
+quota that really has run out now fails the run once — telling you when it comes back —
+instead of being re-hit for every addon left. Both the window and the terminal show how
+many calls are left, and say when they are waiting and why.
+
+**The addons you have bound are listed first**, then everything still unmanaged, each
+group alphabetically. On a real install most rows are addons this tool does not manage,
+and a single alphabetical list buried the handful it does among them.
+
+**Working on your own addon is now documented, and costs nothing.** Bind it to your
+checkout with a `local:` source and the client reads your working tree directly — save a
+file, `/reload`, done. No downloads, no API calls, and nothing to press between edits. The
+README has a section on it, including the case where you push to GitHub from elsewhere and
+just want the pushed version installed.
+
 ## New in v0.6.0
 
 **The window shows you what a repository holds.** Paste a repo into Set source and its

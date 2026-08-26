@@ -391,6 +391,32 @@ class Releasing(unittest.TestCase):
             "checkout would wipe the downloaded artifacts",
         )
 
+    def test_the_notes_have_a_section_for_the_version_being_shipped(self):
+        """Bumping the version and writing the notes are one job, not two.
+
+        The regression: v0.7.0 was dispatched against code still calling itself
+        0.6.0. `version-matches-tag` caught it, which is what it is for -- but
+        it caught it after somebody had already typed a tag and started a
+        release, and the only signal before that was remembering. This fails on
+        every push instead, the moment the version moves without its notes.
+
+        It also holds the other way round: notes for a version that is not the
+        one shipping are notes nobody will read.
+        """
+        import wowaddons
+
+        heading = re.compile(
+            rf"^## (?:New|Fixed)[\w ]* in v{re.escape(wowaddons.__version__)}$",
+            re.MULTILINE,
+        )
+        # searched rather than assertRegex'd: a failure here should say what is
+        # missing, not print the whole notes file back at you.
+        self.assertTrue(
+            heading.search(self.NOTES.read_text()),
+            f"release-notes.md has no '## New in v{wowaddons.__version__}' section -- "
+            "bump the version and describe it in the same commit",
+        )
+
     def test_the_version_is_reportable(self):
         # A shipped binary that cannot say which build it is makes every bug
         # report start with a guessing game.
