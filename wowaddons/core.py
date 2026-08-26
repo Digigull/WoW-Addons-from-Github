@@ -289,13 +289,13 @@ def save(state: dict) -> None:
     tmp.replace(MANIFEST)
 
 
-def checks_offline(install: dict) -> bool:
+def checks_without_api(install: dict) -> bool:
     """Whether this install checks without the GitHub REST API."""
-    return bool(install.get("offline"))
+    return bool(install.get("no_api"))
 
 
-def set_checks_offline(install: dict, offline: bool) -> None:
-    install["offline"] = bool(offline)
+def set_checks_without_api(install: dict, no_api: bool) -> None:
+    install["no_api"] = bool(no_api)
 
 
 def addons_dir(install: dict) -> Path:
@@ -1281,7 +1281,7 @@ def git_refs(repo: str) -> dict | None:
         with urllib.request.urlopen(request, timeout=30) as response:
             found = read_advertisement(response.read(REFS_MAX_BYTES))
     except Exception:
-        # Private, blocked, offline, or something new: the REST path still
+        # Private, blocked, no_api, or something new: the REST path still
         # works and is what every caller falls back to.
         return None
     if not found["refs"]:
@@ -1557,8 +1557,8 @@ _recent_archive: dict[str, bytes] = {}
 def archive_bytes(url: str) -> bytes:
     """The archive at `url`, reusing the last one when it is the same.
 
-    An offline check downloads an archive to work out a version and the install
-    immediately wants the same bytes. Keeping exactly one is enough to make
+    A check made without the API downloads an archive to work out a version and
+    the install immediately wants the same bytes. Keeping exactly one is enough to make
     that one download instead of two, without holding a pile of repositories in
     memory -- which, for a mode whose whole cost is bandwidth, would be a poor
     trade.
@@ -1663,7 +1663,7 @@ def folder_digest(repo: str, ref: str, folder: str) -> str:
     return digests[folder]
 
 
-def offline_ref(repo: str, branch: str | None) -> str:
+def ref_without_api(repo: str, branch: str | None) -> str:
     """Which ref to follow, without asking the API which one is default."""
     found = git_refs(repo)
     if not found:
@@ -1676,13 +1676,13 @@ def offline_ref(repo: str, branch: str | None) -> str:
     return ref
 
 
-def offline_version(repo_spec: str) -> tuple[str, str]:
+def version_without_api(repo_spec: str) -> tuple[str, str]:
     """(version, archive url) for a source, spending no REST quota at all.
 
     Follows the default branch rather than releases -- see the note above.
     """
     repo, branch, folder = split_repo_spec(repo_spec)
-    ref = offline_ref(repo, branch)
+    ref = ref_without_api(repo, branch)
     url = archive_url(repo, ref, tag=names_a_tag(repo, ref))
 
     chosen = wanted_folders(folder)
@@ -1697,15 +1697,15 @@ def offline_version(repo_spec: str) -> tuple[str, str]:
     return version, url
 
 
-def offline_addons_in_repo(repo_spec: str) -> list[str]:
+def addons_in_repo_without_api(repo_spec: str) -> list[str]:
     """The addon folders a repository holds, read out of its archive."""
     repo, branch, _folder = split_repo_spec(repo_spec)
-    ref = offline_ref(repo, branch)
+    ref = ref_without_api(repo, branch)
     blob = archive_bytes(archive_url(repo, ref, tag=names_a_tag(repo, ref)))
     return sorted(digests_in_archive(blob), key=str.lower)
 
 
-def addons_in_repo(repo_spec: str, *, offline: bool = False) -> list[str]:
+def addons_in_repo(repo_spec: str, *, no_api: bool = False) -> list[str]:
     """The addon folders a repository holds, for somebody to choose from.
 
     A folder counts as an addon when it holds a .toc named after itself -- the
@@ -1721,8 +1721,8 @@ def addons_in_repo(repo_spec: str, *, offline: bool = False) -> list[str]:
     choosing what to install means it -- and installing it separately is the
     mistake `addon_dirs_in` is bounded to avoid.
     """
-    if offline:
-        return offline_addons_in_repo(repo_spec)
+    if no_api:
+        return addons_in_repo_without_api(repo_spec)
 
     repo, branch, _folder = split_repo_spec(repo_spec)
     ref = branch or default_branch(repo)
@@ -2163,7 +2163,7 @@ def update_addon(
     force: bool = False,
     dry_run: bool = False,
     check: bool = False,
-    offline: bool = False,
+    no_api: bool = False,
     progress=None,
 ) -> Result:
     """Update a single addon. Returns what happened; never prints.
@@ -2211,7 +2211,7 @@ def update_addon(
 
         progress("checking", rest)
         _repo, _branch, folder = split_repo_spec(rest)
-        version, url = offline_version(rest) if offline else latest_github(rest)
+        version, url = version_without_api(rest) if no_api else latest_github(rest)
         result.version = version
         if entry.get("installed") == version and not force:
             return Result(name=name, outcome=UP_TO_DATE, detail=f"up to date ({version})", version=version)
@@ -2223,7 +2223,7 @@ def update_addon(
         progress("downloading", f"{rest} {version}")
         # Offline checking has usually just fetched this exact archive to work
         # the version out; reuse those bytes rather than paying for them twice.
-        blob = archive_bytes(url) if offline else download(url)
+        blob = archive_bytes(url) if no_api else download(url)
         progress("installing", rest)
         # backup= is the user's own preference; the entry decides folder by
         # folder which of them that preference actually applies to.

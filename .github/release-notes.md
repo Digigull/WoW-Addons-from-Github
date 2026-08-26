@@ -36,7 +36,7 @@ work out again. To get rid of a bound row, set its source to **unmanaged** and r
 
 **A checkbox to check without the GitHub API at all.** Unauthenticated GitHub allows 60
 API calls an hour, per address — so on a shared or office connection something else can
-spend yours. Tick *Check without the GitHub API* (or `--offline` in the terminal) and no
+spend yours. Tick *Check without the GitHub API* (or `--no-api` in the terminal) and no
 call is made under any circumstance:
 
 - an addon's version comes from hashing its folder inside the repository's archive, which

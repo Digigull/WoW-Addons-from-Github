@@ -53,9 +53,9 @@ class _Worker(threading.Thread):
     what any of that looks like.
     """
 
-    def __init__(self, names, entries, root, outbox, *, force=False, check=False, offline=False):
+    def __init__(self, names, entries, root, outbox, *, force=False, check=False, no_api=False):
         super().__init__(daemon=True)
-        self.offline = offline
+        self.no_api = no_api
         self.names = list(names)
         self.entries = entries
         self.root = root
@@ -87,7 +87,7 @@ class _Worker(threading.Thread):
                 )
                 result = core.update_addon(
                     name, entry, self.root, force=self.force, check=self.check,
-                    offline=self.offline, progress=progress,
+                    no_api=self.no_api, progress=progress,
                 )
                 self.outbox.put(("result", result))
         finally:
@@ -111,14 +111,14 @@ class SourceDialog(tk.Toplevel):
     # out of step with __init__.
     VARIABLES = ("choice", "local", "repo", "branch", "track", "copy", "backup", "folder")
 
-    def __init__(self, parent, addon: str, entry: dict, root: Path, *, offline: bool = False):
+    def __init__(self, parent, addon: str, entry: dict, root: Path, *, no_api: bool = False):
         super().__init__(parent)
         self.title(f'Source for "{addon}"')
         self.addon = addon
         self.addons_root = root
         # Defaults to False so a test, or any other caller, gets the ordinary
         # API lookup without having to know this mode exists.
-        self.checks_offline = offline
+        self.checks_without_api = no_api
         self.entry = entry
         self.result: tuple[str, bool] | None = None
         self.keep_backup = entry.get("backup", True)
@@ -341,11 +341,11 @@ class SourceDialog(tk.Toplevel):
         # and nothing here touches a widget: it puts a result in a queue and
         # _drain_lookups picks it up on the main thread. That rule is why this
         # program does not abort with Tcl_AsyncDelete.
-        offline = self.checks_offline
+        no_api = self.checks_without_api
         def ask() -> None:
             core.begin_run()
             try:
-                self.lookups.put((spec, core.addons_in_repo(spec, offline=offline), None))
+                self.lookups.put((spec, core.addons_in_repo(spec, no_api=no_api), None))
             except Exception as exc:  # noqa: BLE001 - reported in the dialog
                 self.lookups.put((spec, [], str(exc)))
             finally:
@@ -763,15 +763,15 @@ class App(ttk.Frame):
         # Its own row: the caption is a sentence, because the trade it makes is
         # not guessable from a three-word label. A checkbox that quietly stops
         # an addon following its releases has to say so where it is ticked.
-        self.offline = tk.BooleanVar(value=False)
-        self.offline_box = ttk.Checkbutton(
+        self.no_api = tk.BooleanVar(value=False)
+        self.no_api_box = ttk.Checkbutton(
             buttons,
             text="Check without the GitHub API — no rate limit, but follows branches "
                  "instead of releases and downloads more",
-            variable=self.offline,
-            command=self._toggle_offline,
+            variable=self.no_api,
+            command=self._toggle_no_api,
         )
-        self.offline_box.grid(row=1, column=0, columnspan=7, sticky="w", pady=(6, 0))
+        self.no_api_box.grid(row=1, column=0, columnspan=7, sticky="w", pady=(6, 0))
 
         status = ttk.Frame(self)
         status.grid(row=3, column=0, sticky="ew")
@@ -844,7 +844,7 @@ class App(ttk.Frame):
         self._sync_installs()
         # Per install, so a vanilla server behind a shared address and a retail
         # one at home do not have to agree about it.
-        self.offline.set(core.checks_offline(self.install()))
+        self.no_api.set(core.checks_without_api(self.install()))
         self.folder_label.configure(
             text=core.tilde(directory) if directory else "(not set)",
             foreground="" if directory else "grey",
@@ -894,13 +894,13 @@ class App(ttk.Frame):
                 self.tree.selection_add(name)
         self._sync_buttons()
 
-    def _toggle_offline(self) -> None:
-        core.set_checks_offline(self.install(), self.offline.get())
+    def _toggle_no_api(self) -> None:
+        core.set_checks_without_api(self.install(), self.no_api.get())
         core.save(self.state)
         self.say(
             "Checking without the GitHub API. Bound addons follow their default "
             "branch; the first check of one may download its repository."
-            if self.offline.get() else
+            if self.no_api.get() else
             "Checking through the GitHub API again."
         )
 
@@ -917,7 +917,7 @@ class App(ttk.Frame):
             (self.update_button, one),
             (self.update_all_button, "disabled" if running else "normal"),
             (self.cancel_button, "normal" if running else "disabled"),
-            (self.offline_box, "disabled" if running else "normal"),
+            (self.no_api_box, "disabled" if running else "normal"),
         ):
             button.configure(state=state)
 
@@ -997,7 +997,7 @@ class App(ttk.Frame):
         name = names[0]
         entry = self.entries().setdefault(name, core.new_entry(name))
         dialog = SourceDialog(self.master, name, entry, root,
-                              offline=core.checks_offline(self.install()))
+                              no_api=core.checks_without_api(self.install()))
         self.master.wait_window(dialog)
         if dialog.result is None:
             return
@@ -1070,7 +1070,7 @@ class App(ttk.Frame):
 
         core.begin_run()
         self.worker = _Worker(names, self.entries(), root, self.outbox, check=check,
-                              offline=core.checks_offline(self.install()))
+                              no_api=core.checks_without_api(self.install()))
         self.worker.start()
         self._sync_buttons()
 

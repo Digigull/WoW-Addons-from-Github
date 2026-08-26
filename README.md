@@ -386,7 +386,7 @@ shape as codeload falling back to the API zipball.
 
 The 60 an hour is counted **per address**, so on a shared, office or CGNAT connection
 something else can spend yours. For that case there is a checkbox — *Check without the
-GitHub API*, or `--offline` in the terminal — under which no API call is made under any
+GitHub API*, or `--no-api` in the terminal — under which no API call is made under any
 circumstance:
 
 - an addon's version comes from hashing its folder inside the repository's archive, which
@@ -405,6 +405,19 @@ route. Bandwidth replaces quota. Leave it off unless you are actually hitting th
 
 The setting is per install, so a server behind a shared address and one at home need not
 agree about it.
+
+**No repository is kept on your disk.** The archive is held in memory for the length of
+the run and discarded; installing unpacks it into the system temporary directory, which is
+emptied as soon as the addon is in place. The only thing that persists is
+`github-cache.json` beside the manifest, holding ETags and twelve-character digests — no
+archives. It is capped at 400 entries, and deleting it costs one cold run and nothing
+else.
+
+| | Temporary, during an install | Kept between runs |
+|---|---|---|
+| **Linux** | `$TMPDIR`, else `/tmp` | `~/.config/wow-addons/github-cache.json` |
+| **macOS** | `$TMPDIR` (`/var/folders/…/T/`) | `~/.config/wow-addons/github-cache.json` |
+| **Windows** | `%TMP%`, normally `…\AppData\Local\Temp` | `%APPDATA%\wow-addons\github-cache.json` |
 
 Both front ends print how many calls are left after a run, and say when they are waiting
 and why, so a pause never looks like a hang. What was learned is kept in

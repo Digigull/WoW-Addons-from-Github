@@ -2328,7 +2328,7 @@ class CheckingWithoutTheAPI(unittest.TestCase):
         # The ref advertisement already carries the commit, so there is nothing
         # to fetch and nothing to hash.
         addons.begin_run()
-        version, _url = addons.offline_version("o/r")
+        version, _url = addons.version_without_api("o/r")
         addons.end_run()
         self.assertEqual(version, "1" * 12)
         self.assertEqual(self.downloads, [])
@@ -2336,7 +2336,7 @@ class CheckingWithoutTheAPI(unittest.TestCase):
 
     def test_a_folder_binding_downloads_once_and_asks_the_api_nothing(self):
         addons.begin_run()
-        addons.offline_version("o/r#GnomeWorks")
+        addons.version_without_api("o/r#GnomeWorks")
         addons.end_run()
         self.assertEqual(len(self.downloads), 1)
         self.assertEqual(self.api, [])
@@ -2346,48 +2346,48 @@ class CheckingWithoutTheAPI(unittest.TestCase):
         # archive; the digests for all of them come out of the one pass.
         addons.begin_run()
         for folder in ("AscensionHonorTracker", "GnomeWorks"):
-            addons.offline_version(f"o/r#{folder}")
+            addons.version_without_api(f"o/r#{folder}")
         addons.end_run()
         self.assertEqual(len(self.downloads), 1)
 
     def test_a_later_run_downloads_nothing_while_the_commit_stands(self):
         # A digest is kept against the commit it was taken from, so it is never
         # stale and never computed twice.
-        addons.begin_run(); addons.offline_version("o/r#GnomeWorks"); addons.end_run()
+        addons.begin_run(); addons.version_without_api("o/r#GnomeWorks"); addons.end_run()
         self.downloads.clear()
-        addons.begin_run(); addons.offline_version("o/r#GnomeWorks"); addons.end_run()
+        addons.begin_run(); addons.version_without_api("o/r#GnomeWorks"); addons.end_run()
         self.assertEqual(self.downloads, [])
 
     def test_a_new_commit_is_fetched_again(self):
-        addons.begin_run(); first = addons.offline_version("o/r#GnomeWorks")[0]; addons.end_run()
+        addons.begin_run(); first = addons.version_without_api("o/r#GnomeWorks")[0]; addons.end_run()
         self.head = "2" * 40
         self.files["repo-main/GnomeWorks/GnomeWorks.toc"] = "changed"
         self.downloads.clear()
-        addons.begin_run(); second = addons.offline_version("o/r#GnomeWorks")[0]; addons.end_run()
+        addons.begin_run(); second = addons.version_without_api("o/r#GnomeWorks")[0]; addons.end_run()
         self.assertEqual(len(self.downloads), 1)
         self.assertNotEqual(first, second)
 
     def test_a_named_folder_that_is_not_there_is_reported(self):
         addons.begin_run()
         with self.assertRaises(addons.Fail) as caught:
-            addons.offline_version("o/r#Nonexistent")
+            addons.version_without_api("o/r#Nonexistent")
         self.assertIn("Nonexistent", str(caught.exception))
 
     def test_the_dialog_can_list_folders_without_the_api(self):
         addons.begin_run()
-        found = addons.addons_in_repo("o/r", offline=True)
+        found = addons.addons_in_repo("o/r", no_api=True)
         addons.end_run()
         self.assertEqual(found, ["AscensionHonorTracker", "GnomeWorks"])
         self.assertEqual(self.api, [])
 
     # -- and through the front door ------------------------------------------
 
-    def test_update_addon_offline_installs_and_spends_no_quota(self):
+    def test_update_addon_without_the_api_installs_and_spends_no_quota(self):
         root = pathlib.Path(self.scratch.name) / "AddOns"
         root.mkdir()
         entry = {"source": "github:o/r#GnomeWorks", "mode": "link"}
         addons.begin_run()
-        result = addons.update_addon("GnomeWorks", entry, root, offline=True)
+        result = addons.update_addon("GnomeWorks", entry, root, no_api=True)
         addons.end_run()
         self.assertEqual(result.outcome, addons.CHANGED, result.detail)
         self.assertTrue((root / "GnomeWorks" / "GnomeWorks.toc").is_file())
@@ -2399,15 +2399,15 @@ class CheckingWithoutTheAPI(unittest.TestCase):
         root = pathlib.Path(self.scratch.name) / "AddOns2"
         root.mkdir()
         addons.begin_run()
-        addons.update_addon("GnomeWorks", {"source": "github:o/r#GnomeWorks"}, root, offline=True)
+        addons.update_addon("GnomeWorks", {"source": "github:o/r#GnomeWorks"}, root, no_api=True)
         addons.end_run()
         self.assertEqual(len(self.downloads), 1)
 
     def test_the_setting_is_remembered_per_install(self):
         install = addons.blank_install()
-        self.assertFalse(addons.checks_offline(install))
-        addons.set_checks_offline(install, True)
-        self.assertTrue(addons.checks_offline(install))
+        self.assertFalse(addons.checks_without_api(install))
+        addons.set_checks_without_api(install, True)
+        self.assertTrue(addons.checks_without_api(install))
 
 
 class RescanForgetsWhatYouDeleted(unittest.TestCase):
