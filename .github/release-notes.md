@@ -21,6 +21,41 @@ script:
 "WoW Addons from GitHub.exe" update --check
 ```
 
+## New in v0.8.0
+
+**Checking for updates barely touches GitHub's quota any more.** Before a clone, git asks
+a server to list what it has — the request every `git fetch` in the world begins with. It
+is served from github.com rather than the API, and it is not counted against the 60 calls
+an hour that unauthenticated GitHub allows. One of them, per repository, gives the default
+branch, every branch and every tag with the commit each points at.
+
+That answers outright the two questions that used to cost the most, and rules out a third:
+a published release always has a tag behind it, so a repository with no tags cannot have a
+release and is never asked about one. What it cannot answer is history — "which commit
+last touched this folder" is not in a ref listing — but a folder cannot change unless the
+branch holding it moves, so that question is now only asked when something actually moved.
+
+Per addon, for a full update, in API calls:
+
+| Binding | First run | Every run after |
+|---|---|---|
+| `local:` | 0 | 0 |
+| `github:owner/repo` — no releases | **0** | **0** |
+| `github:owner/repo@branch` | **0** | **0** |
+| `github:owner/repo` — publishes releases | 1 | 0 |
+| `github:owner/repo#Folder` | 1 | 0 |
+
+The first-run column is the one that changed. A fresh install with thirty addons used to
+need more calls than the hour allows, so it could not finish; now most bindings need none
+at all, and the rest revalidate for free from then on.
+
+Nothing is taken on trust. A ref we cannot see is never reported as unchanged, an
+unreadable listing is ignored rather than guessed at, and a repository that is private or
+a network that blocks git falls straight back to the API path as before.
+
+Also: a source pinned to a **tag** (`@v1.2.3`) now fetches the tag's archive directly
+instead of trying the branch path first and being refused.
+
 ## Fixed in v0.7.1
 
 **A repeated "Check for updates" still cost calls.** v0.7.0 made an unchanged check free

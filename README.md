@@ -340,36 +340,42 @@ fast as the network answered — which is how a perfectly ordinary addon list ca
 **GitHub rate limit reached**, and then spent one more doomed call per remaining addon
 saying so again.
 
-Four things now keep a run inside the budget:
+Most of a run no longer touches the API at all:
 
-- **A check that finds nothing new is free.** Every answer is stored with the `ETag`
-  GitHub stamped on it, and sent back as `If-None-Match` next time. An unchanged resource
-  replies `304 Not Modified`, and GitHub does not bill a `304`. Check as often as you
-  like, as long as your addons are not moving.
+- **The questions git can answer go to git.** Before a clone, git asks a server to list
+  what it has — `github.com/owner/repo.git/info/refs`, the request every `git fetch`
+  begins with. It is not the REST API and is not billed against the hourly quota, and one
+  of them per repository yields the default branch, every branch and every tag with the
+  commit each points at. That is the default-branch lookup and the branch-head lookup
+  gone, and — since a published release always has a tag — a repository with no tags is
+  never asked about releases at all.
+- **History is only asked for when something moved.** Which commit last touched a folder
+  is not in a ref listing, but a folder cannot change unless the branch holding it moves.
+  Ten addons in one unmoved monorepo cost nothing.
+- **A check that finds nothing new is free.** Whatever is left is stored with the `ETag`
+  GitHub stamped on it and sent back as `If-None-Match`; an unchanged resource replies
+  `304 Not Modified`, which GitHub does not bill.
 - **Archives are fetched off the meter.** A zip comes from `codeload.github.com`, the host
-  behind the green *Download ZIP* button, which is not the REST API and does not spend the
-  hourly quota. The REST URL stays as an automatic fallback, so a run that cannot use
-  codeload still installs, for the price of a call.
-- **One question per run.** Ten addons out of one repository share its branch lookup.
+  behind the green *Download ZIP* button, which is not the REST API. The REST URL stays as
+  an automatic fallback.
 - **The wall is not re-hit.** Once the quota is known to be spent the run fails once,
   immediately, naming the time it comes back, rather than spending a round trip per
   remaining addon to be told the same thing.
 
-What that costs in practice, per addon, for a full update where the addon really changed:
+What that costs in API calls, per addon, for a full update where the addon really changed:
 
 | Source | First run | Every run after |
 |---|---|---|
 | `local:/path/to/checkout` | **0** | **0** |
+| `github:owner/repo` — repo publishes **no** releases | **0** | **0** |
+| `github:owner/repo@main` — branch pinned | **0** | **0** |
 | `github:owner/repo` — repo publishes releases | 1 | **0** |
-| `github:owner/repo@main` — branch pinned | 1 | **0** |
-| `github:owner/repo@main#Folder` — branch and folder pinned | 1 | **0** |
-| `github:owner/repo#Folder` — folder pinned | 2 | **0** |
-| `github:owner/repo` — repo publishes **no** releases | 3 | 1 |
+| `github:owner/repo#Folder` — folder pinned | 1 | **0** |
 
-The last row is the only shape that keeps costing something, because "this repo has no
-releases" comes back as a `404`, and a `404` carries no `ETag` to revalidate against.
-Pinning the branch — `github:owner/repo@main` — skips the release lookup entirely and
-takes it to zero.
+Nothing is taken on trust anywhere in that. A ref that cannot be seen is never reported as
+unchanged, an unreadable listing is ignored rather than guessed at, and a private
+repository or a network that blocks git falls straight back to the REST path — the same
+shape as codeload falling back to the API zipball.
 
 Both front ends print how many calls are left after a run, and say when they are waiting
 and why, so a pause never looks like a hang. What was learned is kept in
