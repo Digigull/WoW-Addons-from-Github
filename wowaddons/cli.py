@@ -181,7 +181,7 @@ def cmd_list(args, state: dict) -> None:
 
     step(f"{len(entries)} addon(s) in {root}")
     width = max(len(n) for n in entries)
-    for name in sorted(entries, key=str.lower):
+    for name in core.display_order(entries):
         entry = entries[name]
         source = entry.get("source", "unmanaged")
         installed = entry.get("installed") or entry.get("toc_version") or ""
@@ -230,7 +230,11 @@ def cmd_update(args, state: dict) -> None:
     install = selected(args, state)
     root = core.addons_dir(install)
     entries = install.get("addons", {})
-    names = args.addons or sorted(entries, key=str.lower)
+    names = args.addons or core.display_order(entries)
+
+    # Waiting on GitHub with nothing on screen reads as a hang, and the pacing
+    # only exists to be waited on, so it says so.
+    core.set_wait_hook(lambda seconds, why: note(f"{DIM}waiting {seconds:.0f}s — {why}{RESET}"))
 
     step("Update" + (" (dry run)" if args.dry_run else ""))
     changed = skipped = 0

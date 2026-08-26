@@ -79,11 +79,17 @@ class _Worker(threading.Thread):
                 def progress(stage, detail, _name=name):
                     self.outbox.put(("progress", (_name, stage, detail)))
 
+                # The engine paces its GitHub calls, and a pause it does not
+                # announce is indistinguishable from a window that has frozen.
+                core.set_wait_hook(
+                    lambda seconds, why, _name=name: self.outbox.put(("waiting", (_name, seconds, why)))
+                )
                 result = core.update_addon(
                     name, entry, self.root, force=self.force, check=self.check, progress=progress
                 )
                 self.outbox.put(("result", result))
         finally:
+            core.set_wait_hook(None)
             self.outbox.put(("done", None))
 
 
@@ -822,7 +828,7 @@ class App(ttk.Frame):
         selected = set(self.tree.selection())
         self.tree.delete(*self.tree.get_children())
         entries = self.entries()
-        for name in sorted(entries, key=str.lower):
+        for name in core.display_order(entries):
             entry = entries[name]
             source = entry.get("source", "unmanaged")
             tags = []
@@ -987,7 +993,7 @@ class App(ttk.Frame):
         self.start(self.selection())
 
     def update_all(self) -> None:
-        self.start(sorted(self.entries(), key=str.lower))
+        self.start(core.display_order(self.entries()))
 
     def check_all(self) -> None:
         """Ask every bound addon what the latest version is. Download nothing.
@@ -996,7 +1002,7 @@ class App(ttk.Frame):
         commit you to installing it, and on a slow connection an unwanted
         `Update all` is not something you can take back.
         """
-        self.start(sorted(self.entries(), key=str.lower), check=True)
+        self.start(core.display_order(self.entries()), check=True)
 
     def start(self, names: list[str], *, check: bool = False) -> None:
         if self.worker is not None and self.worker.is_alive():
@@ -1049,6 +1055,11 @@ class App(ttk.Frame):
                     name, stage, detail = payload
                     if self.tree.exists(name):
                         self.tree.set(name, "status", f"{stage}…")
+                elif kind == "waiting":
+                    name, seconds, why = payload
+                    if self.tree.exists(name):
+                        self.tree.set(name, "status", f"waiting {seconds:.0f}s…")
+                    self.say(f"Waiting {seconds:.0f}s — {why}")
                 elif kind == "result":
                     self._show_result(payload)
                 elif kind == "cancelled":

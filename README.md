@@ -99,7 +99,7 @@ Running from a checkout instead needs **Python 3.9 or newer**, and that is the w
 |---|---|
 | `init <path>` | Remember where the client is. Accepts your WoW folder, its `Interface` folder, or `Interface/AddOns` itself. |
 | `scan` | Read every addon already installed and record it, guessing a source from each `.toc` where it can. |
-| `list` | Every addon, its source, and its installed version. |
+| `list` | Every addon, its source, and its installed version. Bound addons first, then the rest, each alphabetically. |
 | `set <Addon> <source>` | Bind one addon to where its updates come from. |
 | `accept` | Take every source that `scan` suggested, in one go. |
 | `update [Addon...]` | Bring bound addons up to date. Defaults to all of them. |
@@ -211,6 +211,9 @@ itself.
 
 Everything the terminal does, in one window:
 
+- **The addons you have bound are listed first**, then everything still unmanaged, each
+  group alphabetically. On a real install most rows are addons this tool does not manage,
+  and a single alphabetical list buries the handful it does among them.
 - **Set source…** opens a dialog over the selected addon: a local folder (with Browse),
   a GitHub repo, an optional branch to track, an optional folder inside the repo, or
   unmanaged. Pasting a github.com link to a folder fills all three in.
@@ -249,10 +252,30 @@ Everything the terminal does, in one window:
   It holds your disk paths, so it does not belong in a repository. `where` prints the
   resolved location.
 
-`GITHUB_TOKEN` is honoured if set, and is entirely optional: unauthenticated GitHub allows 60
-requests an hour, which is far more than a personal addon list needs.
-
 Restart the client, or `/reload`, to pick changes up.
+
+## GitHub's rate limit
+
+Unauthenticated GitHub allows 60 API calls an hour, and separately objects to bursts
+however much of that is left. One addon costs one to three calls to check and one more to
+download, so `Update all` over a longer list is a burst of them fired as fast as the
+network answers — which is how a perfectly ordinary addon list came back **GitHub rate
+limit reached**, and then spent one more doomed call per remaining addon saying so again.
+
+Updates are now paced instead:
+
+- an answer already fetched is reused for a couple of minutes, so two addons out of the
+  same repository do not both pay for the same question;
+- calls are spaced out — a little always, and much more once the quota is nearly gone, so
+  the last of it is rationed rather than emptied in one second;
+- a burst limit, which clears in about a minute, is waited out and the call retried;
+- an exhausted hourly quota fails the run once, immediately, saying when it comes back,
+  rather than being re-hit for every addon left. Both front ends say when they are
+  waiting and why, so a pause never looks like a hang.
+
+None of that invents quota. `GITHUB_TOKEN` still does: it is entirely optional, and it
+raises the limit to 5000 calls an hour. Set it to a read-only token if you keep hitting
+the wall with a long list.
 
 ## Linux, Wine and Proton
 
@@ -327,7 +350,8 @@ guards whose failure would otherwise be silent: an archive whose root is the add
 installing under GitHub's wrapper name (which the client ignores), a `403` reported as a
 rate limit when the real cause was a blocked proxy or a private repository, and an
 AppImage entry point that stops going through the wrapper that sets up Tcl/Tk — which
-would produce a build that passes every check except opening a window.
+would produce a build that passes every check except opening a window, and an update run
+that spends its GitHub quota in one burst and then keeps asking after it is gone.
 
 ### Building the downloads
 

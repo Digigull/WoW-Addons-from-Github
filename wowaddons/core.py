@@ -17,6 +17,7 @@ is one addon out of many and the rest must still go.
 
 from __future__ import annotations
 
+import datetime
 import io
 import json
 import os
@@ -25,6 +26,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -677,6 +679,25 @@ def accept_suggestions(state: dict) -> list[tuple[str, str]]:
     return taken
 
 
+def display_order(entries: dict) -> list[str]:
+    """Addon names: the ones with a source first, then the rest, each A-Z.
+
+    Both front ends list every addon in the AddOns folder, and on a real
+    install most of them are unmanaged -- installed by hand, or left over. Pure
+    alphabetical order scatters the handful this tool actually maintains
+    through fifty rows it does not, so the list you came to read is the one you
+    have to hunt for. Bound addons are what the window is for; they go first.
+
+    Within each group the order is still alphabetical, because that is the only
+    order somebody can predict when looking for one name.
+    """
+    def where(name: str) -> tuple[bool, str]:
+        source = entries.get(name, {}).get("source", "unmanaged")
+        return (source == "unmanaged", name.lower())
+
+    return sorted(entries, key=where)
+
+
 def github_message(exc: urllib.error.HTTPError) -> str:
     """GitHub explains itself in the response body; surface that, not the code."""
     try:
@@ -685,41 +706,279 @@ def github_message(exc: urllib.error.HTTPError) -> str:
         return "no detail given"
 
 
-def http_json(url: str) -> dict | None:
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"})
-    token = os.environ.get("GITHUB_TOKEN")
-    if token:
-        # Entirely optional. Unauthenticated is 60 requests/hour, which is far
-        # more than a personal addon list needs; set this only if you hit it.
-        request.add_header("Authorization", f"Bearer {token}")
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return json.loads(response.read().decode())
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            return None
-        # A 403 is NOT automatically a rate limit -- a private repo, a blocked
-        # egress proxy and an exhausted quota all land here, and telling someone
-        # to "wait an hour" when the real cause is a proxy wastes their evening.
-        # The remaining-quota header is what actually distinguishes them.
-        if exc.code in (403, 429):
-            if exc.headers.get("x-ratelimit-remaining") == "0":
-                reset = exc.headers.get("x-ratelimit-reset", "")
-                when = ""
-                if reset.isdigit():
-                    import datetime
+# -- pacing GitHub -----------------------------------------------------------
+#
+# GitHub allows 60 API calls an hour without a token and 5000 with one, and
+# separately objects to bursts however much quota is left. One addon costs one
+# to three calls, so "Update all" over thirty of them is a burst of eighty
+# requests fired as fast as the network answers -- the exact shape that trips
+# both limits, and the reason "GitHub rate limit reached" was the ordinary
+# outcome of a normal-sized addon list rather than a rare one.
+#
+# Three things happen below, in order of how much they help:
+#
+#   an answer is reused        two addons out of the same repository asked the
+#                              same question; the second need not cost a call
+#   calls are spaced out       always a little, and much more once the quota is
+#                              nearly gone, so the last few last as long as
+#                              they can rather than evaporating in one second
+#   the wall is not re-hit     once the quota is known to be spent, the rest of
+#                              the run fails immediately from what we already
+#                              know instead of spending thirty more round trips
+#                              to be told the same thing thirty more times
+#
+# None of it invents quota. With sixty calls an hour and eighty needed, some of
+# the run will still fail; what changes is that it fails once, quickly, saying
+# when it can be retried -- and that the ordinary list of a dozen addons, which
+# fits comfortably inside the limit, stops being refused for burst alone.
 
-                    when = " until " + datetime.datetime.fromtimestamp(int(reset)).strftime("%H:%M")
-                die(
-                    f"GitHub rate limit reached{when}."
-                    "\n     Set GITHUB_TOKEN to a read-only token to raise it, or wait."
-                )
-            die(f"GitHub refused the request (403): {github_message(exc)}")
-        if exc.code == 401:
-            die("GitHub rejected GITHUB_TOKEN (401). Unset it, or use a valid read-only token.")
-        die(f"GitHub returned {exc.code} for {url}: {github_message(exc)}")
-    except urllib.error.URLError as exc:
-        die(f"could not reach GitHub: {exc.reason}")
+GITHUB_MIN_GAP = 0.25
+"""Seconds between two API calls, always. Cheap, and burst limits are real."""
+
+GITHUB_LOW_WATER = 20
+"""Below this many calls left, stop spending them at full speed."""
+
+GITHUB_MAX_GAP = 5.0
+"""Never pause longer than this between calls -- past it a run looks hung."""
+
+GITHUB_MAX_WAIT = 60.0
+"""Longest we will sit out a limit before giving up and saying so."""
+
+CACHE_SECONDS = 120.0
+"""How long an API answer stays reusable. Long enough to cover one run of
+`Update all`, short enough that a commit pushed a minute ago is not hidden."""
+
+
+def header(headers, name: str) -> str | None:
+    """One header, case-insensitively, from a real response or a plain dict."""
+    if headers is None:
+        return None
+    value = headers.get(name)
+    if value is None:
+        try:
+            items = list(headers.items())
+        except Exception:
+            return None
+        for key, found in items:
+            if key.lower() == name:
+                return found
+    return value
+
+
+def header_number(headers, name: str) -> float | None:
+    """A numeric header, or None if it is missing or not a number."""
+    value = header(headers, name)
+    if value is None:
+        return None
+    try:
+        return float(str(value).strip())
+    except ValueError:
+        return None
+
+
+_wait_hook = _nothing
+
+
+def set_wait_hook(hook=None) -> None:
+    """Who to tell that a request is being held back, and why.
+
+    A front end sets this; the engine still prints nothing. Without it the
+    waiting is silent, which for a quarter of a second is right and for a
+    minute is indistinguishable from a hang.
+    """
+    global _wait_hook
+    _wait_hook = hook or _nothing
+
+
+def report_wait(seconds: float, why: str) -> None:
+    """Say we are waiting -- but only when it is long enough to be noticed."""
+    if seconds >= 1.0:
+        _wait_hook(seconds, why)
+
+
+class Throttle:
+    """Spaces out GitHub calls, and remembers when the quota ran out.
+
+    `sleep` and `clock` are injected so a test can exercise the pacing without
+    actually sitting there for it.
+    """
+
+    def __init__(self, *, sleep=time.sleep, clock=time.time):
+        self._sleep = sleep
+        self._clock = clock
+        self.forget()
+
+    def forget(self) -> None:
+        """Back to knowing nothing -- new process, or a test starting over."""
+        self.remaining: float | None = None
+        self.reset_at: float | None = None
+        self._last_call: float | None = None
+
+    def gap(self) -> float:
+        """How long to leave between the last call and the next one.
+
+        The floor is there for burst limits. Above it, what is left is spread
+        across the time until the quota comes back, so a nearly-spent quota is
+        rationed rather than emptied -- capped, because a pause long enough to
+        look like a crash is not an improvement on an error message.
+        """
+        gap = GITHUB_MIN_GAP
+        if self.remaining is not None and self.reset_at is not None and self.remaining <= GITHUB_LOW_WATER:
+            left = max(self.reset_at - self._clock(), 0.0)
+            gap = max(gap, min(left / max(self.remaining, 1.0), GITHUB_MAX_GAP))
+        return gap
+
+    def wait_turn(self) -> float:
+        """Hold the next call back until its turn. Returns the seconds waited."""
+        now = self._clock()
+        waited = 0.0
+        if self._last_call is not None:
+            due = self._last_call + self.gap()
+            if due > now:
+                waited = due - now
+                report_wait(waited, "pacing requests to stay inside GitHub's rate limit")
+                self._sleep(waited)
+        self._last_call = self._clock()
+        return waited
+
+    def observe(self, headers) -> None:
+        """Learn from a response how much quota is left and when it returns."""
+        remaining = header_number(headers, "x-ratelimit-remaining")
+        if remaining is not None:
+            self.remaining = remaining
+        reset = header_number(headers, "x-ratelimit-reset")
+        if reset is not None:
+            self.reset_at = reset
+
+    def spent(self) -> bool:
+        """True while the quota is known to be gone and not yet back."""
+        return self.remaining == 0 and self.reset_at is not None and self.reset_at > self._clock()
+
+    def sit_out(self, headers) -> bool:
+        """Wait out a short limit; say whether retrying is now worth it.
+
+        A secondary (burst) limit clears in a minute and is worth waiting for.
+        An exhausted hourly quota is not: nobody wants a window that sits there
+        for forty minutes pretending to work.
+        """
+        delay = header_number(headers, "retry-after")
+        if delay is None:
+            reset = header_number(headers, "x-ratelimit-reset")
+            delay = None if reset is None else reset - self._clock()
+        if delay is None or delay > GITHUB_MAX_WAIT:
+            return False
+        delay = max(delay, 1.0)
+        report_wait(delay, "GitHub asked for a pause; waiting it out")
+        self._sleep(delay)
+        self._last_call = self._clock()
+        return True
+
+
+THROTTLE = Throttle()
+_cache: dict[str, tuple[float, dict | None]] = {}
+
+
+def forget_github_state() -> None:
+    """Drop the cache and the quota bookkeeping, for a genuinely fresh look."""
+    _cache.clear()
+    THROTTLE.forget()
+
+
+_MISS = object()
+"""Distinguishes "not cached" from a cached None, which 404 legitimately is."""
+
+
+def cached(url: str, clock=time.time):
+    """A recent answer for this URL, or `_MISS` if there is not one."""
+    found = _cache.get(url)
+    if found is None:
+        return _MISS
+    when, answer = found
+    if clock() - when > CACHE_SECONDS:
+        del _cache[url]
+        return _MISS
+    return answer
+
+
+def rate_limit_message(reset_at: float | None) -> str:
+    when = ""
+    if reset_at:
+        when = " until " + datetime.datetime.fromtimestamp(reset_at).strftime("%H:%M")
+    return (
+        f"GitHub rate limit reached{when}."
+        "\n     Set GITHUB_TOKEN to a read-only token to raise it, or wait."
+    )
+
+
+def is_rate_limit(headers, message: str) -> bool:
+    """Whether this 403/429 is a limit rather than permissions or a proxy.
+
+    A 403 is NOT automatically a rate limit -- a private repo, a blocked egress
+    proxy and an exhausted quota all land here, and telling someone to "wait an
+    hour" when the real cause is a proxy wastes their evening. The remaining
+    header distinguishes the hourly quota; the body names the burst limit,
+    which arrives with quota still on the clock.
+    """
+    if header_number(headers, "x-ratelimit-remaining") == 0:
+        return True
+    lowered = message.lower()
+    return "secondary rate limit" in lowered or "abuse detection" in lowered
+
+
+def http_json(url: str) -> dict | None:
+    """One GitHub API call: cached if it can be, paced if it cannot."""
+    answer = cached(url)
+    if answer is not _MISS:
+        return answer
+
+    for attempt in (1, 2):
+        if THROTTLE.spent():
+            # Nothing to gain from asking: the answer is already known, and
+            # asking anyway is what turns one exhausted quota into thirty
+            # identical failures and a run that takes a minute to say so.
+            die(rate_limit_message(THROTTLE.reset_at))
+
+        request = urllib.request.Request(
+            url, headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"}
+        )
+        token = os.environ.get("GITHUB_TOKEN")
+        if token:
+            # Entirely optional. Unauthenticated is 60 requests/hour, which a
+            # personal addon list can still reach on a big update; set this if
+            # you do.
+            request.add_header("Authorization", f"Bearer {token}")
+
+        THROTTLE.wait_turn()
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                THROTTLE.observe(response.headers)
+                answer = json.loads(response.read().decode())
+                _cache[url] = (time.time(), answer)
+                return answer
+        except urllib.error.HTTPError as exc:
+            THROTTLE.observe(exc.headers)
+            if exc.code == 404:
+                # Worth remembering: "no release" is asked once per addon and
+                # is a perfectly good answer to cache.
+                _cache[url] = (time.time(), None)
+                return None
+            if exc.code in (403, 429):
+                message = github_message(exc)
+                if is_rate_limit(exc.headers, message):
+                    if attempt == 1 and THROTTLE.sit_out(exc.headers):
+                        continue
+                    die(rate_limit_message(THROTTLE.reset_at))
+                die(f"GitHub refused the request ({exc.code}): {message}")
+            if exc.code == 401:
+                die("GitHub rejected GITHUB_TOKEN (401). Unset it, or use a valid read-only token.")
+            die(f"GitHub returned {exc.code} for {url}: {github_message(exc)}")
+        except urllib.error.URLError as exc:
+            die(f"could not reach GitHub: {exc.reason}")
+
+    # Unreachable: every branch above returns or raises, and only the first
+    # attempt may retry. Here so that a future edit which breaks that cannot
+    # quietly return None, which every caller would read as "404, no such thing".
+    die(f"gave up talking to GitHub for {url}")
 
 
 def split_repo_spec(repo_spec: str) -> tuple[str, str | None, str | None]:
@@ -881,11 +1140,25 @@ def likely_addon(name: str, folders: list[str]) -> str | None:
 
 
 def download(url: str) -> bytes:
+    """Fetch one archive, paced with the rest when it goes through the API.
+
+    A zipball from api.github.com is spent out of the same hourly quota as
+    every version check, so an update installing thirty addons is thirty calls
+    the pacing has to count. A release asset served from elsewhere is not, and
+    is fetched at full speed.
+    """
+    through_the_api = "api.github.com" in url
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     token = os.environ.get("GITHUB_TOKEN")
-    if token and "api.github.com" in url:
+    if token and through_the_api:
         request.add_header("Authorization", f"Bearer {token}")
+    if through_the_api:
+        if THROTTLE.spent():
+            die(rate_limit_message(THROTTLE.reset_at))
+        THROTTLE.wait_turn()
     with urllib.request.urlopen(request, timeout=120) as response:
+        if through_the_api:
+            THROTTLE.observe(response.headers)
         return response.read()
 
 

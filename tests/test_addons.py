@@ -17,12 +17,15 @@ whose failure would be silent:
     you off to wait an hour for nothing
 """
 
+import datetime
 import io
+import json
 import os
 import pathlib
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 import zipfile
@@ -142,6 +145,12 @@ class ForbiddenIsNotAlwaysRateLimit(unittest.TestCase):
     The regression: every 403 said "wait an hour", which is the one piece of
     advice guaranteed not to help when the cause is egress or permissions.
     """
+
+    def setUp(self):
+        # The engine remembers what the last response said about the quota, so
+        # a test that hands it an exhausted one has to hand it back.
+        addons.forget_github_state()
+        self.addCleanup(addons.forget_github_state)
 
     def raise403(self, headers: dict, body: bytes):
         def fake(url, timeout=0):
@@ -1420,3 +1429,281 @@ class FlaggingAWholeRepositoryBinding(unittest.TestCase):
         self.assertFalse(addons.covers_several_addons(
             {"source": "local:/x", "folders": ["A", "B"], "installed": "linked"}))
         self.assertFalse(addons.covers_several_addons({"source": "unmanaged"}))
+
+
+class FakeResponse:
+    """What urlopen returns, reduced to the three things http_json touches."""
+
+    def __init__(self, body, headers=None):
+        self.body = body
+        self.headers = headers or {}
+
+    def read(self) -> bytes:
+        return self.body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+class PacingGitHub(unittest.TestCase):
+    """The quota is small and the burst limit is real; both must survive a run.
+
+    The regression these pin: `Update all` over a normal addon list fired every
+    request it needed as fast as the network answered, which is how a list that
+    fits inside sixty calls an hour still came back "GitHub rate limit reached"
+    -- and then spent one doomed round trip per remaining addon saying so again.
+    """
+
+    def setUp(self):
+        # A throttle that reports its sleeps rather than taking them, so the
+        # pacing can be asserted without the suite sitting through it.
+        self.slept = []
+        self.now = [1_000_000.0]
+        self.real_throttle = addons.THROTTLE
+        addons.THROTTLE = addons.Throttle(sleep=self.sleep, clock=lambda: self.now[0])
+        addons.forget_github_state()
+        self.addCleanup(addons.forget_github_state)
+        self.addCleanup(lambda: setattr(addons, "THROTTLE", self.real_throttle))
+        self.addCleanup(addons.set_wait_hook, None)
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now[0] += seconds
+
+    def urlopen(self, answers):
+        """Stub urlopen with a scripted list; records the URLs asked for."""
+        self.asked = []
+        queue = list(answers)
+
+        def fake(request, timeout=0):
+            self.asked.append(request.full_url)
+            answer = queue.pop(0) if len(queue) > 1 else queue[0]
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        real = addons.urllib.request.urlopen
+        addons.urllib.request.urlopen = fake
+        self.addCleanup(lambda: setattr(addons.urllib.request, "urlopen", real))
+
+    def limit(self, headers: dict, message: str = "API rate limit exceeded"):
+        body = json.dumps({"message": message}).encode()
+        return urllib.error.HTTPError("http://x", 403, "Forbidden", headers, io.BytesIO(body))
+
+    # -- spacing -------------------------------------------------------------
+
+    def test_the_first_call_waits_for_nothing(self):
+        addons.THROTTLE.wait_turn()
+        self.assertEqual(self.slept, [])
+
+    def test_two_calls_in_a_row_are_spaced_out(self):
+        addons.THROTTLE.wait_turn()
+        addons.THROTTLE.wait_turn()
+        self.assertEqual(self.slept, [addons.GITHUB_MIN_GAP])
+
+    def test_plenty_of_quota_keeps_the_gap_at_its_floor(self):
+        addons.THROTTLE.observe({"x-ratelimit-remaining": "4999",
+                                 "x-ratelimit-reset": str(self.now[0] + 3600)})
+        self.assertEqual(addons.THROTTLE.gap(), addons.GITHUB_MIN_GAP)
+
+    def test_a_nearly_spent_quota_is_spread_over_the_time_it_has_left(self):
+        # Ten calls left and twenty seconds until they come back: two seconds
+        # each, rather than ten in the same second and nothing afterwards.
+        addons.THROTTLE.observe({"x-ratelimit-remaining": "10",
+                                 "x-ratelimit-reset": str(self.now[0] + 20)})
+        self.assertEqual(addons.THROTTLE.gap(), 2.0)
+
+    def test_the_gap_is_capped_so_a_run_never_looks_hung(self):
+        addons.THROTTLE.observe({"x-ratelimit-remaining": "1",
+                                 "x-ratelimit-reset": str(self.now[0] + 3600)})
+        self.assertEqual(addons.THROTTLE.gap(), addons.GITHUB_MAX_GAP)
+
+    def test_a_wait_worth_noticing_is_announced(self):
+        said = []
+        addons.set_wait_hook(lambda seconds, why: said.append((seconds, why)))
+        addons.THROTTLE.observe({"x-ratelimit-remaining": "1",
+                                 "x-ratelimit-reset": str(self.now[0] + 3600)})
+        addons.THROTTLE.wait_turn()
+        addons.THROTTLE.wait_turn()
+        self.assertEqual(len(said), 1)
+        self.assertEqual(said[0][0], addons.GITHUB_MAX_GAP)
+
+    def test_a_quarter_second_is_not_worth_announcing(self):
+        said = []
+        addons.set_wait_hook(lambda seconds, why: said.append(seconds))
+        addons.THROTTLE.wait_turn()
+        addons.THROTTLE.wait_turn()
+        self.assertEqual(said, [])
+
+    # -- not spending calls twice --------------------------------------------
+
+    def test_the_same_question_is_only_asked_once(self):
+        # Two addons out of one repository ask for the same default branch. The
+        # second answer is already in hand; buying it again costs quota that
+        # the addon after them then does not have.
+        self.urlopen([FakeResponse(b'{"default_branch": "main"}',
+                                   {"x-ratelimit-remaining": "58"})])
+        url = "https://api.github.com/repos/o/r"
+        self.assertEqual(addons.http_json(url), {"default_branch": "main"})
+        self.assertEqual(addons.http_json(url), {"default_branch": "main"})
+        self.assertEqual(len(self.asked), 1)
+
+    def test_a_404_is_remembered_as_an_answer(self):
+        # "This repo publishes no releases" is asked once per addon and is a
+        # perfectly good thing to know without asking twice.
+        missing = urllib.error.HTTPError("http://x", 404, "Not Found", {}, io.BytesIO(b"{}"))
+        self.urlopen([missing])
+        url = "https://api.github.com/repos/o/r/releases/latest"
+        self.assertIsNone(addons.http_json(url))
+        self.assertIsNone(addons.http_json(url))
+        self.assertEqual(len(self.asked), 1)
+
+    def test_a_stale_answer_is_asked_again(self):
+        self.urlopen([FakeResponse(b'{"default_branch": "main"}', {})])
+        url = "https://api.github.com/repos/o/r"
+        addons.http_json(url)
+        self.assertIsNot(addons.cached(url), addons._MISS)
+        self.assertIs(
+            addons.cached(url, clock=lambda: time.time() + addons.CACHE_SECONDS + 1),
+            addons._MISS,
+        )
+
+    # -- hitting the wall ----------------------------------------------------
+
+    def test_an_exhausted_quota_is_not_asked_again(self):
+        # The point: one failure, not one per remaining addon. Forty more round
+        # trips cannot produce a different answer before the reset.
+        reset = self.now[0] + 1800
+        self.urlopen([self.limit({"x-ratelimit-remaining": "0",
+                                  "x-ratelimit-reset": str(reset)})])
+        for url in ("https://api.github.com/repos/o/one", "https://api.github.com/repos/o/two"):
+            with self.assertRaises(addons.Fail) as caught:
+                addons.http_json(url)
+            self.assertIn("rate limit", str(caught.exception).lower())
+        self.assertEqual(len(self.asked), 1)
+
+    def test_the_message_says_when_the_quota_comes_back(self):
+        reset = self.now[0] + 1800
+        expected = datetime.datetime.fromtimestamp(reset).strftime("%H:%M")
+        self.assertIn(expected, addons.rate_limit_message(reset))
+
+    def test_a_quota_that_has_come_back_is_asked_again(self):
+        addons.THROTTLE.observe({"x-ratelimit-remaining": "0",
+                                 "x-ratelimit-reset": str(self.now[0] + 10)})
+        self.assertTrue(addons.THROTTLE.spent())
+        self.now[0] += 11
+        self.assertFalse(addons.THROTTLE.spent())
+
+    def test_a_burst_limit_is_waited_out_and_retried(self):
+        # A secondary limit arrives with quota still on the clock and clears in
+        # about a minute, so waiting is the whole fix -- and failing the addon
+        # instead would be failing it for being one of several in a row.
+        burst = self.limit({"retry-after": "5", "x-ratelimit-remaining": "42"},
+                           "You have exceeded a secondary rate limit")
+        self.urlopen([burst, FakeResponse(b'{"default_branch": "main"}', {})])
+        self.assertEqual(addons.http_json("https://api.github.com/repos/o/r"),
+                         {"default_branch": "main"})
+        self.assertIn(5.0, self.slept)
+        self.assertEqual(len(self.asked), 2)
+
+    def test_an_hour_long_limit_is_not_waited_out(self):
+        # Sitting in front of a frozen window for forty minutes is worse than
+        # being told to come back later.
+        self.urlopen([self.limit({"x-ratelimit-remaining": "0",
+                                  "x-ratelimit-reset": str(self.now[0] + 2400)})])
+        with self.assertRaises(addons.Fail):
+            addons.http_json("https://api.github.com/repos/o/r")
+        self.assertEqual(self.slept, [])
+        self.assertEqual(len(self.asked), 1)
+
+    def test_a_forbidden_with_quota_left_still_says_what_github_said(self):
+        # The pacing must not swallow the case it was never about.
+        self.urlopen([self.limit({"x-ratelimit-remaining": "4999"},
+                                 "GitHub access is not enabled for this session.")])
+        with self.assertRaises(addons.Fail) as caught:
+            addons.http_json("https://api.github.com/repos/o/r")
+        self.assertIn("not enabled for this session", str(caught.exception))
+        self.assertNotIn("rate limit", str(caught.exception).lower())
+
+
+    # -- archives count too --------------------------------------------------
+
+    def test_a_zipball_is_paced_like_any_other_call(self):
+        # It comes out of the same hourly quota as the version check that
+        # found it, so pacing the checks and not the downloads would leave the
+        # bigger half of a thirty-addon update unaccounted for.
+        self.urlopen([FakeResponse(b"PK\x03\x04", {"x-ratelimit-remaining": "40"})])
+        addons.download("https://api.github.com/repos/o/r/zipball/main")
+        addons.download("https://api.github.com/repos/o/r/zipball/main")
+        self.assertEqual(self.slept, [addons.GITHUB_MIN_GAP])
+
+    def test_a_release_asset_is_fetched_at_full_speed(self):
+        # Served from GitHub's downloads host, not the API: no quota, no pause.
+        self.urlopen([FakeResponse(b"PK\x03\x04")])
+        addons.download("https://github.com/o/r/releases/download/v1/MyAddon.zip")
+        addons.download("https://github.com/o/r/releases/download/v1/MyAddon.zip")
+        self.assertEqual(self.slept, [])
+
+    def test_an_exhausted_quota_stops_the_downloads_too(self):
+        addons.THROTTLE.observe({"x-ratelimit-remaining": "0",
+                                 "x-ratelimit-reset": str(self.now[0] + 1800)})
+        self.urlopen([FakeResponse(b"PK\x03\x04")])
+        with self.assertRaises(addons.Fail) as caught:
+            addons.download("https://api.github.com/repos/o/r/zipball/main")
+        self.assertIn("rate limit", str(caught.exception).lower())
+        self.assertEqual(self.asked, [])
+
+
+class BoundAddonsComeFirst(unittest.TestCase):
+    """The list is read to find the addons this tool maintains, so those lead.
+
+    On a real install most rows are unmanaged, and alphabetical order buries
+    the six that matter among fifty that do not.
+    """
+
+    def order(self, **entries):
+        return addons.display_order(entries)
+
+    def test_sourced_addons_lead_the_list(self):
+        self.assertEqual(
+            self.order(
+                Zulu={"source": "github:o/r"},
+                Alpha={"source": "unmanaged"},
+                Bravo={"source": "local:/somewhere"},
+            ),
+            ["Bravo", "Zulu", "Alpha"],
+        )
+
+    def test_each_group_is_still_alphabetical(self):
+        self.assertEqual(
+            self.order(
+                delta={"source": "github:o/d"},
+                Charlie={"source": "github:o/c"},
+                zulu={"source": "unmanaged"},
+                Alpha={"source": "unmanaged"},
+            ),
+            ["Charlie", "delta", "Alpha", "zulu"],
+        )
+
+    def test_a_suggestion_is_not_a_source(self):
+        # A .toc header is the author's claim about where the code lives, not
+        # this user's decision to install from there -- the row is still loose.
+        self.assertEqual(
+            self.order(
+                Bound={"source": "github:o/r"},
+                Suggested={"source": "unmanaged", "suggested": "github:o/s"},
+            ),
+            ["Bound", "Suggested"],
+        )
+
+    def test_an_entry_with_no_source_field_counts_as_loose(self):
+        self.assertEqual(
+            self.order(Aaa={}, Zzz={"source": "github:o/r"}),
+            ["Zzz", "Aaa"],
+        )
+
+    def test_an_empty_list_is_empty(self):
+        self.assertEqual(self.order(), [])
