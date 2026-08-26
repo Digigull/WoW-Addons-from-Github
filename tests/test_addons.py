@@ -485,11 +485,11 @@ class WhereTheManifestLives(unittest.TestCase):
             try:
                 addons.MANIFEST = tmp / "new.json"
                 addons.LEGACY_WINDOWS_MANIFEST = legacy
-                self.assertEqual(addons.load(windows=True)["addons_dir"], "/old/place")
+                self.assertEqual(addons.current(addons.load(windows=True))["addons_dir"], "/old/place")
 
                 # And once something is written to the new place, that wins.
                 addons.MANIFEST.write_text('{"addons_dir": "/new/place", "addons": {}}')
-                self.assertEqual(addons.load(windows=True)["addons_dir"], "/new/place")
+                self.assertEqual(addons.current(addons.load(windows=True))["addons_dir"], "/new/place")
             finally:
                 addons.MANIFEST, addons.LEGACY_WINDOWS_MANIFEST = new, old_legacy
 
@@ -502,7 +502,7 @@ class WhereTheManifestLives(unittest.TestCase):
             try:
                 addons.MANIFEST = tmp / "new.json"
                 addons.LEGACY_WINDOWS_MANIFEST = legacy
-                self.assertIsNone(addons.load(windows=False)["addons_dir"])
+                self.assertIsNone(addons.current(addons.load(windows=False))["addons_dir"])
             finally:
                 addons.MANIFEST, addons.LEGACY_WINDOWS_MANIFEST = new, old_legacy
 
@@ -644,15 +644,22 @@ class PastingARepoAddress(unittest.TestCase):
 
     def test_the_shapes_people_actually_paste(self):
         for text, expected in [
-            ("tullamods/Bagnon", ("tullamods/Bagnon", None)),
-            ("https://github.com/tullamods/Bagnon", ("tullamods/Bagnon", None)),
-            ("https://github.com/tullamods/Bagnon/", ("tullamods/Bagnon", None)),
-            ("https://github.com/tullamods/Bagnon.git", ("tullamods/Bagnon", None)),
-            ("http://www.github.com/tullamods/Bagnon", ("tullamods/Bagnon", None)),
-            ("github.com/tullamods/Bagnon", ("tullamods/Bagnon", None)),
-            ("git@github.com:tullamods/Bagnon.git", ("tullamods/Bagnon", None)),
-            ("  https://github.com/tullamods/Bagnon  ", ("tullamods/Bagnon", None)),
-            ("https://github.com/tullamods/Bagnon#readme", ("tullamods/Bagnon", None)),
+            ("tullamods/Bagnon", ("tullamods/Bagnon", None, None)),
+            ("https://github.com/tullamods/Bagnon", ("tullamods/Bagnon", None, None)),
+            ("https://github.com/tullamods/Bagnon/", ("tullamods/Bagnon", None, None)),
+            ("https://github.com/tullamods/Bagnon.git", ("tullamods/Bagnon", None, None)),
+            ("http://www.github.com/tullamods/Bagnon", ("tullamods/Bagnon", None, None)),
+            ("github.com/tullamods/Bagnon", ("tullamods/Bagnon", None, None)),
+            ("git@github.com:tullamods/Bagnon.git", ("tullamods/Bagnon", None, None)),
+            ("  https://github.com/tullamods/Bagnon  ", ("tullamods/Bagnon", None, None)),
+            ("https://github.com/tullamods/Bagnon#readme", ("tullamods/Bagnon", None, None)),
+            # A repo of several addons: the folder you clicked into IS the
+            # statement of which addon you mean, and it is what gets pasted.
+            ("https://github.com/Digigull/Ascension-Custom-Addons/tree/main/AscensionHonorTracker",
+             ("Digigull/Ascension-Custom-Addons", "main", "AscensionHonorTracker")),
+            ("https://github.com/o/r/tree/main/Nested/Deep/Addon/",
+             ("o/r", "main", "Nested/Deep/Addon")),
+            ("o/r#OneAddon", ("o/r", None, "OneAddon")),
         ]:
             with self.subTest(text=text):
                 self.assertEqual(addons.parse_repo(text), expected)
@@ -660,8 +667,8 @@ class PastingARepoAddress(unittest.TestCase):
     def test_a_branch_in_the_url_is_kept(self):
         # Somebody browsing a branch and copying the address means that branch.
         self.assertEqual(addons.parse_repo("https://github.com/Questie/Questie/tree/develop"),
-                         ("Questie/Questie", "develop"))
-        self.assertEqual(addons.parse_repo("https://github.com/o/r/blob/main"), ("o/r", "main"))
+                         ("Questie/Questie", "develop", None))
+        self.assertEqual(addons.parse_repo("https://github.com/o/r/blob/main"), ("o/r", "main", None))
 
     def test_things_that_are_not_a_github_repo_are_refused(self):
         # Refused, not mangled: storing a CurseForge page as owner/repo would
@@ -684,3 +691,590 @@ class PastingARepoAddress(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# A repository holding several unrelated addons -- one commit history, nine
+# addons, no releases. Every assumption below was checked against a real one:
+# Digigull/Ascension-Custom-Addons, which is where these bugs were found.
+MONOREPO = {
+    "Ascension-Custom-Addons-1a2b3c/AscensionHonorTracker/AscensionHonorTracker.toc": "a",
+    "Ascension-Custom-Addons-1a2b3c/GnomeWorks/GnomeWorks.toc": "b",
+    "Ascension-Custom-Addons-1a2b3c/TurboPlates/TurboPlates.toc": "c",
+    "Ascension-Custom-Addons-1a2b3c/README.md": "docs",
+}
+
+
+class OneAddonOutOfMany(unittest.TestCase):
+    """Binding an addon to one folder of a repository that holds several.
+
+    Without this, binding a single addon to such a repo installs all of them,
+    and the entry then claims every one of their folders as its own. Both
+    halves cause damage, and the second one destroyed a file during testing.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_only_the_bound_folder_is_installed(self):
+        written = addons.install_zip(mkzip(MONOREPO), self.root, dry_run=False,
+                                     only="AscensionHonorTracker")
+        self.assertEqual(written, ["AscensionHonorTracker"])
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()),
+                         ["AscensionHonorTracker"])
+
+    def test_without_a_folder_the_whole_lot_still_installs(self):
+        # The existing behaviour, kept: an addon that ships its own library
+        # depends on it, and most repos hold exactly one addon anyway.
+        written = addons.install_zip(mkzip(MONOREPO), self.root, dry_run=False)
+        self.assertEqual(written,
+                         ["AscensionHonorTracker", "GnomeWorks", "TurboPlates"])
+
+    def test_a_folder_that_is_not_there_is_refused_by_name(self):
+        with self.assertRaises(addons.Fail) as caught:
+            addons.install_zip(mkzip(MONOREPO), self.root, False, only="Nonexistent")
+        self.assertIn("Nonexistent", str(caught.exception))
+
+    def test_a_folder_this_tool_did_not_write_is_kept(self):
+        """The bug that deleted a file, reduced to its shape.
+
+        Bind one addon of a repo that holds three. The entry records the folder
+        it installed. A different addon from that same repo is then put there by
+        hand -- and the next update must not treat it as one of ours just
+        because the same archive happens to contain a folder by that name.
+
+        This used to decide once, from the entry, and apply that answer to every
+        folder the archive landed.
+        """
+        entry = {"backup": True, "installed": "v1", "folders": ["AscensionHonorTracker"]}
+        mine = self.root / "GnomeWorks"
+        mine.mkdir()
+        (mine / "GnomeWorks.toc").write_text("mine")
+        (mine / "my_edit.lua").write_text("an afternoon's work")
+
+        addons.install_zip(mkzip(MONOREPO), self.root, False, backup=True, entry=entry)
+
+        kept = self.root / "GnomeWorks.replaced" / "my_edit.lua"
+        self.assertTrue(kept.is_file(), "a folder this tool never installed was destroyed")
+        self.assertEqual(kept.read_text(), "an afternoon's work")
+
+    def test_a_folder_this_tool_did_write_is_replaced_without_piling_up(self):
+        # The other half of the same rule: our own folder is replaced directly,
+        # or .replaced2, .replaced3 accumulate on every update.
+        entry = {"backup": True, "installed": "v1", "folders": ["AscensionHonorTracker"]}
+        addons.install_zip(mkzip(MONOREPO), self.root, False, backup=True, entry=entry,
+                           only="AscensionHonorTracker")
+        addons.install_zip(mkzip(MONOREPO), self.root, False, backup=True, entry=entry,
+                           only="AscensionHonorTracker")
+        self.assertEqual([p.name for p in self.root.glob("*.replaced*")], [])
+
+    def test_should_backup_folder_answers_per_folder(self):
+        entry = {"backup": True, "installed": "v1", "folders": ["Mine"]}
+        self.assertFalse(addons.should_backup_folder(entry, "Mine"))
+        self.assertTrue(addons.should_backup_folder(entry, "Theirs"))
+        # Nothing installed yet: the folder is the user's whatever it is called.
+        self.assertTrue(addons.should_backup_folder({"folders": ["Mine"]}, "Mine"))
+        # And an explicit no still means no.
+        self.assertFalse(addons.should_backup_folder({"backup": False}, "Anything"))
+
+
+class VersionFollowsTheFolder(unittest.TestCase):
+    """A mono-repo's HEAD moves when any addon in it changes.
+
+    Versioning an addon by the repository reports an update for all nine every
+    time one of them is touched. An "update available" that is usually wrong is
+    worse than no column at all, because people stop reading it.
+    """
+
+    def setUp(self):
+        self.responses = {}
+        self._real = addons.http_json
+        addons.http_json = lambda url: self.responses.get(url)
+        self.addCleanup(lambda: setattr(addons, "http_json", self._real))
+        self.repo = "https://api.github.com/repos/o/r"
+
+    def test_the_version_is_the_last_commit_touching_that_folder(self):
+        self.responses[self.repo] = {"default_branch": "main"}
+        self.responses[f"{self.repo}/commits?sha=main&path=HonorTracker&per_page=1"] = [
+            {"sha": "9ba7d5f00000000"}
+        ]
+        version, url = addons.latest_github("o/r#HonorTracker")
+        self.assertEqual(version, "9ba7d5f00000")
+        self.assertIn("/zipball/main", url)
+
+    def test_two_folders_in_one_repo_get_different_versions(self):
+        self.responses[self.repo] = {"default_branch": "main"}
+        self.responses[f"{self.repo}/commits?sha=main&path=A&per_page=1"] = [{"sha": "aaaaaaaaaaaa"}]
+        self.responses[f"{self.repo}/commits?sha=main&path=B&per_page=1"] = [{"sha": "bbbbbbbbbbbb"}]
+        self.assertNotEqual(addons.latest_github("o/r#A")[0], addons.latest_github("o/r#B")[0])
+
+    def test_a_named_folder_is_not_overruled_by_a_release(self):
+        # A release asset is packaged for one addon; nothing says its contents
+        # line up with a path in the source tree, so honouring both would mean
+        # guessing which the user meant.
+        self.responses[f"{self.repo}/releases/latest"] = {
+            "tag_name": "v9.9", "zipball_url": "z", "assets": [],
+        }
+        self.responses[self.repo] = {"default_branch": "main"}
+        self.responses[f"{self.repo}/commits?sha=main&path=A&per_page=1"] = [{"sha": "cccccccccccc"}]
+        self.assertEqual(addons.latest_github("o/r#A")[0], "cccccccccccc")
+
+    def test_a_branch_and_a_folder_together(self):
+        self.responses[f"{self.repo}/commits?sha=dev&path=A&per_page=1"] = [{"sha": "dddddddddddd"}]
+        version, url = addons.latest_github("o/r@dev#A")
+        self.assertEqual(version, "dddddddddddd")
+        self.assertIn("/zipball/dev", url)
+
+    def test_a_folder_nothing_ever_touched_is_reported(self):
+        self.responses[self.repo] = {"default_branch": "main"}
+        self.responses[f"{self.repo}/commits?sha=main&path=Typo&per_page=1"] = []
+        with self.assertRaises(addons.Fail) as caught:
+            addons.latest_github("o/r#Typo")
+        self.assertIn("Typo", str(caught.exception))
+
+
+class RepoLayoutsThatUsedToBeMissed(unittest.TestCase):
+    """Addons are not always at the top of the tree."""
+
+    def install(self, files, **kw):
+        with tempfile.TemporaryDirectory() as tmp:
+            return addons.install_zip(mkzip(files), pathlib.Path(tmp), dry_run=True, **kw)
+
+    def test_an_addon_under_src_beside_docs(self):
+        # Nothing recognisable at the top and more than one way down, so the
+        # old search gave up and reported "no addon folder found".
+        self.assertEqual(
+            self.install({"r-1a2b/src/MyAddon/MyAddon.toc": "x", "r-1a2b/docs/readme.md": "y"}),
+            ["MyAddon"],
+        )
+
+    def test_a_dot_directory_is_not_searched(self):
+        self.assertEqual(
+            self.install({"r-1a2b/MyAddon/MyAddon.toc": "x",
+                          "r-1a2b/.github/workflows/ci.yml": "y"}),
+            ["MyAddon"],
+        )
+
+    def test_bundled_libraries_do_not_become_the_addon(self):
+        # An addon shipping Libs/AceGUI-3.0/AceGUI-3.0.toc must install as
+        # MyAddon, not as its own libraries. This is why the deeper search is
+        # a last resort and bounded rather than a full walk.
+        self.assertEqual(
+            self.install({"r-1a2b/MyAddon/MyAddon.toc": "x",
+                          "r-1a2b/MyAddon/Libs/AceGUI-3.0/AceGUI-3.0.toc": "y"}),
+            ["MyAddon"],
+        )
+
+
+class SourcesNamingAFolder(unittest.TestCase):
+    def test_a_folder_url_is_what_people_will_paste(self):
+        # Clicking into one addon of several on github.com and copying the
+        # address is the clearest statement of which addon is meant.
+        self.assertEqual(
+            addons.parse_repo("https://github.com/o/r/tree/main/HonorTracker"),
+            ("o/r", "main", "HonorTracker"),
+        )
+
+    def test_it_round_trips_through_set_source(self):
+        state = {"addons": {}}
+        entry, _ = addons.set_source(
+            state, "HonorTracker",
+            "github:https://github.com/o/r/tree/main/HonorTracker",
+        )
+        self.assertEqual(entry["source"], "github:o/r@main#HonorTracker")
+        self.assertEqual(addons.split_repo_spec("o/r@main#HonorTracker"),
+                         ("o/r", "main", "HonorTracker"))
+
+    def test_an_ssh_url_is_not_split_on_its_own_at_sign(self):
+        # git@github.com:o/r used to split into repo "git", branch
+        # "github.com:o/r", because the "@" was taken before the URL was read.
+        state = {"addons": {}}
+        entry, _ = addons.set_source(state, "Bagnon", "git@github.com:tullamods/Bagnon.git")
+        self.assertEqual(entry["source"], "github:tullamods/Bagnon")
+
+    def test_the_folder_is_split_before_the_branch(self):
+        # A branch may not contain "#", but a path may well contain "@".
+        self.assertEqual(addons.split_repo_spec("o/r#weird@name"), ("o/r", None, "weird@name"))
+
+
+class UpdatingOneAddonOfManyEndToEnd(unittest.TestCase):
+    """The whole chain, because the bug lived in how the parts were joined.
+
+    Each piece was defensible on its own: `should_backup` correctly said "this
+    tool installed this addon, replacing it loses nothing", and `install_zip`
+    correctly applied the flag it was given. The damage was that one answer
+    about one addon was handed to a loop over nine folders.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self._latest, self._download = addons.latest_github, addons.download
+        addons.latest_github = lambda spec: ("v2", "http://x/a.zip")
+        addons.download = lambda url: mkzip(MONOREPO)
+        self.addCleanup(lambda: (setattr(addons, "latest_github", self._latest),
+                                 setattr(addons, "download", self._download)))
+
+    def test_a_hand_installed_addon_survives_updating_a_neighbour(self):
+        entry = {
+            "source": "github:o/r",          # the whole repo, as it was bound
+            "installed": "v1",               # and updated once already
+            "folders": ["AscensionHonorTracker"],
+            "backup": True,
+        }
+        mine = self.root / "GnomeWorks"
+        mine.mkdir()
+        (mine / "GnomeWorks.toc").write_text("mine")
+        (mine / "my_edit.lua").write_text("an afternoon's work")
+
+        result = addons.update_addon("AscensionHonorTracker", entry, self.root)
+
+        self.assertEqual(result.outcome, addons.CHANGED, result.detail)
+        kept = self.root / "GnomeWorks.replaced" / "my_edit.lua"
+        self.assertTrue(kept.is_file(),
+                        "updating one addon destroyed a folder this tool never installed")
+
+    def test_binding_the_whole_repo_says_that_it_holds_several(self):
+        # It works, but every addon in the repo will now report an update
+        # whenever any one of them changes. Better said once than discovered.
+        entry = {"source": "github:o/r", "installed": None, "folders": [], "backup": True}
+        result = addons.update_addon("AscensionHonorTracker", entry, self.root)
+        notes = " ".join(message for _level, message in result.notes)
+        self.assertIn("3 addons", notes)
+        self.assertIn("#FolderName", notes)
+
+    def test_bound_to_a_folder_it_touches_nothing_else(self):
+        entry = {"source": "github:o/r#AscensionHonorTracker", "installed": None,
+                 "folders": [], "backup": True}
+        result = addons.update_addon("AscensionHonorTracker", entry, self.root)
+        self.assertEqual(result.folders, ["AscensionHonorTracker"])
+        self.assertEqual(entry["folders"], ["AscensionHonorTracker"])
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()),
+                         ["AscensionHonorTracker"])
+
+
+class LayoutsFromRealAscensionAddons(unittest.TestCase):
+    """Five links somebody actually handed over, reduced to their shapes.
+
+    Every one of these was checked against the real repository before being
+    written down here, because guessing at addon layouts is how the last three
+    bugs got in. The names are kept so a failure points at something findable.
+    """
+
+    def install(self, files):
+        with tempfile.TemporaryDirectory() as tmp:
+            return addons.install_zip(mkzip(files), pathlib.Path(tmp), dry_run=True)
+
+    def test_several_addons_that_ship_together(self):
+        # gerob/LootCollector: a main addon plus two companions, with bundled
+        # libraries nested inside them. The companions install; the libraries
+        # must not, or AddOns fills up with LibStub and LibBase64-1.0.
+        self.assertEqual(
+            self.install({
+                "gerob-LootCollector-1a2b3c/LootCollector/LootCollector.toc": "a",
+                "gerob-LootCollector-1a2b3c/LootCollector/Libs/LibStub/LibStub.toc": "lib",
+                "gerob-LootCollector-1a2b3c/LootCollector/Libs/LibBase64-1.0/LibBase64-1.0.toc": "lib",
+                "gerob-LootCollector-1a2b3c/LootCollector_CustomImport/LootCollector_CustomImport.toc": "b",
+                "gerob-LootCollector-1a2b3c/LootCollector_StarterDB/LootCollector_StarterDB.toc": "c",
+                "gerob-LootCollector-1a2b3c/Docs/notes.md": "d",
+            }),
+            ["LootCollector", "LootCollector_CustomImport", "LootCollector_StarterDB"],
+        )
+
+    def test_one_addon_beside_the_usual_repository_furniture(self):
+        # LaSainteChips/AscensionRaidLootCompanion: .github, docs, CHANGELOG,
+        # AGENTS.md -- none of which is an addon.
+        self.assertEqual(
+            self.install({
+                "x-1a2b3c/AscensionRaidLootCompanion/AscensionRaidLootCompanion.toc": "a",
+                "x-1a2b3c/AscensionRaidLootCompanion/Core/init.lua": "b",
+                "x-1a2b3c/docs/guide.md": "c",
+                "x-1a2b3c/.github/workflows/ci.yml": "d",
+                "x-1a2b3c/CHANGELOG.md": "e",
+            }),
+            ["AscensionRaidLootCompanion"],
+        )
+
+    def test_a_repo_whose_root_is_the_addon_with_one_toc_per_client(self):
+        """ayro-CMD/FrostSeek ships seven .toc files, one per WoW flavour.
+
+        They all belong in a single folder named FrostSeek -- the client picks
+        the .toc that matches itself. Choosing FrostSeek_Cata.toc would name the
+        folder FrostSeek_Cata, which every client would then ignore.
+        """
+        self.assertEqual(
+            self.install({
+                "ayro-CMD-FrostSeek-1a2b3c/FrostSeek.toc": "a",
+                "ayro-CMD-FrostSeek-1a2b3c/FrostSeek_Cata.toc": "b",
+                "ayro-CMD-FrostSeek-1a2b3c/FrostSeek_CataPS.toc": "c",
+                "ayro-CMD-FrostSeek-1a2b3c/FrostSeek_Mists.toc": "d",
+                "ayro-CMD-FrostSeek-1a2b3c/FrostSeek_TBC.toc": "e",
+                "ayro-CMD-FrostSeek-1a2b3c/FrostSeek_Vanilla.toc": "f",
+                "ayro-CMD-FrostSeek-1a2b3c/FrostSeek_Wrath.toc": "g",
+                "ayro-CMD-FrostSeek-1a2b3c/Core.lua": "h",
+            }),
+            ["FrostSeek"],
+        )
+
+    def test_the_addon_is_named_by_its_toc_not_by_the_repository(self):
+        """Minnona/Minn-Tinkers holds MinnTinkers.toc -- the hyphen differs.
+
+        The game loads Folder/Folder.toc and silently ignores anything else, so
+        installing this as Minn-Tinkers (or as the archive's wrapper name) would
+        produce an addon that never appears in the list and no error anywhere.
+        """
+        self.assertEqual(
+            self.install({
+                "Minnona-Minn-Tinkers-1a2b3c/MinnTinkers.toc": "a",
+                "Minnona-Minn-Tinkers-1a2b3c/Core.lua": "b",
+                "Minnona-Minn-Tinkers-1a2b3c/Modules/thing.lua": "c",
+            }),
+            ["MinnTinkers"],
+        )
+
+    def test_a_flavour_toc_does_not_win_when_it_sorts_first(self):
+        """The rule is shortest stem, not first alphabetically.
+
+        "-" sorts before ".", so Addon-Classic.toc comes first in the listing
+        and would name the folder Addon-Classic -- which no client loads. The
+        underscore form does not discriminate here, because "." sorts before
+        "_" and the base name wins by accident.
+        """
+        self.assertEqual(
+            self.install({"r-1a2b3c/Addon-Classic.toc": "a", "r-1a2b3c/Addon.toc": "b"}),
+            ["Addon"],
+        )
+
+
+class AnAccountIsNotAnAddon(unittest.TestCase):
+    """https://github.com/Ascension-Addons names no repository at all.
+
+    It is an easy thing to paste when the addons you want are published by an
+    organisation, and "not a GitHub repository" reads as though the link were
+    broken rather than as "you are one click short".
+    """
+
+    def test_an_account_page_is_recognised_as_one(self):
+        for text in ("https://github.com/Ascension-Addons",
+                     "https://github.com/Ascension-Addons/",
+                     "github.com/Ascension-Addons"):
+            with self.subTest(text=text):
+                self.assertEqual(addons.github_account(text), "Ascension-Addons")
+
+    def test_a_repository_is_not_mistaken_for_an_account(self):
+        for text in ("https://github.com/o/r", "https://github.com/o/r/tree/main/Sub",
+                     "o/r", "git@github.com:o/r.git"):
+            with self.subTest(text=text):
+                self.assertIsNone(addons.github_account(text))
+
+    def test_the_error_says_what_to_do_instead(self):
+        with self.assertRaises(addons.Fail) as caught:
+            addons.resolve_source("X", "github:https://github.com/Ascension-Addons")
+        message = str(caught.exception)
+        self.assertIn("Ascension-Addons", message)
+        self.assertIn("account", message)
+        self.assertIn("Ascension-Addons/repo-name", message)
+
+    def test_it_is_still_refused_rather_than_stored(self):
+        # Storing it as a source would produce a 404 at update time, long after
+        # the paste, with nothing pointing back at the cause.
+        self.assertIsNone(addons.parse_repo("https://github.com/Ascension-Addons"))
+
+
+class OneAddonBuiltForSeveralClients(unittest.TestCase):
+    """Four shapes a "which client?" repository takes, and what each needs.
+
+    Only one of them needs the user to choose. Getting this wrong is quiet:
+    an addon built for the wrong client is not something the game reports.
+    """
+
+    def install(self, files, **kw):
+        with tempfile.TemporaryDirectory() as tmp:
+            return addons.install_zip(mkzip(files), pathlib.Path(tmp), dry_run=True, **kw)
+
+    def test_one_toc_per_client_needs_no_choice_at_all(self):
+        # The WoW convention, and what ayro-CMD/FrostSeek does. Every flavour
+        # .toc belongs in the one folder; the client loads the one that matches
+        # itself. Splitting them would break all of them.
+        self.assertEqual(
+            self.install({
+                "r-1a2b/MyAddon.toc": "a", "r-1a2b/MyAddon_Vanilla.toc": "b",
+                "r-1a2b/MyAddon_Wrath.toc": "c", "r-1a2b/MyAddon_Cata.toc": "d",
+            }),
+            ["MyAddon"],
+        )
+
+    def test_a_folder_per_client_is_refused_rather_than_guessed(self):
+        """Wrath/MyAddon and Retail/MyAddon: sort order must not decide this.
+
+        It did, briefly, and silently: "Retail" sorts before "Wrath", so a repo
+        offering both installed the retail build on a Wrath realm with no
+        indication that a choice had even been made. Refusing and naming the
+        options is the only honest answer -- the tool cannot know which client
+        somebody plays.
+        """
+        files = {"r-1a2b/Wrath/MyAddon/MyAddon.toc": "WRATH",
+                 "r-1a2b/Retail/MyAddon/MyAddon.toc": "RETAIL"}
+        with self.assertRaises(addons.Fail) as caught:
+            self.install(files)
+        message = str(caught.exception)
+        self.assertIn("Retail", message)
+        self.assertIn("Wrath", message)
+        self.assertIn("#", message, "the message must say how to choose")
+
+    def test_naming_the_client_folder_installs_that_build(self):
+        files = {"r-1a2b/Wrath/MyAddon/MyAddon.toc": "WRATH",
+                 "r-1a2b/Retail/MyAddon/MyAddon.toc": "RETAIL"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            addons.install_zip(mkzip(files), root, False, only="Wrath")
+            self.assertEqual((root / "MyAddon" / "MyAddon.toc").read_text(), "WRATH")
+
+    def test_one_way_down_is_still_followed_without_a_choice(self):
+        # The refusal must not fire for the ordinary single-addon repo that
+        # simply keeps its addon under src/ -- there is nothing to choose.
+        self.assertEqual(
+            self.install({"r-1a2b/src/MyAddon/MyAddon.toc": "x",
+                          "r-1a2b/docs/readme.md": "y"}),
+            ["MyAddon"],
+        )
+
+
+class SeveralWoWFolders(unittest.TestCase):
+    """One person, a vanilla server, a Wrath one, maybe retail.
+
+    They share nothing. The same addon name means a different addon, possibly
+    from a different branch or a different folder of the same repository, and
+    certainly a different AddOns directory. Anything that leaks between them is
+    a bug that writes files into the wrong game.
+    """
+
+    def test_an_install_has_exactly_the_shape_the_manifest_used_to(self):
+        # This is what keeps the change small: every function that took the old
+        # state and reached for addons or addons_dir now takes one install and
+        # is otherwise untouched.
+        self.assertEqual(sorted(addons.blank_install()), ["addons", "addons_dir"])
+
+    def test_an_old_manifest_becomes_one_install_named_after_its_folder(self):
+        old = {"addons_dir": "/home/me/Games/Ascension/Interface/AddOns",
+               "addons": {"Bagnon": {"source": "github:o/r"}}}
+        new = addons.migrate(old)
+        self.assertEqual(list(new["installs"]), ["Ascension"])
+        self.assertEqual(new["current"], "Ascension")
+        self.assertEqual(addons.current(new)["addons"]["Bagnon"]["source"], "github:o/r")
+
+    def test_migrating_is_not_repeated_on_an_already_migrated_manifest(self):
+        once = addons.migrate({"addons_dir": "/w/Interface/AddOns", "addons": {}})
+        self.assertEqual(addons.migrate(once), once)
+
+    def test_a_manifest_that_never_reached_init_gets_no_phantom_install(self):
+        # Filing an empty placeholder under a name would leave it in the list
+        # forever, and the first real install would arrive as the second entry.
+        self.assertEqual(addons.migrate(addons.blank_install())["installs"], {})
+
+    def test_the_placeholder_is_swept_up_when_a_real_one_arrives(self):
+        state = {"installs": {"default": addons.blank_install()}, "current": "default"}
+        addons.add_install(state, pathlib.Path("/games/Wrath/Interface/AddOns"))
+        self.assertEqual(list(state["installs"]), ["Wrath"])
+
+    def test_naming_an_install_after_its_folder_skips_interface_and_addons(self):
+        for directory, expected in [
+            ("/games/Ascension/Interface/AddOns", "Ascension"),
+            ("/games/Vanilla/Interface/addons", "Vanilla"),
+            ("/games/Wrath", "Wrath"),
+        ]:
+            with self.subTest(directory=directory):
+                self.assertEqual(addons.install_name_for(directory), expected)
+
+    def test_two_installs_of_the_same_name_do_not_collide(self):
+        self.assertEqual(
+            addons.install_name_for("/elsewhere/Wrath/Interface/AddOns", taken={"Wrath"}),
+            "Wrath (2)",
+        )
+
+    def test_the_same_addon_can_be_bound_differently_in_each(self):
+        """The whole point of this. A shared addon name, two different sources.
+
+        Ascension is a Wrath-based realm; another server may be vanilla. The
+        same repository can hold a build for each, and binding one must say
+        nothing about the other.
+        """
+        state = {"installs": {}}
+        addons.add_install(state, pathlib.Path("/games/Vanilla/Interface/AddOns"))
+        addons.set_source(addons.current(state), "Shared", "github:o/r#Vanilla")
+        addons.add_install(state, pathlib.Path("/games/Wrath/Interface/AddOns"))
+        addons.set_source(addons.current(state), "Shared", "github:o/r#Wrath")
+
+        self.assertEqual(addons.pick(state, "Vanilla")["addons"]["Shared"]["source"],
+                         "github:o/r#Vanilla")
+        self.assertEqual(addons.pick(state, "Wrath")["addons"]["Shared"]["source"],
+                         "github:o/r#Wrath")
+
+    def test_pick_does_not_change_which_install_is_current(self):
+        # --install aims one run elsewhere. It would be a nasty surprise if it
+        # quietly left every later command pointed at the other game.
+        state = {"installs": {}}
+        addons.add_install(state, pathlib.Path("/games/Vanilla/Interface/AddOns"))
+        addons.add_install(state, pathlib.Path("/games/Wrath/Interface/AddOns"))
+        addons.pick(state, "Vanilla")
+        self.assertEqual(addons.current_name(state), "Wrath")
+
+    def test_use_does_change_it(self):
+        state = {"installs": {}}
+        addons.add_install(state, pathlib.Path("/games/Vanilla/Interface/AddOns"))
+        addons.add_install(state, pathlib.Path("/games/Wrath/Interface/AddOns"))
+        addons.use(state, "Vanilla")
+        self.assertEqual(addons.current_name(state), "Vanilla")
+
+    def test_an_unknown_install_is_refused_with_the_list(self):
+        state = {"installs": {}}
+        addons.add_install(state, pathlib.Path("/games/Wrath/Interface/AddOns"))
+        with self.assertRaises(addons.Fail) as caught:
+            addons.pick(state, "Typo")
+        self.assertIn("Wrath", str(caught.exception))
+
+    def test_pointing_init_at_the_same_folder_twice_is_an_update(self):
+        # Re-running init after moving the game must not leave two entries
+        # racing to manage one directory.
+        state = {"installs": {}}
+        first = addons.add_install(state, pathlib.Path("/games/Wrath/Interface/AddOns"))
+        again = addons.add_install(state, pathlib.Path("/games/Wrath/Interface/AddOns"))
+        self.assertEqual(first, again)
+        self.assertEqual(len(state["installs"]), 1)
+
+    def test_forgetting_one_moves_current_somewhere_real(self):
+        state = {"installs": {}}
+        addons.add_install(state, pathlib.Path("/games/Vanilla/Interface/AddOns"))
+        addons.add_install(state, pathlib.Path("/games/Wrath/Interface/AddOns"))
+        addons.forget_install(state, "Wrath")
+        self.assertEqual(addons.current_name(state), "Vanilla")
+        self.assertNotIn("Wrath", state["installs"])
+
+    def test_current_is_stable_when_the_record_is_unclear(self):
+        # An arbitrary answer here would update a different WoW folder than the
+        # last run did, which is how files land in the wrong game.
+        state = {"installs": {"Wrath": addons.blank_install(),
+                              "Vanilla": addons.blank_install()},
+                 "current": "gone"}
+        self.assertEqual(addons.current_name(state), "Vanilla")
+        self.assertEqual(addons.current_name(state), "Vanilla")
+
+    def test_handing_the_whole_manifest_to_an_install_function_is_an_error(self):
+        """An install and the old manifest are the same shape, so this is easy.
+
+        Quiet, too: setdefault("addons", {}) on a manifest writes the binding
+        into a top-level key nothing reads, and the addon looks bound and never
+        updates. A TypeError stops a test dead instead.
+        """
+        state = addons.migrate(addons.blank_install())
+        for call in (
+            lambda: addons.set_source(state, "A", "unmanaged"),
+            lambda: addons.accept_suggestions(state),
+            lambda: addons.addons_dir(state),
+            lambda: addons.rescan(state, pathlib.Path(".")),
+        ):
+            with self.subTest(call=call):
+                with self.assertRaises(TypeError):
+                    call()

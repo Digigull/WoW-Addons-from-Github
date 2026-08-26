@@ -26,6 +26,7 @@ import stat
 import subprocess
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field
@@ -89,12 +90,190 @@ def manifest_to_read(windows: bool | None = None) -> Path:
     return LEGACY_WINDOWS_MANIFEST if LEGACY_WINDOWS_MANIFEST.exists() else MANIFEST
 
 
+# ── installs ─────────────────────────────────────────────────────────────────
+# One person can have several WoW folders: a vanilla server, a Wrath one,
+# retail. They share nothing -- different AddOns directories, and an addon
+# bound in one says nothing about the same addon in another, which may want a
+# different branch or a different folder of the same repository entirely.
+#
+# So the manifest holds several INSTALLS, and an install has exactly the shape
+# the whole manifest used to have:
+#
+#     {"addons_dir": "...", "addons": {name: entry}}
+#
+# That is deliberate and it is why this change is small: every function that
+# took the old state and reached for `addons` or `addons_dir` now takes one
+# install and is otherwise untouched. The outer manifest is a new, thin layer
+# above them.
+
+MANIFEST_VERSION = 2
+
+
+def blank_install() -> dict:
+    return {"addons_dir": None, "addons": {}}
+
+
+def is_empty_install(install: dict) -> bool:
+    """Nothing pointed at and nothing recorded -- a placeholder, not an install."""
+    return not install.get("addons_dir") and not install.get("addons")
+
+
+def install_name_for(directory: str | None, taken=()) -> str:
+    """A name to file an install under, from its folder.
+
+    `.../Ascension/Interface/AddOns` becomes "Ascension" -- the folder people
+    already call the install by, so nobody has to invent a label to get started.
+    """
+    name = "default"
+    if directory:
+        parts = [p for p in Path(directory).parts if p not in ("/", "\\")]
+        skip = {"addons", "interface"}
+        meaningful = [p for p in parts if p.lower() not in skip]
+        if meaningful:
+            name = meaningful[-1]
+    candidate, counter = name, 1
+    while candidate in taken:
+        counter += 1
+        candidate = f"{name} ({counter})"
+    return candidate
+
+
+def migrate(state: dict) -> dict:
+    """Bring a manifest written before installs existed up to date.
+
+    Read-time only, and non-destructive: the file on disk is not rewritten
+    until something else saves it, so an older build reading the same manifest
+    keeps working right up until this one writes.
+    """
+    if "installs" in state:
+        return state
+    install = {
+        "addons_dir": state.get("addons_dir"),
+        "addons": state.get("addons", {}),
+    }
+    if is_empty_install(install):
+        # A manifest that never got as far as `init`. Filing that under a name
+        # would leave a phantom install in the list forever, and the first real
+        # one would arrive as the second entry.
+        return {"version": MANIFEST_VERSION, "installs": {}}
+    name = install_name_for(install["addons_dir"])
+    return {"version": MANIFEST_VERSION, "current": name, "installs": {name: install}}
+
+
+def one_install(install: dict, called: str) -> dict:
+    """Guard against being handed the whole manifest instead of one install.
+
+    An install and the old whole-manifest shape are deliberately identical, so
+    the mistake is easy and, worse, quiet: `set_source(state, ...)` on a
+    manifest would `setdefault("addons", {})` at the top level and write the
+    binding into a key nothing ever reads again. The addon would appear to have
+    been bound and would never update.
+
+    A TypeError rather than a Fail: this is a contract violation in calling
+    code, not something a user did, and it should stop a test dead rather than
+    be reported in a status bar.
+    """
+    if "installs" in install:
+        raise TypeError(
+            f"{called}() takes one install, not the whole manifest; "
+            "pass core.current(state) or core.pick(state, name)"
+        )
+    return install
+
+
+def installs(state: dict) -> dict:
+    return state.setdefault("installs", {})
+
+
+def current_name(state: dict) -> str:
+    """The install commands act on, chosen stably when the record is unclear.
+
+    Falls back to the first install by name rather than to whatever a dict
+    happens to yield first: an arbitrary answer here would silently update a
+    different WoW folder than the last run did.
+    """
+    known = installs(state)
+    name = state.get("current")
+    if name in known:
+        return name
+    if known:
+        return sorted(known)[0]
+    name = name or "default"
+    known[name] = blank_install()
+    state["current"] = name
+    return name
+
+
+def current(state: dict) -> dict:
+    """The install to act on. Every command works through this."""
+    return installs(state).setdefault(current_name(state), blank_install())
+
+
+def pick(state: dict, name: str) -> dict:
+    """One install by name, without changing which one is current.
+
+    `--install` targets a command at another WoW folder for that one run. It
+    would be a nasty surprise if a single `--install Wrath update` quietly left
+    every later command pointed at Wrath.
+    """
+    known = installs(state)
+    if name not in known:
+        options = ", ".join(sorted(known)) or "none yet"
+        die(f"no install called '{name}'. There is: {options}")
+    return known[name]
+
+
+def use(state: dict, name: str) -> dict:
+    """Switch which install is current, and mean it -- the caller saves."""
+    install = pick(state, name)
+    state["current"] = name
+    return install
+
+
+def add_install(state: dict, directory: Path, name: str | None = None) -> str:
+    """Remember another WoW folder, and switch to it. Returns its name.
+
+    Pointing an existing install at the same folder again is an update, not a
+    duplicate: re-running init after moving the game should not leave two
+    entries racing to manage one directory.
+    """
+    known = installs(state)
+    target = str(directory)
+    for existing, install in known.items():
+        if install.get("addons_dir") == target and (name is None or name == existing):
+            state["current"] = existing
+            return existing
+    name = name or install_name_for(target, taken=known)
+    if name in known:
+        known[name]["addons_dir"] = target
+    else:
+        known[name] = {"addons_dir": target, "addons": {}}
+    # Sweep up any placeholder a bare `load` left behind, so the list shows the
+    # WoW folders somebody actually has and nothing else.
+    for empty in [n for n, i in known.items() if n != name and is_empty_install(i)]:
+        del known[empty]
+    state["current"] = name
+    return name
+
+
+def forget_install(state: dict, name: str) -> None:
+    """Stop tracking one install. Touches no files in the game folder."""
+    known = installs(state)
+    if name not in known:
+        die(f"no install called '{name}'")
+    del known[name]
+    if state.get("current") == name:
+        state.pop("current", None)
+        if known:
+            state["current"] = sorted(known)[0]
+
+
 def load(windows: bool | None = None) -> dict:
     path = manifest_to_read(windows)
     if not path.exists():
-        return {"addons_dir": None, "addons": {}}
+        return migrate(blank_install())
     try:
-        return json.loads(path.read_text())
+        return migrate(json.loads(path.read_text()))
     except json.JSONDecodeError as exc:
         die(f"manifest is not valid JSON ({exc}). Fix or delete {path}")
 
@@ -108,7 +287,9 @@ def save(state: dict) -> None:
     tmp.replace(MANIFEST)
 
 
-def addons_dir(state: dict) -> Path:
+def addons_dir(install: dict) -> Path:
+    """The AddOns folder of one install -- not of the manifest as a whole."""
+    state = one_install(install, "addons_dir")
     if not state.get("addons_dir"):
         die("no WoW folder set yet. Run:  addons.py init /path/to/your/wow/folder")
     path = Path(state["addons_dir"])
@@ -274,6 +455,7 @@ def rescan(state: dict, root: Path) -> tuple[int, int]:
     Does not save -- the caller decides when to write, which matters for a GUI
     that may want to scan speculatively.
     """
+    one_install(state, "rescan")
     installed = scan_installed(root)
     entries = state.setdefault("addons", {})
 
@@ -313,16 +495,20 @@ REPO_URL = re.compile(
          (?:www\.)?github\.com[/:]                    # the host
          (?P<owner>[\w.-]+)/(?P<repo>[\w.-]+?)         # the part that matters
          (?:\.git)?                                    # clone URLs end this way
-         (?:/(?:tree|blob)/(?P<branch>[^/#?]+))?       # browsing a branch
+         (?:/(?:tree|blob)/(?P<branch>[^/#?]+)         # browsing a branch
+            (?P<folder>(?:/[^#?]*)?))?                 # ...and a folder inside it
          /*(?:[#?].*)?$                                # trailing slash, anchor, query
       """,
     re.I | re.X,
 )
-BARE_REPO = re.compile(r"^(?P<owner>[\w.-]+)/(?P<repo>[\w.-]+?)(?:\.git)?$")
+# owner/repo, optionally naming one folder inside it: owner/repo#Sub/Folder.
+BARE_REPO = re.compile(
+    r"^(?P<owner>[\w.-]+)/(?P<repo>[\w.-]+?)(?:\.git)?(?:#(?P<folder>[^#]+))?$"
+)
 
 
-def parse_repo(text: str) -> tuple[str, str | None] | None:
-    """Pull (owner/repo, branch) out of whatever the user pasted.
+def parse_repo(text: str) -> tuple[str, str | None, str | None] | None:
+    """Pull (owner/repo, branch, folder) out of whatever the user pasted.
 
     Accepts `owner/repo` and every shape of GitHub URL somebody is likely to
     have copied: the page they were looking at, the green Code button's HTTPS
@@ -332,6 +518,11 @@ def parse_repo(text: str) -> tuple[str, str | None] | None:
 
     Telling somebody who just pasted a working URL to retype it as owner/repo is
     a small insult that this tool has no reason to offer.
+
+    The folder matters for a repository holding several addons. Clicking into
+    one on github.com gives a `/tree/<branch>/<folder>` URL, and that is both
+    the obvious thing to paste and an exact statement of which addon is meant --
+    so it is read rather than discarded.
     """
     text = text.strip()
     if not text:
@@ -340,8 +531,28 @@ def parse_repo(text: str) -> tuple[str, str | None] | None:
         match = pattern.match(text)
         if match:
             found = match.groupdict()
-            return f"{found['owner']}/{found['repo']}", found.get("branch")
+            folder = (found.get("folder") or "").strip("/")
+            return f"{found['owner']}/{found['repo']}", found.get("branch"), folder or None
     return None
+
+
+ACCOUNT_URL = re.compile(
+    r"^(?:https?://)?(?:www\.)?github\.com/(?P<name>[\w.-]+)/*(?:[#?].*)?$", re.I
+)
+
+
+def github_account(text: str) -> str | None:
+    """The account name, if this is a github.com user or organisation page.
+
+    `github.com/Ascension-Addons` is a perfectly good link that names no
+    repository at all, and it is an easy thing to paste when the addons you
+    want are published by an organisation. Saying only "not a GitHub
+    repository" about it is true and unhelpful -- it reads as though the link
+    is broken, when the real answer is "open the addon you want and paste that
+    address instead".
+    """
+    match = ACCOUNT_URL.match(text.strip())
+    return match.group("name") if match else None
 
 
 def looks_like_a_repo(source: str) -> bool:
@@ -401,14 +612,32 @@ def resolve_source(addon: str, source: str) -> tuple[str, str, Path | None]:
     if kind == "github":
         # `set X github:https://github.com/o/r` is a natural thing to type once
         # the window accepts a pasted URL, so the CLI should not be pickier.
-        spec, branch = rest.split("@", 1) if "@" in rest else (rest, None)
-        found = parse_repo(spec)
-        if found is None:
-            die(f"cannot see a GitHub repository in '{spec}'.\n"
-                "     Expected owner/repo, or a github.com URL.")
-        repo, url_branch = found
-        branch = branch or url_branch
-        return f"github:{repo}@{branch}" if branch else f"github:{repo}", kind, None
+        # Whole thing first. Splitting on "@" up front used to come first and
+        # was wrong for an SSH URL, which contains one: `git@github.com:o/r`
+        # split into repo "git" and branch "github.com:o/r".
+        found = parse_repo(rest)
+        if found is not None:
+            repo, branch, folder = found
+        else:
+            spec, branch, folder = split_repo_spec(rest)
+            found = parse_repo(spec)
+            if found is None:
+                account = github_account(spec)
+                if account:
+                    die(f"'{account}' is a GitHub account, not a repository -- it may hold\n"
+                        "     many addons. Open the one you want on github.com and paste\n"
+                        f"     that address, or write it as {account}/repo-name.")
+                die(f"cannot see a GitHub repository in '{spec}'.\n"
+                    "     Expected owner/repo, or a github.com URL.")
+            repo, url_branch, url_folder = found
+            branch = branch or url_branch
+            folder = folder or url_folder
+        normalised = f"github:{repo}"
+        if branch:
+            normalised += f"@{branch}"
+        if folder:
+            normalised += f"#{folder}"
+        return normalised, kind, None
     if kind != "local":
         return source, kind, None
 
@@ -426,7 +655,7 @@ def set_source(
     state: dict, addon: str, source: str, *, copy: bool = False, backup: bool | None = None
 ) -> tuple[dict, Path | None]:
     """Bind one addon to a source. Returns (entry, local_path)."""
-    entries = state.setdefault("addons", {})
+    entries = one_install(state, "set_source").setdefault("addons", {})
     source, kind, local_path = resolve_source(addon, source)
 
     entry = entries.setdefault(addon, new_entry(addon))
@@ -441,7 +670,7 @@ def set_source(
 def accept_suggestions(state: dict) -> list[tuple[str, str]]:
     """Take every source `scan` suggested. Returns the (name, source) pairs."""
     taken = []
-    for name, entry in sorted(state.get("addons", {}).items()):
+    for name, entry in sorted(one_install(state, "accept_suggestions").get("addons", {}).items()):
         if entry.get("source") == "unmanaged" and entry.get("suggested"):
             entry["source"] = entry.pop("suggested")
             taken.append((name, entry["source"]))
@@ -493,16 +722,66 @@ def http_json(url: str) -> dict | None:
         die(f"could not reach GitHub: {exc.reason}")
 
 
-def latest_github(repo_spec: str) -> tuple[str, str]:
-    """(version, zip url) for the newest thing at owner/repo[@branch]."""
+def split_repo_spec(repo_spec: str) -> tuple[str, str | None, str | None]:
+    """'owner/repo@branch#Folder' -> ('owner/repo', 'branch', 'Folder').
+
+    The folder is split off first: a branch name may not contain '#', but a
+    path certainly may contain '@' (and nothing stops a branch containing '/'),
+    so taking them in the other order would mis-split both.
+    """
+    folder = None
+    if "#" in repo_spec:
+        repo_spec, folder = repo_spec.split("#", 1)
+        folder = folder.strip("/") or None
+    branch = None
     if "@" in repo_spec:
-        repo, branch = repo_spec.split("@", 1)
+        repo_spec, branch = repo_spec.split("@", 1)
+    return repo_spec, branch, folder
+
+
+def default_branch(repo: str) -> str:
+    info = http_json(f"https://api.github.com/repos/{repo}")
+    if not info:
+        die(f"no such repo, or it is private: {repo}")
+    return info.get("default_branch", "master")
+
+
+def latest_folder_commit(repo: str, branch: str, folder: str) -> str:
+    """The last commit that touched one folder -- this addon's real version.
+
+    A repository holding nine addons has one commit history, so its HEAD moves
+    whenever ANY of them changes. Versioning an addon by the repo would report
+    an update for all nine every time one is touched, and "update available" that
+    is usually wrong is worse than no column at all: people stop reading it.
+
+    GitHub answers the narrower question directly, and for the same one request.
+    """
+    query = urllib.parse.urlencode({"sha": branch, "path": folder, "per_page": 1})
+    commits = http_json(f"https://api.github.com/repos/{repo}/commits?{query}")
+    if not commits:
+        die(f"nothing in {repo} touches '{folder}' -- check the folder name")
+    return commits[0]["sha"][:12]
+
+
+def latest_github(repo_spec: str) -> tuple[str, str]:
+    """(version, zip url) for the newest thing at owner/repo[@branch][#folder]."""
+    repo, branch, folder = split_repo_spec(repo_spec)
+
+    if folder:
+        # A named folder overrides releases deliberately. A release asset is
+        # packaged for one addon; there is no reason its contents line up with
+        # a path in the source tree, so honouring both would mean guessing.
+        ref = branch or default_branch(repo)
+        version = latest_folder_commit(repo, ref, folder)
+        return version, f"https://api.github.com/repos/{repo}/zipball/{ref}"
+
+    if branch:
         commits = http_json(f"https://api.github.com/repos/{repo}/commits/{branch}")
         if not commits:
             die(f"no branch '{branch}' in {repo}")
         return commits["sha"][:12], f"https://api.github.com/repos/{repo}/zipball/{branch}"
 
-    release = http_json(f"https://api.github.com/repos/{repo_spec}/releases/latest")
+    release = http_json(f"https://api.github.com/repos/{repo}/releases/latest")
     if release:
         # Prefer an attached .zip: that is the packaged addon, laid out the way
         # it should sit in AddOns. The source archive is the fallback and needs
@@ -512,13 +791,10 @@ def latest_github(repo_spec: str) -> tuple[str, str]:
                 return release["tag_name"], asset["browser_download_url"]
         return release["tag_name"], release["zipball_url"]
 
-    info = http_json(f"https://api.github.com/repos/{repo_spec}")
-    if not info:
-        die(f"no such repo, or it is private: {repo_spec}")
-    branch = info.get("default_branch", "master")
-    commits = http_json(f"https://api.github.com/repos/{repo_spec}/commits/{branch}")
-    sha = commits["sha"][:12] if commits else branch
-    return sha, f"https://api.github.com/repos/{repo_spec}/zipball/{branch}"
+    ref = default_branch(repo)
+    commits = http_json(f"https://api.github.com/repos/{repo}/commits/{ref}")
+    sha = commits["sha"][:12] if commits else ref
+    return sha, f"https://api.github.com/repos/{repo}/zipball/{ref}"
 
 
 def download(url: str) -> bytes:
@@ -533,7 +809,7 @@ def download(url: str) -> bytes:
 # ── installing ───────────────────────────────────────────────────────────────
 
 
-def addon_dirs_in(tree: Path) -> list[tuple[Path, str]]:
+def addon_dirs_in(tree: Path, depth: int = 1) -> list[tuple[Path, str]]:
     """Find the real addon folders inside an extracted archive.
 
     Returns (folder, name-to-install-as) pairs. Three layouts turn up and all
@@ -550,6 +826,11 @@ def addon_dirs_in(tree: Path) -> list[tuple[Path, str]]:
     The order below matters. A .toc at the current level has to be checked
     before descending into a lone subdirectory, or an addon laid out as
     MyAddon.toc + Core/ gets followed down into Core/ and lost.
+
+    `depth` bounds the last resort -- searching subdirectories when this level
+    holds nothing recognisable. One level covers the real layouts (src/, Addons/,
+    an addon beside docs/) and stops short of an addon's own bundled libraries,
+    which sit deeper and would otherwise be installed as if each were the addon.
     """
     hits = [
         (child, child.name)
@@ -567,22 +848,83 @@ def addon_dirs_in(tree: Path) -> list[tuple[Path, str]]:
         chosen = exact[0] if exact else min(tocs, key=lambda t: len(t.stem))
         return [(tree, chosen.stem)]
 
-    subdirs = [child for child in tree.iterdir() if child.is_dir()]
+    subdirs = sorted(child for child in tree.iterdir() if child.is_dir())
     if len(subdirs) == 1:
-        return addon_dirs_in(subdirs[0])
+        return addon_dirs_in(subdirs[0], depth=depth)
+
+    # Nothing at this level and several ways down. Repositories do lay addons
+    # out as src/MyAddon/MyAddon.toc beside a docs/ or .github/ folder, and
+    # giving up here reported "no addon folder found" for a repo plainly
+    # holding one. Look one level deeper, but only that far: an addon bundles
+    # its own libraries (Libs/AceGUI-3.0/AceGUI-3.0.toc), and a search that
+    # kept descending would install those as though they were the addon.
+    if depth > 0:
+        candidates = {}
+        for child in subdirs:
+            if child.name.startswith("."):
+                continue
+            found = addon_dirs_in(child, depth=depth - 1)
+            if found:
+                candidates[child.name] = found
+        if len(candidates) == 1:
+            return next(iter(candidates.values()))
+        if len(candidates) > 1:
+            # Several ways down, each holding an addon. This is what a repo with
+            # a folder per client looks like -- Wrath/MyAddon, Retail/MyAddon --
+            # and picking one would be a coin toss decided by sort order. It
+            # really did install Retail on a Wrath realm, silently, and an addon
+            # built for the wrong client is not an error the game reports.
+            names = ", ".join(sorted(candidates))
+            die(f"this repo holds an addon in more than one folder ({names}). "
+                f"Name the one you want: #{sorted(candidates)[0]}")
     return []
 
 
-def install_zip(blob: bytes, target: Path, dry_run: bool, *, backup: bool = False, report=None) -> list[str]:
+def descend_to(tree: Path, folder: str) -> Path:
+    """Find one named folder inside an extracted archive.
+
+    GitHub's source archive wraps everything in `owner-repo-1a2b3c/`, so the
+    path the user picked on github.com is one level down from the archive root.
+    Both are tried rather than assuming, because a hand-rolled release zip may
+    have no wrapper at all.
+    """
+    candidates = [tree / folder]
+    subdirs = [child for child in tree.iterdir() if child.is_dir()]
+    if len(subdirs) == 1:
+        candidates.append(subdirs[0] / folder)
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    die(f"the archive has no folder '{folder}' -- was it renamed or moved?")
+
+
+def install_zip(
+    blob: bytes,
+    target: Path,
+    dry_run: bool,
+    *,
+    backup: bool = False,
+    entry: dict | None = None,
+    only: str | None = None,
+    report=None,
+) -> list[str]:
     """Unpack an addon archive into AddOns. Returns the folder names written.
 
     Under `dry_run` nothing is written but the names are still returned, so a
     caller can report exactly what it would have installed without this needing
     to know how that report is displayed.
 
-    `backup` moves an existing real folder aside instead of deleting it. It is
-    the caller's decision because only the caller knows whether the folder is
-    the user's own or one this tool put there -- see `should_backup`.
+    `only` narrows the archive to one folder inside it, for a repository that
+    holds several addons. Without it every addon folder in the archive is
+    installed, which is right for an addon shipping its own library and wrong
+    for a repository of nine unrelated addons.
+
+    `backup` moves an existing real folder aside instead of deleting it.
+    `entry` refines that PER FOLDER: the decision used to be taken once from
+    the bound addon and applied to every folder the archive landed, so updating
+    one addon of nine deleted the other eight on the strength of a record that
+    described only the first. Confirmed by losing a file. See
+    `should_backup_folder`.
 
     This used to delete unconditionally while the window promised a backup, and
     somebody lost a hand-installed addon to it. Do not make that true again.
@@ -602,9 +944,11 @@ def install_zip(blob: bytes, target: Path, dry_run: bool, *, backup: bool = Fals
         except zipfile.BadZipFile:
             die("downloaded file is not a zip -- check the source is an addon release")
 
-        folders = addon_dirs_in(tmpdir)
+        root = descend_to(tmpdir, only) if only else tmpdir
+        folders = addon_dirs_in(root)
         if not folders:
-            die("no addon folder (a directory holding its own .toc) found in the archive")
+            where = f"'{only}'" if only else "the archive"
+            die(f"no addon folder (a directory holding its own .toc) found in {where}")
 
         written = []
         for folder, name in folders:
@@ -617,7 +961,8 @@ def install_zip(blob: bytes, target: Path, dry_run: bool, *, backup: bool = Fals
                 if is_link(destination):
                     remove_link(destination)
                 elif destination.exists():
-                    displace(destination, backup=backup, report=report)
+                    keep = backup and (entry is None or should_backup_folder(entry, name))
+                    displace(destination, backup=keep, report=report)
                 shutil.copytree(folder, destination)
             written.append(name)
         return written
@@ -639,6 +984,27 @@ def displace(destination: Path, *, backup: bool, report=None) -> None:
     moved = backup_name(destination)
     report("note", f"moving existing folder aside -> {moved.name}")
     destination.rename(moved)
+
+
+def should_backup_folder(entry: dict, folder: str) -> bool:
+    """Whether THIS folder should be kept when the next install replaces it.
+
+    `should_backup` asks the same question about the addon as a whole, which is
+    the same answer right up until an archive lands more than one folder. Then
+    it is wrong for every folder but the first: updating one addon of nine
+    deleted the other eight, because the entry said "this tool installed it"
+    and that was only ever true of the folder the entry named.
+
+    A folder counts as this tool's own when the entry records a version AND
+    lists that folder among the ones it wrote. Both halves matter: a scanned
+    entry lists the folder before anything has been installed into it, so the
+    version is what separates "we put this here" from "it was already there".
+    """
+    if not entry.get("backup", True):
+        return False
+    if not entry.get("installed"):
+        return True
+    return folder not in (entry.get("folders") or [])
 
 
 def should_backup(entry: dict) -> bool:
@@ -714,7 +1080,12 @@ def displaced_folder(entry: dict, addon: str, root: Path) -> Path | None:
     if source.startswith("local:"):
         destination = root / Path(source[len("local:"):]).name
     elif source.startswith("github:"):
-        destination = root / addon
+        # A named folder is a much better guess than the addon's own name: it
+        # is what lands in AddOns, and for a repo of several addons the two are
+        # often different. Without one the archive's contents are unknowable
+        # until it is downloaded, so the addon's name remains the best guess.
+        _repo, _branch, folder = split_repo_spec(source[len("github:"):])
+        destination = root / (Path(folder).name if folder else addon)
     else:
         return None
     if destination.exists() and not is_link(destination):
@@ -814,6 +1185,7 @@ def update_addon(
             return result
 
         progress("checking", rest)
+        _repo, _branch, folder = split_repo_spec(rest)
         version, url = latest_github(rest)
         result.version = version
         if entry.get("installed") == version and not force:
@@ -826,7 +1198,23 @@ def update_addon(
         progress("downloading", f"{rest} {version}")
         blob = download(url)
         progress("installing", rest)
-        result.folders = install_zip(blob, root, dry_run, backup=should_backup(entry), report=report)
+        # backup= is the user's own preference; the entry decides folder by
+        # folder which of them that preference actually applies to.
+        result.folders = install_zip(
+            blob, root, dry_run,
+            backup=entry.get("backup", True), entry=entry, only=folder, report=report,
+        )
+        if not folder and len(result.folders) > 1:
+            # A repository of several addons, bound as a whole. It works, but
+            # every addon in it will now report an update whenever any one of
+            # them changes, and this addon's entry claims all of their folders.
+            # Say so once rather than letting it be discovered as odd behaviour.
+            report(
+                "note",
+                f"this repo holds {len(result.folders)} addons "
+                f"({', '.join(result.folders)}). Set the source to one folder "
+                f"inside it -- github:{_repo}#FolderName -- to update just this addon.",
+            )
         if not dry_run:
             entry["folders"] = result.folders
             entry["installed"] = version

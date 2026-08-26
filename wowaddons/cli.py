@@ -18,6 +18,7 @@ EPILOG = """\
     addons.py scan
     addons.py set GnomeWorks local:.
     addons.py set SomeAddon github:owner/repo
+    addons.py set OneOfMany github:owner/repo#OneOfMany
     addons.py update
 
     addons.py            (no arguments) opens the window instead
@@ -38,6 +39,21 @@ HOW IT FITS TOGETHER
   set     binds one addon to where its updates should come from
   update  brings every bound addon up to date
 
+SEVERAL WOW FOLDERS
+
+A vanilla server, a Wrath one and retail are separate installs: separate AddOns
+directories, separate bindings, nothing shared. `init` again adds one rather
+than replacing the first.
+
+  addons.py init ~/Games/Vanilla --name Vanilla
+  addons.py installs                     what is known, * marks the one in use
+  addons.py use Vanilla                  switch
+  addons.py update --install Wrath       aim ONE run elsewhere, without switching
+  addons.py forget Vanilla               stop tracking it (deletes no game files)
+
+The same addon may be bound differently in each -- a different branch, or a
+different folder of the same repository -- which is usually the point.
+
 Sources:
 
   local:<path>        a folder on this disk -- a checkout of this repo, or any
@@ -48,7 +64,15 @@ Sources:
   github:owner/repo   latest GitHub release, preferring an attached .zip and
                       falling back to the source archive
   github:owner/repo@branch   that branch's current head instead of a release
+  github:owner/repo#Folder   ONE addon out of a repository that holds several.
+                      Only that folder is installed, and its version is the
+                      last commit that touched it -- so the other addons in the
+                      repo neither get installed nor make this one look out of
+                      date. `@branch#Folder` combines with the above.
   unmanaged           leave it alone
+
+A github.com link works anywhere owner/repo does, including a link to a folder:
+https://github.com/owner/repo/tree/main/MyAddon means that addon, on that branch.
 
 The manifest lives outside this repo, in
 $XDG_CONFIG_HOME/wow-addons/manifest.json, because it holds your disk paths and
@@ -80,20 +104,65 @@ def show(level: str, message: str) -> None:
 # ── commands ─────────────────────────────────────────────────────────────────
 
 
+def selected(args, state: dict) -> dict:
+    """The install this command acts on: --install, else the current one."""
+    name = getattr(args, "install", None)
+    return core.pick(state, name) if name else core.current(state)
+
+
 def cmd_init(args, state: dict) -> None:
     target = core.find_addons_dir(Path(args.path))
-    state["addons_dir"] = str(target)
+    name = core.add_install(state, target, args.name)
     core.save(state)
-    step("WoW folder set")
+    step(f"WoW folder set: {name}")
     note(str(target))
+    if len(core.installs(state)) > 1:
+        note("")
+        note(f"{len(core.installs(state))} installs known. `addons.py installs` lists them,")
+        note("`addons.py use <name>` switches, and `--install <name>` targets one run.")
     note("")
     note("Next:  addons.py scan     (read what is already installed)")
 
 
+def cmd_installs(args, state: dict) -> None:
+    known = core.installs(state)
+    if not known:
+        core.die("no WoW folder set yet. Run:  addons.py init /path/to/your/wow/folder")
+    current = core.current_name(state)
+    step(f"{len(known)} install(s)")
+    width = max(len(n) for n in known)
+    for name in sorted(known, key=str.lower):
+        install = known[name]
+        entries = install.get("addons", {})
+        bound = sum(1 for e in entries.values() if e.get("source", "unmanaged") != "unmanaged")
+        marker = f"{BOLD}*{RESET}" if name == current else " "
+        counts = f"{len(entries)} addon(s), {bound} bound" if entries else "not scanned yet"
+        note(f"{marker} {name:<{width}}  {core.tilde(install.get('addons_dir') or '(not set)')}")
+        note(f"  {'':<{width}}  {DIM}{counts}{RESET}")
+    note("")
+    note("* is the one commands act on. Switch with `use`, or aim one run with --install.")
+
+
+def cmd_use(args, state: dict) -> None:
+    install = core.use(state, args.name)
+    core.save(state)
+    step(f"now using {args.name}")
+    note(core.tilde(install.get("addons_dir") or "(not set)"))
+
+
+def cmd_forget(args, state: dict) -> None:
+    """Stop tracking an install. Deletes nothing in the game folder."""
+    core.forget_install(state, args.name)
+    core.save(state)
+    step(f"forgot {args.name}")
+    note("Nothing in that WoW folder was touched -- only this tool's record of it.")
+
+
 def cmd_scan(args, state: dict) -> None:
-    root = core.addons_dir(state)
+    install = selected(args, state)
+    root = core.addons_dir(install)
     step(f"Scanning {root}")
-    installed, guessed = core.rescan(state, root)
+    installed, guessed = core.rescan(install, root)
     core.save(state)
     note(f"{installed} addon folder(s) installed")
     if guessed:
@@ -104,8 +173,9 @@ def cmd_scan(args, state: dict) -> None:
 
 
 def cmd_list(args, state: dict) -> None:
-    root = core.addons_dir(state)
-    entries = state.get("addons", {})
+    install = selected(args, state)
+    root = core.addons_dir(install)
+    entries = install.get("addons", {})
     if not entries:
         core.die("nothing scanned yet. Run:  addons.py scan")
 
@@ -130,7 +200,7 @@ def cmd_list(args, state: dict) -> None:
 def cmd_set(args, state: dict) -> None:
     backup = False if args.no_backup else (True if args.backup else None)
     entry, local_path = core.set_source(
-        state, args.addon, args.source, copy=args.copy, backup=backup
+        selected(args, state), args.addon, args.source, copy=args.copy, backup=backup
     )
     core.save(state)
 
@@ -149,7 +219,7 @@ def cmd_set(args, state: dict) -> None:
 def cmd_accept(args, state: dict) -> None:
     """Take every source `scan` suggested, in one go."""
     step("Accepting suggested sources")
-    taken = core.accept_suggestions(state)
+    taken = core.accept_suggestions(selected(args, state))
     for name, source in taken:
         note(f"{name} -> {source}")
     core.save(state)
@@ -157,8 +227,9 @@ def cmd_accept(args, state: dict) -> None:
 
 
 def cmd_update(args, state: dict) -> None:
-    root = core.addons_dir(state)
-    entries = state.get("addons", {})
+    install = selected(args, state)
+    root = core.addons_dir(install)
+    entries = install.get("addons", {})
     names = args.addons or sorted(entries, key=str.lower)
 
     step("Update" + (" (dry run)" if args.dry_run else ""))
@@ -208,7 +279,15 @@ def cmd_where(args, state: dict) -> None:
         # Windows, mid-migration: say which file the numbers came from, because
         # otherwise `where` points at an empty file and looks like it is lying.
         note(f"           (still reading {reading}; the next write moves it)")
-    note(f"AddOns:    {state.get('addons_dir') or '(not set)'}")
+    known = core.installs(state)
+    if not known:
+        note("AddOns:    (not set)")
+        return
+    label = "AddOns:"
+    for name in sorted(known, key=str.lower):
+        marker = "*" if name == core.current_name(state) else " "
+        note(f"{label:<9}{marker} {name}: {known[name].get('addons_dir') or '(not set)'}")
+        label = ""
 
 
 def cmd_gui(args, state: dict) -> None:
@@ -236,17 +315,38 @@ def build_parser(prog: str = "addons.py", epilog: str | None = None) -> argparse
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("init", help="point at your WoW folder")
+    def targeted(name: str, **kw):
+        """A subcommand that acts on one install, and can be aimed at another."""
+        made = sub.add_parser(name, **kw)
+        made.add_argument(
+            "--install", metavar="NAME",
+            help="act on this install for this run only, without switching to it",
+        )
+        return made
+
+    p = sub.add_parser("init", help="point at a WoW folder (run it again for a second one)")
     p.add_argument("path", help="the WoW folder, or Interface/AddOns directly")
+    p.add_argument("--name", help="what to call this install (default: the folder's own name)")
     p.set_defaults(func=cmd_init)
 
-    p = sub.add_parser("scan", help="read every addon already installed")
+    p = sub.add_parser("installs", help="list every WoW folder this tool knows")
+    p.set_defaults(func=cmd_installs)
+
+    p = sub.add_parser("use", help="switch which install commands act on")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_use)
+
+    p = sub.add_parser("forget", help="stop tracking an install (deletes no game files)")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_forget)
+
+    p = targeted("scan", help="read every addon already installed")
     p.set_defaults(func=cmd_scan)
 
-    p = sub.add_parser("list", help="show every addon and its source")
+    p = targeted("list", help="show every addon and its source")
     p.set_defaults(func=cmd_list)
 
-    p = sub.add_parser("set", help="bind one addon to a source")
+    p = targeted("set", help="bind one addon to a source")
     p.add_argument("addon")
     p.add_argument("source", help="local:/path | github:owner/repo | github:owner/repo@branch | unmanaged")
     p.add_argument("--copy", action="store_true", help="copy real files instead of symlinking (local: only)")
@@ -258,10 +358,10 @@ def build_parser(prog: str = "addons.py", epilog: str | None = None) -> argparse
                    help="keep a copy of an existing folder as <Name>.replaced (the default)")
     p.set_defaults(func=cmd_set)
 
-    p = sub.add_parser("accept", help="take every source that scan suggested")
+    p = targeted("accept", help="take every source that scan suggested")
     p.set_defaults(func=cmd_accept)
 
-    p = sub.add_parser("update", help="bring bound addons up to date")
+    p = targeted("update", help="bring bound addons up to date")
     p.add_argument("addons", nargs="*", help="default: all of them")
     p.add_argument("--check", action="store_true", help="report what is out of date, download nothing")
     p.add_argument("--dry-run", action="store_true", help="do everything but write")

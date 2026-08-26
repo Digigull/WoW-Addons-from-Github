@@ -197,7 +197,49 @@ class WindowTests(unittest.TestCase):
 
         self.run_update(fake)
         written = json.loads(core.MANIFEST.read_text())
-        self.assertEqual(written["addons"]["Bound"]["installed"], "v3")
+        self.assertEqual(core.current(written)["addons"]["Bound"]["installed"], "v3")
+
+    # -- several WoW folders -------------------------------------------------
+
+    def second_install(self, name="Wrath"):
+        other = pathlib.Path(self.tmp.name) / name / "Interface" / "AddOns"
+        other.mkdir(parents=True)
+        core.add_install(self.app.state, other, name)
+        self.app.refresh()
+        return other
+
+    def test_the_picker_is_hidden_until_there_is_a_second_install(self):
+        # A dropdown holding one entry is a control that cannot do anything.
+        self.assertEqual(self.app.install_picker.winfo_manager(), "")
+        self.second_install()
+        self.assertEqual(self.app.install_picker.winfo_manager(), "grid")
+
+    def test_switching_shows_the_other_folders_addons(self):
+        """The table must follow the picker, or it shows one game's addons
+        while every button acts on another's files."""
+        other = self.second_install()
+        self.assertEqual(self.app.install_choice.get(), "Wrath")
+        self.assertEqual(list(self.app.tree.get_children()), [])
+        self.assertEqual(self.app.root_dir(), other)
+
+        self.app.install_choice.set(pathlib.Path(self.addons).parts[-3])
+        self.app._switch_install()
+        self.pump()
+        self.assertEqual(sorted(self.app.tree.get_children()), ["Bound", "Loose"])
+        self.assertEqual(self.app.root_dir(), self.addons)
+
+    def test_each_install_keeps_its_own_bindings(self):
+        self.second_install()
+        core.set_source(self.app.install(), "Bound", "github:o/r#Wrath")
+        core.use(self.app.state, pathlib.Path(self.addons).parts[-3])
+        self.assertEqual(self.app.entries()["Bound"]["source"], "github:o/r")
+
+    def test_the_window_acts_on_the_install_it_is_showing(self):
+        # entries() and root_dir() must come from the same install, always --
+        # a mismatch writes one game's addon into another game's folder.
+        self.second_install()
+        self.assertIs(self.app.entries(), self.app.install()["addons"])
+        self.assertEqual(str(self.app.root_dir()), self.app.install()["addons_dir"])
 
     # -- the dialog ----------------------------------------------------------
 
@@ -216,6 +258,48 @@ class WindowTests(unittest.TestCase):
         dlg.branch.set("dev")
         dlg._save()
         self.assertEqual(dlg.result, ("github:o/r@dev", False))
+
+    def test_the_dialog_writes_a_folder_source(self):
+        # A repository holding several addons: this addon tracks one folder.
+        dlg = self.dialog("Bound")
+        dlg.folder.set("HonorTracker")
+        dlg._save()
+        self.assertEqual(dlg.result, ("github:o/r#HonorTracker", False))
+
+    def test_a_pasted_folder_url_fills_the_folder_in(self):
+        # Clicking into one addon of several on github.com and copying the
+        # address is the plainest way anybody says which addon they mean.
+        dlg = self.dialog("Bound")
+        dlg.repo.set("https://github.com/o/r/tree/main/HonorTracker")
+        dlg._absorb_url()
+        self.assertEqual(dlg.folder.get(), "HonorTracker")
+        self.assertTrue(dlg.track.get(), "the branch in the URL should be taken too")
+        self.assertIn("HonorTracker", dlg.repo_hint.cget("text"))
+        dlg._save()
+        self.assertEqual(dlg.result, ("github:o/r@main#HonorTracker", False))
+
+    def test_the_dialog_reads_back_a_folder_source(self):
+        entry = {"source": "github:o/r@main#HonorTracker", "installed": None, "folders": []}
+        dlg = gui.SourceDialog(self.root, "Bound", entry, self.addons)
+        self.assertEqual(dlg.repo.get(), "o/r")
+        self.assertEqual(dlg.branch.get(), "main")
+        self.assertEqual(dlg.folder.get(), "HonorTracker")
+        dlg.destroy()
+
+    def test_the_caution_names_the_folder_the_repo_will_land(self):
+        """For a mono-repo the folder installed is not the addon's own name.
+
+        Cautioning about `Bound` while `HonorTracker` is the directory actually
+        about to be replaced is the same class of mistake as promising a backup
+        that never happened: a true-sounding sentence about the wrong file.
+        """
+        (self.addons / "HonorTracker").mkdir()
+        (self.addons / "HonorTracker" / "mine.lua").write_text("x")
+        dlg = self.dialog("Bound")
+        dlg.folder.set("HonorTracker")
+        dlg._show_caution()
+        self.assertIn("HonorTracker", dlg.caution.cget("text"))
+        dlg.destroy()
 
     def test_the_dialog_refuses_something_that_is_not_owner_slash_repo(self):
         dlg = self.dialog("Bound")
@@ -408,7 +492,7 @@ class WindowTests(unittest.TestCase):
         dlg.backup.set(False)
         dlg._save()
         self.assertFalse(dlg.keep_backup)
-        core.set_source(self.app.state, "Bound", dlg.result[0], backup=dlg.keep_backup)
+        core.set_source(self.app.install(), "Bound", dlg.result[0], backup=dlg.keep_backup)
         self.assertIs(self.app.entries()["Bound"]["backup"], False)
 
     def test_no_caution_for_a_folder_that_is_only_a_link(self):

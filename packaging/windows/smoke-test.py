@@ -109,8 +109,13 @@ def main() -> None:
         manifest = config / "wow-addons" / "manifest.json"
         if not manifest.is_file():
             fail(f"no manifest at {manifest}")
-        if json.loads(manifest.read_text())["addons_dir"] is None:
-            fail("the manifest records no AddOns folder")
+        written = json.loads(manifest.read_text())
+        # The manifest holds several installs; the AddOns folder lives inside
+        # one of them. Reading the old flat key here would have passed for the
+        # wrong reason -- KeyError, not a missing folder.
+        folders = [i.get("addons_dir") for i in written.get("installs", {}).values()]
+        if not folders or None in folders:
+            fail(f"the manifest records no AddOns folder: {written}")
         result = run(exe, "where", env=env)
         if str(config) not in result.stdout:
             fail(f"`where` does not point at {config}: {result.stdout[:400]}")
