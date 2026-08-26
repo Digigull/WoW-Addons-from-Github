@@ -2,6 +2,39 @@ Update your World of Warcraft addons from repositories **you** choose. No catalo
 account, and no telemetry of any kind — it contacts exactly the hosts named in your own
 manifest and nothing else.
 
+## New in v0.6.0
+
+**The window shows you what a repository holds.** Paste a repo into Set source and its
+addons appear underneath as tick boxes, with the one matching that row already ticked.
+No need to know what a folder path is, and no need to leave the window to find out.
+
+Tick more than one if an addon and its companion belong together — they become one row
+that updates as a unit. Save with nothing ticked and it asks first, because that binds the
+whole repository and installs every addon in it.
+
+Nothing is guessed when nothing matches. A wrong guess that arrives pre-ticked gets
+accepted without being read, and the addon then updates from somebody else's folder.
+
+A repository holding **one** addon offers no tick boxes at all — one candidate is not a
+choice, and naming it would switch that addon from its published releases to commit ids.
+The window says which addon it found and leaves it alone.
+
+A row already bound to a whole multi-addon repository is flagged in the table as
+*installs N addons*. The advice used to go into the Status column, which is 170 pixels
+wide, so it was a smudge rather than a warning.
+
+## Fixed in v0.5.1
+
+**Set source did nothing in v0.5.0.** Choosing any source in the window — a repo, a
+folder, or Unmanaged — failed silently: nothing was saved, and the table redrew the value
+that was already there. It looked like the app reverting your choice on purpose. The
+manifest was never touched, so nothing was lost and nothing needs undoing; re-set the
+source on v0.5.1 and it holds. The terminal (`addons.py set`) was never affected.
+
+An unexpected error in the window now says so, instead of going to a console a windowed
+build does not have. That is what turned a one-line bug into something that looked like
+the program disobeying you.
+
 ## New since v0.3.1
 
 **Several WoW folders at once.** A vanilla server, a Wrath one and retail are separate

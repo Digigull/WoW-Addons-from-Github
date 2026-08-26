@@ -158,8 +158,22 @@ Some people keep every addon they have written in one repository. Bound as a who
 repo installs **all** of it, and since the repo has one commit history, every addon in it
 reports an update whenever any one of them changes.
 
-Naming the folder fixes both. The simplest way is to click into that addon on github.com
-and paste the address you end up at:
+**The window lists them for you.** Type or paste the repository into Set source and the
+addons it holds appear underneath as tick boxes, with the one matching this row already
+ticked. Tick more than one if an addon and its companion belong together — they become a
+single row that updates as a unit. Saving with nothing ticked asks first, because that
+binds the whole repository.
+
+Nothing is guessed when nothing matches: a wrong guess arriving pre-ticked would be
+accepted without being read. And a repository holding a single addon offers no tick boxes —
+one candidate is not a choice, and naming it would switch that addon from its releases to
+commit ids for no gain.
+
+A row already bound to a whole multi-addon repository is flagged in the table as
+*installs N addons*, so it can be narrowed whenever it suits.
+
+You can also name the folder yourself, which is what the tick boxes write for you. Clicking
+into an addon on github.com and pasting that address does the same thing:
 
 ```
 https://github.com/owner/repo/tree/main/MyAddon

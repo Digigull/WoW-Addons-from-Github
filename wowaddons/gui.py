@@ -28,12 +28,15 @@ from __future__ import annotations
 
 import queue
 import threading
+import traceback
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from . import __version__, core
 from .core import Fail
+
+ISSUES_URL = "https://github.com/Digigull/WoW-Addons-from-Github/issues"
 
 POLL_MS = 100
 UNMANAGED_LABEL = "(unmanaged)"
@@ -122,6 +125,15 @@ class SourceDialog(tk.Toplevel):
         self.copy = tk.BooleanVar(value=entry.get("mode") == "copy")
         self.backup = tk.BooleanVar(value=entry.get("backup", True))
         self.folder = tk.StringVar()
+        # Ticked boxes write into `self.folder`, which stays the single source
+        # of truth: _save reads only that, so a typed folder and a ticked one
+        # cannot disagree, and a repository too large to list is still usable.
+        self.folder_boxes: dict[str, tk.BooleanVar] = {}
+        self.looked_up: list[str] = []
+        self.lookup_for = ""
+        self.lookups: queue.Queue = queue.Queue()
+        self._lookup_after = None
+        self._poll_after = None
 
         if source.startswith("local:"):
             self.choice.set("local")
@@ -213,6 +225,18 @@ class SourceDialog(tk.Toplevel):
         ttk.Label(folder_row, text="(only if the repo holds several addons)",
                   foreground="grey").grid(row=0, column=2, sticky="w", padx=(6, 0))
 
+        # What the repository actually contains, once it has been asked. Empty
+        # until then, and hidden entirely for a repo holding a single addon --
+        # there is nothing to choose and a one-item list would only imply there
+        # were a decision to make.
+        self.addon_list = ttk.LabelFrame(body, text="Addons in this repository")
+        self.addon_list.grid(row=10, column=0, columnspan=3, sticky="ew", **pad)
+        self.addon_list.grid_remove()
+        self.lookup_status = ttk.Label(self.addon_list, text="", foreground="grey")
+        self.lookup_status.grid(row=0, column=0, sticky="w", padx=6, pady=(2, 4))
+        self.addon_boxes = ttk.Frame(self.addon_list)
+        self.addon_boxes.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 4))
+
         ttk.Radiobutton(body, text="Leave unmanaged", value="unmanaged", variable=self.choice,
                         command=self._sync).grid(row=4, column=0, sticky="w", **pad)
 
@@ -228,6 +252,11 @@ class SourceDialog(tk.Toplevel):
         if suggested:
             ttk.Label(body, text=f"This addon's .toc suggests {suggested}", foreground="grey").grid(
                 row=6, column=0, columnspan=3, sticky="w", **pad)
+
+        if self.choice.get() == "github" and self.repo.get().strip():
+            # Already bound: show what the repository holds without waiting for
+            # a keystroke, so the ticks can be read against what is saved.
+            self.after(50, self._begin_lookup)
 
         self.caution = ttk.Label(body, text="", foreground="#a05000", wraplength=480, justify="left")
         self.caution.grid(row=7, column=0, columnspan=3, sticky="w", **pad)
@@ -267,6 +296,121 @@ class SourceDialog(tk.Toplevel):
         if folder:
             shown += f" · {folder}"
         self.repo_hint.configure(text=shown)
+        self._schedule_lookup()
+
+    # -- asking the repository what it holds ---------------------------------
+
+    def _schedule_lookup(self) -> None:
+        """Ask GitHub a moment after typing stops, not on every keystroke.
+
+        Typing `tullamods/Bagnon` would otherwise be sixteen requests for one
+        answer. The delay is cancelled and re-armed on each key, so exactly one
+        goes out per repository somebody actually settles on.
+        """
+        if self._lookup_after is not None:
+            self.after_cancel(self._lookup_after)
+        self._lookup_after = self.after(600, self._begin_lookup)
+
+    def _begin_lookup(self) -> None:
+        self._lookup_after = None
+        if self.repo is None:
+            return
+        found = core.parse_repo(self.repo.get())
+        if found is None:
+            self._hide_list()
+            return
+        repo, branch, _folder = found
+        spec = f"{repo}@{branch}" if branch else repo
+        if spec == self.lookup_for:
+            return
+        self.lookup_for = spec
+        self._show_list(f"looking in {repo}…", [])
+
+        # A worker, because a request on the main thread freezes the window --
+        # and nothing here touches a widget: it puts a result in a queue and
+        # _drain_lookups picks it up on the main thread. That rule is why this
+        # program does not abort with Tcl_AsyncDelete.
+        def ask() -> None:
+            try:
+                self.lookups.put((spec, core.addons_in_repo(spec), None))
+            except Exception as exc:  # noqa: BLE001 - reported in the dialog
+                self.lookups.put((spec, [], str(exc)))
+
+        threading.Thread(target=ask, daemon=True).start()
+        self._poll_lookups()
+
+    def _poll_lookups(self) -> None:
+        if self._poll_after is not None:
+            self.after_cancel(self._poll_after)
+        self._poll_after = self.after(100, self._drain_lookups)
+
+    def _drain_lookups(self) -> None:
+        self._poll_after = None
+        if self.repo is None:
+            return  # closed while the request was in flight
+        pending = False
+        while True:
+            try:
+                spec, folders, error = self.lookups.get_nowait()
+            except queue.Empty:
+                break
+            if spec != self.lookup_for:
+                continue  # an answer about a repo that has since been retyped
+            pending = True
+            if error:
+                self._show_list(f"could not read {spec}: {error}", [])
+            elif not folders:
+                # The repository root is the addon -- FrostSeek, Minn-Tinkers.
+                # There is nothing to choose, so say so and offer no choice.
+                self._show_list("one addon, installed whole — nothing to choose", [])
+            elif len(folders) == 1:
+                # One candidate is not a choice. Offering a single tick box
+                # would imply a decision, and ticking it would do real harm:
+                # naming a folder switches this row from the repository's
+                # RELEASES to the last commit touching that folder, so an addon
+                # that publishes tagged releases would silently start reporting
+                # commit ids instead of version numbers. Left unticked it
+                # installs exactly the same folder, and keeps its releases.
+                self._show_list(f"one addon: {folders[0]} — nothing to choose", [])
+            else:
+                self._show_list(
+                    f"{len(folders)} addons — tick the ones this row updates", folders
+                )
+        if not pending:
+            self._poll_lookups()
+
+    def _hide_list(self) -> None:
+        self.lookup_for = ""
+        self.looked_up = []
+        self.addon_list.grid_remove()
+
+    def _show_list(self, message: str, folders: list[str]) -> None:
+        self.looked_up = folders
+        self.lookup_status.configure(text=message)
+        for child in self.addon_boxes.winfo_children():
+            child.destroy()
+        self.folder_boxes.clear()
+
+        already = core.wanted_folders(self.folder.get())
+        guess = core.likely_addon(self.addon, folders) if not already else None
+        for row, folder in enumerate(folders):
+            ticked = folder in already or folder == guess
+            variable = tk.BooleanVar(value=ticked)
+            self.folder_boxes[folder] = variable
+            ttk.Checkbutton(
+                self.addon_boxes, text=folder, variable=variable,
+                command=self._folders_ticked,
+            ).grid(row=row, column=0, sticky="w")
+        if folders:
+            self._folders_ticked()
+        self.addon_list.grid()
+
+    def _folders_ticked(self, *_a) -> None:
+        """Ticked boxes are written into the folder box, which _save reads."""
+        if self.folder is None:
+            return
+        self.folder.set(",".join(f for f, v in self.folder_boxes.items() if v.get()))
+        self._show_caution()
 
     def _sync(self, *_a) -> None:
         """Grey out whatever the current choice does not use."""
@@ -402,6 +546,19 @@ class SourceDialog(tk.Toplevel):
             # A branch in the pasted URL counts as asking to track it.
             branch = typed if (self.track.get() and typed) else (url_branch or "")
             folder = (self.folder.get().strip() or url_folder or "").strip("/")
+            if not folder and len(self.looked_up) > 1:
+                # Saving with nothing ticked is a real choice -- it binds the
+                # whole repository -- but it is far more often an oversight, and
+                # the consequence (every addon in the repo installed into your
+                # AddOns folder) is not obvious from the dialog.
+                if not messagebox.askokcancel(
+                    "No addon ticked",
+                    f"You have not ticked any of the {len(self.looked_up)} addons in "
+                    f"{repo}.\n\nOK installs ALL of them whenever this row updates.\n"
+                    "Cancel goes back so you can tick the one you want.",
+                    parent=self, default=messagebox.CANCEL, icon=messagebox.WARNING,
+                ):
+                    return
             source = f"github:{repo}"
             if branch:
                 source += f"@{branch}"
@@ -429,7 +586,23 @@ class SourceDialog(tk.Toplevel):
         Releasing them here pins that moment to the main thread, during close,
         which is the only point at which it is certainly safe.
         """
+        # Timers first: an after() that fires into a half-torn-down dialog
+        # reaches for widgets that are gone.
+        for pending in ("_lookup_after", "_poll_after"):
+            token = getattr(self, pending, None)
+            if token is not None:
+                self.after_cancel(token)
+                setattr(self, pending, None)
+
         held = [getattr(self, name, None) for name in self.VARIABLES]
+        # The tick boxes are variables too, made after __init__ so the
+        # VARIABLES list does not cover them. Clearing the dict is what
+        # actually releases them; extending `held` first only makes them
+        # finalise at the same moment as the rest, after super().destroy(),
+        # rather than a few lines earlier. Same thread either way, which is
+        # the part that matters.
+        held.extend(self.folder_boxes.values())
+        self.folder_boxes.clear()
         for name in self.VARIABLES:
             setattr(self, name, None)
         super().destroy()
@@ -661,6 +834,18 @@ class App(ttk.Frame):
                 if entry.get("suggested"):
                     status = f"suggests {entry['suggested']}"
                     tags = ["suggested"]
+            elif core.covers_several_addons(entry):
+                # This row installs a whole repository of addons. It works, and
+                # it is usually not what was meant: every addon in the repo is
+                # written into AddOns whenever this one updates, and each of
+                # them reports an update whenever any of them changes.
+                #
+                # The engine already says so in a note, and the note goes into
+                # the Status column, which is 170 pixels wide -- a sentence
+                # there is a smudge, not a warning. A short flag is readable,
+                # and Set source now opens on the list to fix it with.
+                status = status or f"installs {len(entry['folders'])} addons"
+                tags.append("suggested")
             self.tree.insert(
                 "", "end", iid=name, text=name,
                 values=(
@@ -700,11 +885,34 @@ class App(ttk.Frame):
     # -- actions -------------------------------------------------------------
 
     def guard(self, action):
-        """Run something that may raise Fail, and put the message in a dialog."""
+        """Run something that may fail, and put the reason in a dialog.
+
+        Fail is the expected kind: a repo that cannot be reached, a folder that
+        is not there. Anything else is a bug in this program -- but a windowed
+        build has no console, so an unhandled exception in a button callback
+        goes nowhere at all. The button then appears to do nothing, and the
+        table redraws the old value, which reads as the app quietly undoing
+        what you asked for.
+
+        That is not hypothetical: v0.5.0 shipped with `Set source` raising
+        TypeError on every use, and it was reported as "it reverts back to the
+        source instead of leaving it unmanaged". Showing the error would not
+        have fixed the bug, but it would have named it.
+        """
         try:
             return action()
         except Fail as exc:
             messagebox.showerror("Cannot do that", str(exc), parent=self)
+            return None
+        except Exception as exc:  # noqa: BLE001 - see above; nowhere else to report
+            traceback.print_exc()
+            messagebox.showerror(
+                "Something went wrong",
+                f"{type(exc).__name__}: {exc}\n\n"
+                "This is a bug in this program, not something you did.\n"
+                f"Please report it at {ISSUES_URL}",
+                parent=self,
+            )
             return None
 
     def choose_folder(self) -> None:
@@ -751,7 +959,7 @@ class App(ttk.Frame):
             return
         source, copy = dialog.result
         keep = dialog.keep_backup
-        if self.guard(lambda: core.set_source(self.state, name, source, copy=copy, backup=keep)) is None:
+        if self.guard(lambda: core.set_source(self.install(), name, source, copy=copy, backup=keep)) is None:
             return
         core.save(self.state)
         self.refresh()

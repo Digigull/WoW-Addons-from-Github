@@ -199,6 +199,313 @@ class WindowTests(unittest.TestCase):
         written = json.loads(core.MANIFEST.read_text())
         self.assertEqual(core.current(written)["addons"]["Bound"]["installed"], "v3")
 
+    # -- choosing an addon out of a repository -------------------------------
+
+    def offer(self, folders, error=None):
+        """Stand in for the repository, without a network."""
+        def listing(spec):
+            if error:
+                raise core.Fail(error)
+            return list(folders)
+        real = core.addons_in_repo
+        core.addons_in_repo = listing
+        self.addCleanup(lambda: setattr(core, "addons_in_repo", real))
+
+    def looked_up_dialog(self, name, repo, folders, error=None):
+        self.offer(folders, error)
+        dlg = self.dialog(name)
+        dlg.choice.set("github")
+        dlg.repo.set(repo)
+        dlg._begin_lookup()
+        for _ in range(40):          # let the worker answer and the poll drain
+            self.pump(2)
+            dlg._drain_lookups()
+            if dlg.looked_up or dlg.lookup_status.cget("text").startswith(("could not", "one addon")):
+                break
+        return dlg
+
+    def test_a_repo_of_several_addons_offers_them_all(self):
+        dlg = self.looked_up_dialog("Bound", "o/r", ["Alpha", "Beta", "Gamma"])
+        self.assertEqual(sorted(dlg.folder_boxes), ["Alpha", "Beta", "Gamma"])
+        self.assertIn("3 addons", dlg.lookup_status.cget("text"))
+        dlg.destroy()
+
+    def test_the_addon_being_bound_is_ticked_for_you(self):
+        # The row is called Bound; if the repo holds a folder of that name it
+        # is almost certainly the one meant.
+        dlg = self.looked_up_dialog("Bound", "o/r", ["Alpha", "Bound", "Gamma"])
+        self.assertTrue(dlg.folder_boxes["Bound"].get())
+        self.assertFalse(dlg.folder_boxes["Alpha"].get())
+        self.assertEqual(dlg.folder.get(), "Bound")
+        dlg.destroy()
+
+    def test_nothing_is_ticked_when_nothing_matches(self):
+        """A wrong guess arriving pre-ticked is worse than no guess.
+
+        It will be accepted without being read, and the addon then updates from
+        somebody else's folder.
+        """
+        dlg = self.looked_up_dialog("Bound", "o/r", ["Alpha", "Beta"])
+        self.assertFalse(any(v.get() for v in dlg.folder_boxes.values()))
+        self.assertEqual(dlg.folder.get(), "")
+        dlg.destroy()
+
+    def test_several_addons_can_be_ticked_for_one_row(self):
+        # A main addon plus its companion is one thing to the person updating
+        # it, and should be one row rather than two.
+        dlg = self.looked_up_dialog("Bound", "o/r", ["Main", "Main_Companion"])
+        dlg.folder_boxes["Main"].set(True)
+        dlg.folder_boxes["Main_Companion"].set(True)
+        dlg._folders_ticked()
+        dlg._save()
+        self.assertEqual(dlg.result, ("github:o/r#Main,Main_Companion", False))
+
+    def test_what_is_already_saved_comes_back_ticked(self):
+        entry = {"source": "github:o/r#Beta", "installed": None, "folders": []}
+        self.offer(["Alpha", "Beta", "Gamma"])
+        dlg = gui.SourceDialog(self.root, "Bound", entry, self.addons)
+        dlg._begin_lookup()
+        for _ in range(40):
+            self.pump(2)
+            dlg._drain_lookups()
+            if dlg.looked_up:
+                break
+        self.assertTrue(dlg.folder_boxes["Beta"].get())
+        self.assertFalse(dlg.folder_boxes["Alpha"].get())
+        dlg.destroy()
+
+    def test_a_repo_whose_root_is_the_addon_offers_no_choice(self):
+        # FrostSeek, Minn-Tinkers: the repository root IS the addon.
+        dlg = self.looked_up_dialog("Bound", "o/r", [])
+        self.assertEqual(dlg.folder_boxes, {})
+        self.assertIn("nothing to choose", dlg.lookup_status.cget("text"))
+        dlg._save()
+        self.assertEqual(dlg.result, ("github:o/r", False))
+
+    def test_a_repo_holding_exactly_one_addon_offers_no_choice_either(self):
+        """One candidate is not a choice, and ticking it would do harm.
+
+        A single tick box implies a decision. Worse, naming a folder switches
+        the row from the repository's RELEASES to the last commit touching that
+        folder -- so an addon publishing tagged releases would quietly start
+        reporting commit ids instead of version numbers. Unticked it installs
+        exactly the same folder and keeps its releases.
+        """
+        dlg = self.looked_up_dialog("Bound", "o/r", ["OnlyOne"])
+        self.assertEqual(dlg.folder_boxes, {}, "a single candidate is not a choice")
+        self.assertIn("OnlyOne", dlg.lookup_status.cget("text"))
+        self.assertIn("nothing to choose", dlg.lookup_status.cget("text"))
+        dlg._save()
+        self.assertEqual(dlg.result, ("github:o/r", False),
+                         "a lone folder must not be written into the source")
+
+    def test_a_lone_candidate_never_triggers_the_are_you_sure(self):
+        # The question is for a repository of several addons with none ticked.
+        # Asking it when there was nothing to tick would be nonsense.
+        dlg = self.looked_up_dialog("Bound", "o/r", ["OnlyOne"])
+        real = gui.messagebox.askokcancel
+        gui.messagebox.askokcancel = lambda *a, **k: self.fail("should not have asked")
+        try:
+            dlg._save()
+        finally:
+            gui.messagebox.askokcancel = real
+        self.assertEqual(dlg.result, ("github:o/r", False))
+
+    def test_a_folder_already_saved_survives_a_repo_that_offers_no_list(self):
+        # Someone who typed a folder by hand, for a repo too large to list or
+        # laid out unusually, must not have it silently dropped.
+        entry = {"source": "github:o/r#Deep/Thing", "installed": None, "folders": []}
+        self.offer([])
+        dlg = gui.SourceDialog(self.root, "Bound", entry, self.addons)
+        dlg._begin_lookup()
+        for _ in range(40):
+            self.pump(2)
+            dlg._drain_lookups()
+            if dlg.lookup_status.cget("text"):
+                break
+        self.assertEqual(dlg.folder.get(), "Deep/Thing")
+        dlg._save()
+        self.assertEqual(dlg.result, ("github:o/r#Deep/Thing", False))
+
+    def test_a_repo_that_cannot_be_read_says_so_and_does_not_block_saving(self):
+        dlg = self.looked_up_dialog("Bound", "o/r", [], error="no such repo, or it is private: o/r")
+        self.assertIn("could not read", dlg.lookup_status.cget("text"))
+        dlg._save()
+        self.assertEqual(dlg.result, ("github:o/r", False))
+
+    def test_saving_with_nothing_ticked_asks_first(self):
+        """Binding the whole repository is a real choice and usually a slip.
+
+        The consequence -- every addon in the repo landing in AddOns -- is not
+        visible from the dialog, so it is worth one question.
+        """
+        dlg = self.looked_up_dialog("Bound", "o/r", ["Alpha", "Beta", "Gamma"])
+        asked = []
+        real = gui.messagebox.askokcancel
+        gui.messagebox.askokcancel = lambda title, message, **k: asked.append(message) or False
+        try:
+            dlg._save()
+        finally:
+            gui.messagebox.askokcancel = real
+        self.assertEqual(len(asked), 1)
+        self.assertIn("ALL of them", asked[0])
+        self.assertIsNone(dlg.result, "Cancel must go back, not save")
+        dlg.destroy()
+
+    def test_saying_ok_binds_the_whole_repository(self):
+        dlg = self.looked_up_dialog("Bound", "o/r", ["Alpha", "Beta", "Gamma"])
+        real = gui.messagebox.askokcancel
+        gui.messagebox.askokcancel = lambda *a, **k: True
+        try:
+            dlg._save()
+        finally:
+            gui.messagebox.askokcancel = real
+        self.assertEqual(dlg.result, ("github:o/r", False))
+
+    def test_a_ticked_choice_saves_without_a_question(self):
+        dlg = self.looked_up_dialog("Bound", "o/r", ["Alpha", "Bound", "Gamma"])
+        real = gui.messagebox.askokcancel
+        gui.messagebox.askokcancel = lambda *a, **k: self.fail("should not have asked")
+        try:
+            dlg._save()
+        finally:
+            gui.messagebox.askokcancel = real
+        self.assertEqual(dlg.result, ("github:o/r#Bound", False))
+
+    def test_the_tick_boxes_are_released_when_the_dialog_closes(self):
+        """A BooleanVar per addon is a new way to have the same old bug.
+
+        They are made after __init__, so the VARIABLES list does not cover
+        them. Left in the dict, they outlive the dialog and are finalised
+        whenever the collector next runs -- which in this program can be on the
+        worker thread, where Tcl aborts the process.
+
+        Asserting the dict is empty is not enough on its own: what matters is
+        that nothing is left for another thread to finalise, so the test drops
+        its own references there and requires that to be inert.
+        """
+        import threading
+
+        dlg = self.looked_up_dialog("Bound", "o/r", ["Alpha", "Beta"])
+        self.assertTrue(dlg.folder_boxes)
+        held = list(dlg.folder_boxes.values())
+
+        dlg.destroy()
+        self.assertEqual(dlg.folder_boxes, {}, "the dialog still holds tk variables")
+
+        gc.collect()  # sweep unrelated garbage on THIS thread first
+        failures = []
+
+        def release():
+            try:
+                del held[:]
+                gc.collect()
+            except Exception as exc:  # pragma: no cover - the thing ruled out
+                failures.append(exc)
+
+        thread = threading.Thread(target=release)
+        thread.start()
+        thread.join()
+        self.assertEqual(failures, [])
+
+    # -- the Set source button, end to end -----------------------------------
+
+    def click_set_source(self, name, result, keep_backup=True):
+        """Drive App.set_source with the dialog answering `result`.
+
+        The button, not the pieces. Every test here used to call core.set_source
+        directly with an install, so nothing ever executed the line in App that
+        chooses what to pass -- and that line was wrong in v0.5.0: it handed
+        over the whole manifest, the TypeError escaped guard() (which catches
+        only Fail), and the save never happened. The table then redrew the old
+        value, which reads exactly like the source reverting by itself.
+        """
+        class Dialog:
+            def __init__(self, *_a, **_k):
+                self.result, self.keep_backup = result, keep_backup
+
+        real_dialog = gui.SourceDialog
+        gui.SourceDialog = Dialog
+        # An INSTANCE attribute, removed again rather than reassigned. Putting
+        # the bound method back as an instance attribute keeps a reference to
+        # the Tk object past destroy(), and it then finalises on whatever
+        # thread the collector is on -- "main thread is not in main loop", and
+        # on the next line Tcl_AsyncDelete aborts the process. Deleting it
+        # restores the ordinary class lookup and holds nothing.
+        self.root.wait_window = lambda *_a, **_k: None
+        try:
+            self.app.tree.selection_set(name)
+            self.app.set_source()
+        finally:
+            gui.SourceDialog = real_dialog
+            del self.root.wait_window
+
+    def test_setting_a_source_from_the_window_actually_saves_it(self):
+        self.click_set_source("Loose", ("github:o/r#Sub", False))
+        self.assertEqual(self.app.entries()["Loose"]["source"], "github:o/r#Sub")
+        written = json.loads(core.MANIFEST.read_text())
+        self.assertEqual(core.current(written)["addons"]["Loose"]["source"], "github:o/r#Sub")
+
+    def test_a_bound_addon_can_be_returned_to_unmanaged(self):
+        """Reported from a real install: choosing Unmanaged reverted.
+
+        Nothing was reverting. The save was raising, so the manifest still held
+        the old source and refresh() drew it back.
+        """
+        self.assertEqual(self.app.entries()["Bound"]["source"], "github:o/r")
+        self.click_set_source("Bound", ("unmanaged", False))
+        self.assertEqual(self.app.entries()["Bound"]["source"], "unmanaged")
+        written = json.loads(core.MANIFEST.read_text())
+        self.assertEqual(core.current(written)["addons"]["Bound"]["source"], "unmanaged")
+
+    def test_the_table_shows_the_new_source_immediately(self):
+        # The window is the only feedback there is; a correct manifest behind a
+        # stale table is indistinguishable from the bug this replaced.
+        self.click_set_source("Bound", ("unmanaged", False))
+        # The table writes unmanaged in brackets, to read as an absence
+        # of a source rather than as a source called "unmanaged".
+        self.assertEqual(self.app.tree.set("Bound", "source"), "(unmanaged)")
+
+    def test_an_unexpected_error_is_shown_rather_than_swallowed(self):
+        """A windowed build has no console for a traceback to land in.
+
+        v0.5.0's Set source raised TypeError on every use. Nothing was shown,
+        the save never happened, and the table redrew the old value -- reported
+        as "it reverts back to the source instead of leaving it unmanaged".
+        Showing the error would not have fixed the bug, but it would have named
+        it instead of making the program look untrustworthy.
+        """
+        shown = []
+        real = gui.messagebox.showerror
+        gui.messagebox.showerror = lambda title, message, **k: shown.append((title, message))
+        try:
+            def boom():
+                raise TypeError("something a user cannot possibly have caused")
+            self.assertIsNone(self.app.guard(boom))
+        finally:
+            gui.messagebox.showerror = real
+        self.assertEqual(len(shown), 1)
+        title, message = shown[0]
+        self.assertIn("wrong", title.lower())
+        self.assertIn("TypeError", message)
+        self.assertIn("bug in this program", message)
+
+    def test_an_expected_failure_still_reads_as_ordinary(self):
+        # A repo that cannot be reached is not a crash and must not be dressed
+        # up as one, or the real crashes stop standing out.
+        shown = []
+        real = gui.messagebox.showerror
+        gui.messagebox.showerror = lambda title, message, **k: shown.append((title, message))
+        try:
+            def nope():
+                raise core.Fail("no such repo, or it is private: o/r")
+            self.app.guard(nope)
+        finally:
+            gui.messagebox.showerror = real
+        title, message = shown[0]
+        self.assertEqual(title, "Cannot do that")
+        self.assertNotIn("bug in this program", message)
+
     # -- several WoW folders -------------------------------------------------
 
     def second_install(self, name="Wrath"):
@@ -390,6 +697,16 @@ class WindowTests(unittest.TestCase):
 
         # And releasing them from another thread must now be inert, because the
         # dialog no longer holds the only references keeping them alive.
+        #
+        # Sweep the main thread first. gc.collect() on the worker below
+        # finalises everything pending in the whole process, not only what this
+        # test made -- so a tk variable left over by any earlier test would be
+        # finalised on that thread, raise "main thread is not in main loop", and
+        # abort the run with Tcl_AsyncDelete. The failure would look like this
+        # test's, and would not be. `variables` still holds its own references,
+        # so this collect cannot take them.
+        gc.collect()
+
         import threading
 
         failures = []

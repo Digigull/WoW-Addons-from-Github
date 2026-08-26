@@ -728,6 +728,12 @@ def split_repo_spec(repo_spec: str) -> tuple[str, str | None, str | None]:
     The folder is split off first: a branch name may not contain '#', but a
     path certainly may contain '@' (and nothing stops a branch containing '/'),
     so taking them in the other order would mis-split both.
+
+    Several folders may be named, separated by commas: an addon that is really
+    two folders of the same repository -- a main addon and its companion -- is
+    one thing to the person updating it, and should be one row in the table.
+    `wanted_folders` splits them; this returns the field as written so the
+    source string round-trips unchanged.
     """
     folder = None
     if "#" in repo_spec:
@@ -737,6 +743,13 @@ def split_repo_spec(repo_spec: str) -> tuple[str, str | None, str | None]:
     if "@" in repo_spec:
         repo_spec, branch = repo_spec.split("@", 1)
     return repo_spec, branch, folder
+
+
+def wanted_folders(folder: str | None) -> list[str]:
+    """The folders a source names, in order, with blanks and slashes trimmed."""
+    if not folder:
+        return []
+    return [part.strip().strip("/") for part in folder.split(",") if part.strip().strip("/")]
 
 
 def default_branch(repo: str) -> str:
@@ -767,12 +780,18 @@ def latest_github(repo_spec: str) -> tuple[str, str]:
     """(version, zip url) for the newest thing at owner/repo[@branch][#folder]."""
     repo, branch, folder = split_repo_spec(repo_spec)
 
-    if folder:
+    chosen = wanted_folders(folder)
+    if chosen:
         # A named folder overrides releases deliberately. A release asset is
         # packaged for one addon; there is no reason its contents line up with
         # a path in the source tree, so honouring both would mean guessing.
         ref = branch or default_branch(repo)
-        version = latest_folder_commit(repo, ref, folder)
+        version = latest_folder_commit(repo, ref, chosen[0])
+        for extra in chosen[1:]:
+            # One version for the row, and it has to move when ANY of the
+            # folders does -- otherwise ticking a second folder would quietly
+            # stop that folder ever reporting an update.
+            version = f"{version}+{latest_folder_commit(repo, ref, extra)[:7]}"
         return version, f"https://api.github.com/repos/{repo}/zipball/{ref}"
 
     if branch:
@@ -795,6 +814,70 @@ def latest_github(repo_spec: str) -> tuple[str, str]:
     commits = http_json(f"https://api.github.com/repos/{repo}/commits/{ref}")
     sha = commits["sha"][:12] if commits else ref
     return sha, f"https://api.github.com/repos/{repo}/zipball/{ref}"
+
+
+def addons_in_repo(repo_spec: str) -> list[str]:
+    """The addon folders a repository holds, for somebody to choose from.
+
+    A folder counts as an addon when it holds a .toc named after itself -- the
+    same rule the installer applies to an archive, so the list cannot promise
+    something the install would then not find.
+
+    One request, not one per folder: the git trees API returns the whole file
+    list at a ref. The contents API would need a call per directory, which for
+    a repository of nine addons is nine round trips to draw one list.
+
+    Bundled libraries are excluded by depth. `MyAddon/Libs/AceGUI-3.0` holds
+    AceGUI-3.0.toc and is an addon by the letter of the rule, but nobody
+    choosing what to install means it -- and installing it separately is the
+    mistake `addon_dirs_in` is bounded to avoid.
+    """
+    repo, branch, _folder = split_repo_spec(repo_spec)
+    ref = branch or default_branch(repo)
+    tree = http_json(f"https://api.github.com/repos/{repo}/git/trees/{ref}?recursive=1")
+    if not tree:
+        die(f"cannot read {repo} at {ref}")
+
+    tocs, directories = {}, set()
+    for item in tree.get("tree", []):
+        path = item.get("path", "")
+        if item.get("type") == "tree":
+            directories.add(path)
+        elif item.get("type") == "blob" and path.lower().endswith(".toc"):
+            tocs.setdefault(path.rsplit("/", 1)[0] if "/" in path else "", []).append(path)
+
+    found = []
+    for directory, paths in tocs.items():
+        if not directory or directory.count("/") > 1:
+            continue
+        name = directory.rsplit("/", 1)[-1]
+        if any(path.rsplit("/", 1)[-1] == f"{name}.toc" for path in paths):
+            found.append(directory)
+
+    if tree.get("truncated") and not found:
+        # Enormous repository. Say so rather than showing an empty list, which
+        # would read as "this repo has no addons in it".
+        die(f"{repo} is too large to list; name the folder yourself")
+    return sorted(found, key=str.lower)
+
+
+def likely_addon(name: str, folders: list[str]) -> str | None:
+    """Which of a repository's folders is probably this addon.
+
+    An exact name match, else a case-insensitive one, else nothing. Nothing is
+    a perfectly good answer: a wrong guess that arrives pre-ticked is worse
+    than no guess, because it will be accepted without being read.
+    """
+    if not folders:
+        return None
+    for folder in folders:
+        if folder.rsplit("/", 1)[-1] == name:
+            return folder
+    lowered = name.lower()
+    for folder in folders:
+        if folder.rsplit("/", 1)[-1].lower() == lowered:
+            return folder
+    return None
 
 
 def download(url: str) -> bytes:
@@ -905,7 +988,7 @@ def install_zip(
     *,
     backup: bool = False,
     entry: dict | None = None,
-    only: str | None = None,
+    only: str | list[str] | None = None,
     report=None,
 ) -> list[str]:
     """Unpack an addon archive into AddOns. Returns the folder names written.
@@ -914,10 +997,11 @@ def install_zip(
     caller can report exactly what it would have installed without this needing
     to know how that report is displayed.
 
-    `only` narrows the archive to one folder inside it, for a repository that
-    holds several addons. Without it every addon folder in the archive is
-    installed, which is right for an addon shipping its own library and wrong
-    for a repository of nine unrelated addons.
+    `only` narrows the archive to named folders inside it, for a repository
+    that holds several addons -- one name, a comma-separated string, or a list.
+    Without it every addon folder in the archive is installed, which is right
+    for an addon shipping its own library and wrong for a repository of nine
+    unrelated addons.
 
     `backup` moves an existing real folder aside instead of deleting it.
     `entry` refines that PER FOLDER: the decision used to be taken once from
@@ -944,11 +1028,18 @@ def install_zip(
         except zipfile.BadZipFile:
             die("downloaded file is not a zip -- check the source is an addon release")
 
-        root = descend_to(tmpdir, only) if only else tmpdir
-        folders = addon_dirs_in(root)
-        if not folders:
-            where = f"'{only}'" if only else "the archive"
-            die(f"no addon folder (a directory holding its own .toc) found in {where}")
+        chosen = wanted_folders(only) if isinstance(only, str) else list(only or [])
+        if chosen:
+            folders = []
+            for name in chosen:
+                found = addon_dirs_in(descend_to(tmpdir, name))
+                if not found:
+                    die(f"no addon folder (a directory holding its own .toc) found in '{name}'")
+                folders.extend(found)
+        else:
+            folders = addon_dirs_in(tmpdir)
+            if not folders:
+                die("no addon folder (a directory holding its own .toc) found in the archive")
 
         written = []
         for folder, name in folders:
@@ -984,6 +1075,21 @@ def displace(destination: Path, *, backup: bool, report=None) -> None:
     moved = backup_name(destination)
     report("note", f"moving existing folder aside -> {moved.name}")
     destination.rename(moved)
+
+
+def covers_several_addons(entry: dict) -> bool:
+    """Is this row bound to a whole repository that holds several addons?
+
+    Answered from what the last install actually wrote, not from the source
+    text: a `github:` source naming no folder MIGHT hold one addon or nine, and
+    the difference is only knowable once the archive has been unpacked. The
+    folder list is that answer, already recorded.
+    """
+    if not entry.get("source", "unmanaged").startswith("github:"):
+        return False
+    if wanted_folders(split_repo_spec(entry["source"][len("github:"):])[2]):
+        return False
+    return len(entry.get("folders") or []) > 1
 
 
 def should_backup_folder(entry: dict, folder: str) -> bool:

@@ -1278,3 +1278,145 @@ class SeveralWoWFolders(unittest.TestCase):
             with self.subTest(call=call):
                 with self.assertRaises(TypeError):
                     call()
+
+
+class OfferingWhatARepositoryHolds(unittest.TestCase):
+    """The list somebody ticks from, and the rule behind it.
+
+    A folder counts as an addon when it holds a .toc named after itself -- the
+    same rule the installer applies to an archive, so the list cannot offer
+    something the install would then fail to find.
+    """
+
+    def setUp(self):
+        self._real = addons.http_json
+        self.addCleanup(lambda: setattr(addons, "http_json", self._real))
+
+    def serve(self, paths, truncated=False):
+        blobs = [{"path": p, "type": "blob"} for p in paths]
+        trees = [{"path": d, "type": "tree"} for d in sorted(
+            {"/".join(p.split("/")[:i]) for p in paths for i in range(1, p.count("/") + 1)})]
+        addons.http_json = lambda url: (
+            {"tree": blobs + trees, "truncated": truncated} if "git/trees" in url
+            else {"default_branch": "main"}
+        )
+
+    def test_a_repository_of_several_addons(self):
+        self.serve([
+            "AscensionHonorTracker/AscensionHonorTracker.toc",
+            "GnomeWorks/GnomeWorks.toc",
+            "TurboPlates/TurboPlates.toc",
+            "management/notes.md",
+            "README.md",
+        ])
+        self.assertEqual(addons.addons_in_repo("o/r"),
+                         ["AscensionHonorTracker", "GnomeWorks", "TurboPlates"])
+
+    def test_bundled_libraries_are_not_offered(self):
+        # LootCollector ships LibStub and LibBase64-1.0 inside itself. Each is
+        # an addon by the letter of the rule and nobody choosing means them.
+        self.serve([
+            "LootCollector/LootCollector.toc",
+            "LootCollector/Libs/LibStub/LibStub.toc",
+            "LootCollector/Libs/LibBase64-1.0/LibBase64-1.0.toc",
+        ])
+        self.assertEqual(addons.addons_in_repo("o/r"), ["LootCollector"])
+
+    def test_a_folder_whose_toc_does_not_match_is_not_an_addon(self):
+        # The client loads Folder/Folder.toc and ignores anything else, so a
+        # mismatch is not an addon however much it looks like one.
+        self.serve(["Something/Different.toc"])
+        self.assertEqual(addons.addons_in_repo("o/r"), [])
+
+    def test_a_repo_whose_root_is_the_addon_offers_nothing(self):
+        # FrostSeek, Minn-Tinkers. There is no choice to make.
+        self.serve(["FrostSeek.toc", "FrostSeek_Wrath.toc", "Core.lua"])
+        self.assertEqual(addons.addons_in_repo("o/r"), [])
+
+    def test_an_addon_one_level_down_is_offered(self):
+        self.serve(["src/MyAddon/MyAddon.toc", "docs/readme.md"])
+        self.assertEqual(addons.addons_in_repo("o/r"), ["src/MyAddon"])
+
+    def test_a_repository_too_large_to_list_says_so(self):
+        # Better than an empty list, which reads as "no addons in here".
+        self.serve(["docs/readme.md"], truncated=True)
+        with self.assertRaises(addons.Fail) as caught:
+            addons.addons_in_repo("o/r")
+        self.assertIn("too large", str(caught.exception))
+
+    def test_the_likely_one_is_the_addons_own_name(self):
+        folders = ["Alpha", "GnomeWorks", "Zeta"]
+        self.assertEqual(addons.likely_addon("GnomeWorks", folders), "GnomeWorks")
+        self.assertEqual(addons.likely_addon("gnomeworks", folders), "GnomeWorks")
+
+    def test_no_guess_at_all_when_nothing_matches(self):
+        """A wrong guess that arrives pre-ticked is worse than no guess.
+
+        It gets accepted without being read, and the addon then updates from
+        somebody else's folder -- silently, because both are real addons.
+        """
+        self.assertIsNone(addons.likely_addon("Bagnon", ["Alpha", "Beta"]))
+        self.assertIsNone(addons.likely_addon("Anything", []))
+
+
+class SeveralFoldersInOneRow(unittest.TestCase):
+    """A main addon and its companion are one thing to whoever updates them."""
+
+    def test_a_source_can_name_more_than_one(self):
+        self.assertEqual(addons.wanted_folders("Main,Main_Companion"),
+                         ["Main", "Main_Companion"])
+        self.assertEqual(addons.wanted_folders(" Main , Sub/Deep , "),
+                         ["Main", "Sub/Deep"])
+        self.assertEqual(addons.wanted_folders(""), [])
+        self.assertEqual(addons.wanted_folders(None), [])
+
+    def test_only_the_named_folders_are_installed(self):
+        archive = mkzip({
+            "r-1a2b/Main/Main.toc": "a",
+            "r-1a2b/Main_Companion/Main_Companion.toc": "b",
+            "r-1a2b/Unrelated/Unrelated.toc": "c",
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            written = addons.install_zip(archive, pathlib.Path(tmp), dry_run=True,
+                                         only="Main,Main_Companion")
+        self.assertEqual(sorted(written), ["Main", "Main_Companion"])
+
+    def test_the_version_moves_when_either_folder_moves(self):
+        responses = {}
+        real = addons.http_json
+        addons.http_json = lambda url: responses.get(url)
+        self.addCleanup(lambda: setattr(addons, "http_json", real))
+        repo = "https://api.github.com/repos/o/r"
+        responses[repo] = {"default_branch": "main"}
+        responses[f"{repo}/commits?sha=main&path=Main&per_page=1"] = [{"sha": "aaaaaaaaaaaa"}]
+        responses[f"{repo}/commits?sha=main&path=Sub&per_page=1"] = [{"sha": "bbbbbbbbbbbb"}]
+        first = addons.latest_github("o/r#Main,Sub")[0]
+
+        # Only the SECOND folder changes. Were the version taken from the first
+        # alone, ticking a second folder would quietly stop it ever updating.
+        responses[f"{repo}/commits?sha=main&path=Sub&per_page=1"] = [{"sha": "cccccccccccc"}]
+        self.assertNotEqual(addons.latest_github("o/r#Main,Sub")[0], first)
+
+
+class FlaggingAWholeRepositoryBinding(unittest.TestCase):
+    def test_a_row_that_installs_several_addons_is_flagged(self):
+        entry = {"source": "github:o/r", "folders": ["A", "B", "C"], "installed": "v1"}
+        self.assertTrue(addons.covers_several_addons(entry))
+
+    def test_a_row_bound_to_one_folder_is_not(self):
+        entry = {"source": "github:o/r#A", "folders": ["A"], "installed": "v1"}
+        self.assertFalse(addons.covers_several_addons(entry))
+
+    def test_an_ordinary_single_addon_repo_is_not(self):
+        entry = {"source": "github:o/r", "folders": ["OnlyOne"], "installed": "v1"}
+        self.assertFalse(addons.covers_several_addons(entry))
+
+    def test_nothing_is_claimed_before_the_first_install(self):
+        # Whether a github: source holds one addon or nine is unknowable until
+        # the archive is unpacked, so an unflagged row is honest, not a miss.
+        self.assertFalse(addons.covers_several_addons({"source": "github:o/r"}))
+
+    def test_local_and_unmanaged_rows_are_never_flagged(self):
+        self.assertFalse(addons.covers_several_addons(
+            {"source": "local:/x", "folders": ["A", "B"], "installed": "linked"}))
+        self.assertFalse(addons.covers_several_addons({"source": "unmanaged"}))
