@@ -202,8 +202,16 @@ class WindowTests(unittest.TestCase):
     # -- choosing an addon out of a repository -------------------------------
 
     def offer(self, folders, error=None):
-        """Stand in for the repository, without a network."""
-        def listing(spec):
+        """Stand in for the repository, without a network.
+
+        The signature is spelled out rather than swallowed with **kwargs on
+        purpose. The dialog's lookup runs on a worker that turns any exception
+        into status text, so a double that does not accept what the real
+        function is now called with does not fail loudly -- it reports a
+        repository with nothing in it, and nine tests fail somewhere else
+        entirely. That is exactly how this drifted once already.
+        """
+        def listing(spec, *, no_api=False):
             if error:
                 raise core.Fail(error)
             return list(folders)
@@ -222,6 +230,14 @@ class WindowTests(unittest.TestCase):
             dlg._drain_lookups()
             if dlg.looked_up or dlg.lookup_status.cget("text").startswith(("could not", "one addon")):
                 break
+        said = dlg.lookup_status.cget("text")
+        if error is None and said.startswith("could not read"):
+            # The lookup raised something this test never asked it to raise.
+            # Said here, where the cause is, rather than left for the caller to
+            # discover as a missing tick box: the worker turns any exception
+            # into this line, so a stale double reads exactly like a repository
+            # that holds no addons.
+            self.fail(f"the repository lookup failed unexpectedly: {said!r}")
         return dlg
 
     def test_a_repo_of_several_addons_offers_them_all(self):
