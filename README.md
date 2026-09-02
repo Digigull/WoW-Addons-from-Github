@@ -100,7 +100,7 @@ Running from a checkout instead needs **Python 3.9 or newer**, and that is the w
 |---|---|
 | `init <path>` | Remember where the client is. Accepts your WoW folder, its `Interface` folder, or `Interface/AddOns` itself. |
 | `scan` | Read every addon already installed and record it, guessing a source from each `.toc` where it can. Drops unmanaged rows whose folder you have deleted; keeps bound ones, flagged *not installed*. |
-| `install <repo>` | Fetch an addon you do **not** have yet and bind it in one step. Takes `owner/repo`, `owner/repo#Folder` or any github.com link; `--folder` (repeatable) picks addons out of a repository that holds several, `--branch` follows a branch instead of releases. |
+| `install <repo>` | Fetch an addon you do **not** have yet and bind it in one step. Takes `owner/repo`, `owner/repo#Folder` or any github.com link; `--folder` (repeatable) picks addons out of a repository that holds several, `--branch` follows a branch instead of releases. `--reset-settings` also deletes that addon's saved variables (account and every character) once it has installed, keeping a copy of each unless you add `--no-settings-backup`. |
 | `list` | Every addon, its source, and its installed version. Bound addons first, then the rest, each alphabetically. |
 | `set <Addon> <source>` | Bind one addon to where its updates come from. |
 | `accept` | Take every source that `scan` suggested, in one go. |
@@ -306,6 +306,15 @@ Everything the terminal does, in one window:
   its own row and its own binding, rather than one row that reinstalls all of them
   whenever any one of them changes. A repository holding a single addon is bound whole,
   which keeps it following that repository's releases.
+- **Installing over an addon you already have asks first**, in a window that
+  keeps two very different questions apart. *Make a backup* — ticked — moves the folder
+  that is there now to `<Name>.replaced` instead of deleting it. Below a rule, under a red
+  **Delete!** heading, is the part that is not undoable: **delete the associated saved
+  variables** — off by default, and it names every file it means, account-wide and one per
+  character, so you can see the extent of it before agreeing. Ticking it enables *back up
+  the saved variables first*, which is itself ticked: those are settings you made, and no
+  repository anywhere has a copy. They are deleted **after** the addon installs, so a
+  download that fails takes nothing with it.
 - **Set source…** opens a dialog over the selected addon: a local folder (with Browse),
   a GitHub repo, an optional branch to track, an optional folder inside the repo, or
   unmanaged. Pasting a github.com link to a folder fills all three in.
@@ -336,6 +345,11 @@ Everything the terminal does, in one window:
   not write, whatever it recorded about the addon you bound. Turn the copy
   off entirely with `--no-backup`, or the checkbox in the Set-source dialog, and an
   existing folder is replaced outright.
+- **It never touches your saved variables unless you tick the box that says so.**
+  Updating an addon leaves `WTF/Account/…/SavedVariables/<Addon>.lua` exactly where it is —
+  your bars stay where you put them. The only thing that deletes one is the **Delete!**
+  section of the install confirmation, or `install --reset-settings`, and both keep a
+  `.replaced` copy beside each file unless you turn that off too.
 - **A rescan never throws away a binding.** An unmanaged row whose folder you deleted is
   dropped from the list, because it held nothing of yours. A row you had bound is kept and
   flagged *not installed* — that is also how an addon you have bound but not yet fetched

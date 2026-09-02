@@ -234,7 +234,7 @@ def cmd_install(args, state: dict) -> None:
     being about something already installed.
     """
     install = selected(args, state)
-    core.addons_dir(install)  # fails now, rather than after the download
+    root = core.addons_dir(install)  # fails now, rather than after the download
     no_api = args.no_api or core.checks_without_api(install)
 
     found = core.parse_repo(args.repo)
@@ -290,6 +290,33 @@ def cmd_install(args, state: dict) -> None:
             core.save(state)
         for old, new in settled:
             note(f"{old} installs as {new}; listed under that name.")
+        if args.reset_settings:
+            wipe_settings(install, root, [name for name, _ in plan], dict(settled),
+                          backup=not args.no_settings_backup)
+
+
+def wipe_settings(install: dict, root: Path, names: list[str], renamed: dict,
+                  *, backup: bool) -> None:
+    """Delete what the client remembers about these addons, after installing them.
+
+    After, never before: settings are the one thing here that no source can
+    fetch again, so a download that failed must not take them with it. An addon
+    whose install did not land keeps its settings for the same reason -- the old
+    version is still there, still using them.
+    """
+    entries = install.get("addons", {})
+    for name in names:
+        name = renamed.get(name, name)
+        if not entries.get(name, {}).get("installed"):
+            continue
+        deleted, problems = core.remove_saved_variables(
+            core.saved_variables(root, name), backup=backup
+        )
+        if deleted:
+            note(f"{name}: {len(deleted)} saved variables file(s) deleted"
+                 + (" (copies kept beside them)" if backup else " (no copy kept)"))
+        for problem in problems:
+            warn(f"{name}: saved variables: {problem}")
 
 
 def cmd_accept(args, state: dict) -> None:
@@ -468,6 +495,11 @@ def build_parser(prog: str = "addons.py", epilog: str | None = None) -> argparse
     p.add_argument("--folder", action="append", default=[], metavar="NAME",
                    help="which addon in the repository (repeatable)")
     p.add_argument("--branch", help="track this branch instead of the latest release")
+    p.add_argument("--reset-settings", action="store_true",
+                   help="afterwards, delete this addon's saved variables in WTF "
+                        "(account and every character)")
+    p.add_argument("--no-settings-backup", action="store_true",
+                   help="with --reset-settings: delete them outright, keeping no copy")
     p.add_argument("--no-api", action="store_true",
                    help="ask git and codeload instead of the GitHub API")
     p.set_defaults(func=cmd_install)

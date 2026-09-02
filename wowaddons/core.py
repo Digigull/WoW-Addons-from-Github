@@ -1971,6 +1971,114 @@ def fetch(url: str) -> bytes:
         return response.read()
 
 
+# ── saved variables (the WTF folder) ─────────────────────────────────────────
+# An addon's settings do not live with the addon. The client keeps them in
+#
+#   WTF/Account/<ACCOUNT>/SavedVariables/<Addon>.lua              account-wide
+#   WTF/Account/<ACCOUNT>/<Realm>/<Char>/SavedVariables/<Addon>.lua  per character
+#
+# plus a .lua.bak the client rotates beside each. Replacing an addon never
+# touches any of that, which is almost always what you want -- your bars stay
+# where you put them across an update. The exception is the reason this exists:
+# settings written by a different fork of the addon, or a version old enough
+# that the new one chokes on them, and the fix is to start clean.
+#
+# Nothing here is called unless somebody ticks a box that says so. Deleting
+# settings is not a side effect of installing anything.
+
+
+def _named(path: Path, name: str) -> list[Path]:
+    """Directories inside `path` called `name`, whatever case they are in.
+
+    The client is case-blind about all of this -- Windows because its
+    filesystem is, a Wine install because Wine makes it so -- and real WTF
+    folders in the wild are spelled Account, ACCOUNT and account.
+    """
+    try:
+        return [child for child in path.iterdir()
+                if child.is_dir() and child.name.lower() == name.lower()]
+    except OSError:
+        return []
+
+
+def _subdirs(path: Path) -> list[Path]:
+    try:
+        return sorted((child for child in path.iterdir() if child.is_dir()),
+                      key=lambda p: p.name.lower())
+    except OSError:
+        return []
+
+
+def wtf_dir(root: Path) -> Path | None:
+    """The WTF folder belonging to the client whose AddOns folder this is.
+
+    AddOns is <WoW>/Interface/AddOns, so WTF is two levels up. Found rather
+    than assumed: a folder that is not there is a perfectly ordinary answer for
+    a client that has never been run.
+    """
+    for candidate in _named(root.parent.parent, "WTF"):
+        return candidate
+    return None
+
+
+def saved_variable_dirs(wtf: Path) -> list[Path]:
+    """Every SavedVariables folder in a WTF tree: one per account, one per character."""
+    found = []
+    for accounts in _named(wtf, "Account"):
+        for account in _subdirs(accounts):
+            found.extend(_named(account, "SavedVariables"))
+            for realm in _subdirs(account):
+                if realm.name.lower() == "savedvariables":
+                    continue
+                for character in _subdirs(realm):
+                    found.extend(_named(character, "SavedVariables"))
+    return found
+
+
+def saved_variables(root: Path, addon: str) -> list[Path]:
+    """Every settings file the client keeps for one addon, account and character.
+
+    The .lua.bak beside each is included: it is the client's own previous copy,
+    and leaving it behind while deleting the .lua would have the addon come
+    back with the settings you just asked to be rid of.
+    """
+    wtf = wtf_dir(root)
+    if wtf is None:
+        return []
+    wanted = (f"{addon.lower()}.lua", f"{addon.lower()}.lua.bak")
+    found = []
+    for directory in saved_variable_dirs(wtf):
+        try:
+            found.extend(child for child in directory.iterdir()
+                         if child.is_file() and child.name.lower() in wanted)
+        except OSError:
+            continue
+    return sorted(found, key=lambda p: str(p).lower())
+
+
+def remove_saved_variables(paths: list[Path], *, backup: bool) -> tuple[list[Path], list[str]]:
+    """Delete these files, keeping a copy of each first if asked.
+
+    Returns (deleted, problems). A copy is `<file>.replaced`, beside the
+    original: the client loads <Addon>.lua and nothing else, so a file with
+    another name sitting next to it is invisible to the game and obvious to
+    whoever goes looking for it.
+
+    A file that cannot be removed is reported, not raised: one locked file must
+    not leave the rest half-done and the caller with no idea which half.
+    """
+    deleted, problems = [], []
+    for path in paths:
+        try:
+            if backup:
+                shutil.copy2(path, backup_name(path))
+            path.unlink()
+            deleted.append(path)
+        except OSError as exc:
+            problems.append(f"{path.name}: {exc.strerror or exc}")
+    return deleted, problems
+
+
 # ── installing ───────────────────────────────────────────────────────────────
 
 
@@ -2264,20 +2372,28 @@ def displaced_folder(entry: dict, addon: str, root: Path) -> Path | None:
     what lands in AddOns. For `github:` the archive's contents are unknowable
     until it is downloaded, so the addon's own name is the best guess.
     """
+    destination = install_destination(entry, addon, root)
+    if destination is not None and destination.exists() and not is_link(destination):
+        return destination
+    return None
+
+
+def install_destination(entry: dict, addon: str, root: Path) -> Path | None:
+    """The folder in AddOns this entry's next install would write.
+
+    For a `local:` source the folder is named after the SOURCE, because that is
+    what lands in AddOns. For `github:` a named folder is a much better guess
+    than the addon's own name -- it is what lands in AddOns, and for a repo of
+    several addons the two are often different. Without one the archive's
+    contents are unknowable until it is downloaded, so the addon's name remains
+    the best guess.
+    """
     source = entry.get("source", "unmanaged")
     if source.startswith("local:"):
-        destination = root / Path(source[len("local:"):]).name
-    elif source.startswith("github:"):
-        # A named folder is a much better guess than the addon's own name: it
-        # is what lands in AddOns, and for a repo of several addons the two are
-        # often different. Without one the archive's contents are unknowable
-        # until it is downloaded, so the addon's name remains the best guess.
+        return root / Path(source[len("local:"):]).name
+    if source.startswith("github:"):
         _repo, _branch, folder = split_repo_spec(source[len("github:"):])
-        destination = root / (Path(folder).name if folder else addon)
-    else:
-        return None
-    if destination.exists() and not is_link(destination):
-        return destination
+        return root / (Path(folder).name if folder else addon)
     return None
 
 

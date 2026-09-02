@@ -909,6 +909,163 @@ class InstallDialog(RepoDialog, tk.Toplevel):
         self.destroy()
 
 
+# ── the overwrite confirmation ───────────────────────────────────────────────
+
+
+class OverwriteDialog(tk.Toplevel):
+    """Asked before an install replaces an addon that is already there.
+
+    Two questions, kept apart because the answers are not equally reversible.
+    Replacing the folder is undone by installing again -- the source still has
+    it. Deleting saved variables is undone by nothing: those are settings you
+    made, over months, and no repository anywhere has a copy of them.
+
+    That is why the second half sits below a rule under its own red heading,
+    starts switched off, and says exactly which files it means. A destructive
+    option that reads like the rest of the form is one people tick by accident.
+    """
+
+    VARIABLES = ("keep_folder", "delete_saved", "backup_saved")
+    SHOWN = 6          # files listed before the list is summarised
+
+    def __init__(self, parent, addon: str, root: Path, entry: dict):
+        super().__init__(parent)
+        self.title(f'Already there: "{addon}"')
+        self.addon = addon
+        self.destination = core.install_destination(entry, addon, root) or (root / addon)
+        # A folder this tool wrote, or a link into a checkout, is not at risk:
+        # replacing it loses nothing that cannot be fetched again.
+        self.at_risk = (not core.is_link(self.destination)
+                        and core.should_backup_folder(entry, self.destination.name))
+        self.wtf = core.wtf_dir(root)
+        self.saved = core.saved_variables(root, self.destination.name)
+        self.result: dict | None = None
+        self.transient(parent)
+        self.resizable(False, False)
+
+        self.keep_folder = tk.BooleanVar(value=True)
+        self.delete_saved = tk.BooleanVar(value=False)
+        # Ticked, but greyed out until deleting is asked for: if somebody does
+        # turn the destructive option on, the safe answer to the next question
+        # should already be the one selected.
+        self.backup_saved = tk.BooleanVar(value=True)
+
+        self._build()
+        self._sync()
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Escape>", lambda _e: self._cancel())
+        self._centre(parent)
+        self.wait_visibility()
+        self.grab_set()
+        self.focus_set()
+
+    def _centre(self, parent) -> None:
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    def _build(self) -> None:
+        pad = {"padx": 10, "pady": 3}
+        body = ttk.Frame(self, padding=12)
+        body.grid(sticky="nsew")
+        body.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            body, wraplength=520, justify="left",
+            text=f"{self.destination.name} is already in your AddOns folder. "
+                 f"Installing replaces it.",
+        ).grid(row=0, column=0, sticky="w", **pad)
+
+        if self.at_risk:
+            self.keep_box = ttk.Checkbutton(
+                body, variable=self.keep_folder,
+                text=f"Make a backup — move it to {core.backup_name(self.destination).name} first",
+            )
+            self.keep_box.grid(row=1, column=0, sticky="w", **pad)
+        else:
+            # Nothing of yours is in there. Offering to keep a copy of it would
+            # be offering to keep a copy of a download.
+            self.keep_folder.set(False)
+            ttk.Label(body, foreground="grey", wraplength=520, justify="left",
+                      text="That folder was put there by this tool, so replacing it "
+                           "loses nothing.").grid(row=1, column=0, sticky="w", **pad)
+
+        ttk.Separator(body, orient="horizontal").grid(
+            row=2, column=0, sticky="ew", padx=10, pady=(10, 2))
+        ttk.Label(body, text="Delete!", foreground="#b00020",
+                  font=("TkDefaultFont", 10, "bold")).grid(row=3, column=0, sticky="w", **pad)
+
+        found = len(self.saved)
+        self.delete_box = ttk.Checkbutton(
+            body, variable=self.delete_saved, command=self._sync,
+            text=f"Delete associated saved variables file{'' if found == 1 else 's'}"
+                 + (f" ({found})" if found else ""),
+        )
+        self.delete_box.grid(row=4, column=0, sticky="w", **pad)
+
+        listing = ttk.Frame(body)
+        listing.grid(row=5, column=0, sticky="w", padx=(34, 10))
+        for row, line in enumerate(self._lines()):
+            ttk.Label(listing, text=line, foreground="grey").grid(row=row, column=0, sticky="w")
+
+        self.backup_box = ttk.Checkbutton(
+            body, variable=self.backup_saved,
+            text="Backup associated saved variable files — keep a .replaced copy of each",
+        )
+        self.backup_box.grid(row=6, column=0, sticky="w", padx=(34, 10), pady=3)
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=7, column=0, sticky="e", pady=(12, 0))
+        ttk.Button(buttons, text="Cancel", command=self._cancel).grid(row=0, column=0, padx=4)
+        ttk.Button(buttons, text="Install", command=self._go).grid(row=0, column=1, padx=4)
+
+    def _lines(self) -> list[str]:
+        """The files, named. A delete nobody can see the extent of is a trap.
+
+        Shown relative to WTF, which is where account settings and one folder
+        per character are told apart -- and telling them apart is most of what
+        somebody needs to know before agreeing to this.
+        """
+        if not self.saved:
+            return ["no saved variables found for this addon"
+                    + ("" if self.wtf else " — no WTF folder yet")]
+        shown = [str(path.relative_to(self.wtf) if self.wtf else path)
+                 for path in self.saved[:self.SHOWN]]
+        if len(self.saved) > self.SHOWN:
+            shown.append(f"…and {len(self.saved) - self.SHOWN} more")
+        return shown
+
+    def _sync(self, *_a) -> None:
+        if self.delete_saved is None:
+            return
+        deleting = bool(self.delete_saved.get()) and bool(self.saved)
+        self.delete_box.configure(state="normal" if self.saved else "disabled")
+        self.backup_box.configure(state="normal" if deleting else "disabled")
+
+    def _go(self) -> None:
+        self.result = {
+            "keep_folder": bool(self.keep_folder.get()),
+            "delete_saved": bool(self.delete_saved.get()) and bool(self.saved),
+            "backup_saved": bool(self.backup_saved.get()),
+        }
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.destroy()
+
+    def destroy(self) -> None:
+        # Same rule as the other dialogs: a tk variable finalised on a worker
+        # thread aborts the process rather than raising. See SourceDialog.
+        held = [getattr(self, name, None) for name in self.VARIABLES]
+        for name in self.VARIABLES:
+            setattr(self, name, None)
+        super().destroy()
+        held.clear()
+
+
 # ── the window ───────────────────────────────────────────────────────────────
 
 
@@ -927,6 +1084,9 @@ class App(ttk.Frame):
         # Rows created by Install addon…, whose names are still a guess until
         # the archive is open.
         self._fresh: set[str] = set()
+        # {addon: keep a copy first} for saved variables somebody asked to have
+        # deleted, held until the install they belong to has succeeded.
+        self._pending_saved: dict[str, bool] = {}
 
         # The version belongs where a user can read it off without hunting: a
         # GUI has no --version, and "which build are you running?" is the first
@@ -1364,15 +1524,43 @@ class App(ttk.Frame):
 
         wanted = []
         for name, source in dialog.result:
-            if self.guard(lambda n=name, s=source: core.set_source(self.install(), n, s)) is None:
+            decision = self._confirm_overwrite(name, source, root)
+            if decision is None:
+                continue  # this one was declined; anything else ticked still goes
+            if self.guard(lambda n=name, s=source, d=decision:
+                          core.set_source(self.install(), n, s, backup=d["keep_folder"])) is None:
                 return
+            if decision["delete_saved"]:
+                # Acted on after the install, not now: a download that fails
+                # must not take somebody's settings with it.
+                self._pending_saved[name] = decision["backup_saved"]
             wanted.append(name)
+        if not wanted:
+            self.say("Nothing installed.")
+            return
         core.save(self.state)
         self.refresh()
         # The rows exist but hold nothing yet, so their names are provisional:
         # what the archive turns out to contain decides what they are called.
         self._fresh.update(wanted)
         self.start(wanted)
+
+    def _confirm_overwrite(self, name: str, source: str, root: Path) -> dict | None:
+        """Ask before replacing a folder that is already in AddOns. None = don't.
+
+        Only when there is something to replace. An install that lands in empty
+        space has nothing to confirm, and a dialog that appears every time
+        teaches people to click through the one that matters.
+        """
+        entry = dict(self.entries().get(name) or core.new_entry(name))
+        entry["source"] = source
+        destination = core.install_destination(entry, name, root)
+        if destination is None or not destination.exists():
+            return {"keep_folder": entry.get("backup", True),
+                    "delete_saved": False, "backup_saved": True}
+        dialog = OverwriteDialog(self.master, name, root, entry)
+        self.master.wait_window(dialog)
+        return dialog.result
 
     def accept_suggestion(self) -> None:
         """Take the .toc's suggestion for the selected rows, on an explicit click.
@@ -1499,6 +1687,31 @@ class App(ttk.Frame):
         self._redraw_keeping_status()
         return settled[0][1]
 
+    def _delete_saved_variables(self, requested: str, result: core.Result) -> None:
+        """Carry out the delete the confirm dialog agreed to, once and afterwards.
+
+        Afterwards, because settings are the one thing here that no source can
+        fetch again: if the download failed, the old addon is still installed
+        and wiping what it remembers would be a loss with nothing gained. The
+        request is dropped either way -- it belonged to that install, not to
+        whatever this row does next.
+        """
+        keep = self._pending_saved.pop(requested, None)
+        root = self.root_dir()
+        if keep is None or root is None or result.failed or self.checking:
+            return
+        deleted, problems = core.remove_saved_variables(
+            core.saved_variables(root, result.name), backup=keep
+        )
+        if deleted:
+            result.notes.append((
+                "note",
+                f"{len(deleted)} saved variables file(s) deleted"
+                + (" — copies kept" if keep else " — no copy kept"),
+            ))
+        for problem in problems:
+            result.notes.append(("warn", f"saved variables: {problem}"))
+
     def _redraw_keeping_status(self) -> None:
         """Rebuild the table without wiping what this run has said on each row.
 
@@ -1516,7 +1729,9 @@ class App(ttk.Frame):
 
     def _show_result(self, result: core.Result) -> None:
         self.progress.configure(value=self.progress["value"] + 1)
+        requested = result.name
         result = replace(result, name=self._settled_name(result))
+        self._delete_saved_variables(requested, result)
         entry = self.entries().get(result.name, {})
 
         # Remember what the source said, so Latest survives closing the window.

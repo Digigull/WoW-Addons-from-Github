@@ -2664,3 +2664,97 @@ class NamingARowAfterWhatLanded(unittest.TestCase):
         })
         self.assertEqual(addons.settle_names(install, ["repo"]), [])
         self.assertEqual(install["addons"]["TheAddon"]["source"], "local:/home/me/src/TheAddon")
+
+
+class TheSettingsInTheWtfFolder(unittest.TestCase):
+    """Finding, and deleting, what the client remembers about one addon.
+
+    Nothing here runs unless somebody ticks a box that says so. It exists for
+    the case where the settings are the problem -- written by a different fork,
+    or a version old enough that the new one chokes on them -- and the fix is to
+    start clean.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.wow = pathlib.Path(self.tmp.name) / "World of Warcraft 3.3.5a"
+        self.root = self.wow / "Interface" / "AddOns"
+        self.root.mkdir(parents=True)
+
+    def write(self, *relatives):
+        for relative in relatives:
+            path = self.wow / "WTF" / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("-- settings\n")
+
+    def named(self, addon="Bagnon"):
+        wtf = self.wow / "WTF"
+        return sorted(str(p.relative_to(wtf)).replace("\\", "/")
+                      for p in addons.saved_variables(self.root, addon))
+
+    def left(self):
+        wtf = self.wow / "WTF"
+        return sorted(str(p.relative_to(wtf)).replace("\\", "/")
+                      for p in wtf.rglob("*") if p.is_file())
+
+    def test_account_and_character_settings_are_both_found(self):
+        self.write("Account/ACC/SavedVariables/Bagnon.lua",
+                   "Account/ACC/Frostmourne/Bob/SavedVariables/Bagnon.lua",
+                   "Account/ACC/Frostmourne/Alice/SavedVariables/Bagnon.lua")
+        self.assertEqual(self.named(), [
+            "Account/ACC/Frostmourne/Alice/SavedVariables/Bagnon.lua",
+            "Account/ACC/Frostmourne/Bob/SavedVariables/Bagnon.lua",
+            "Account/ACC/SavedVariables/Bagnon.lua",
+        ])
+
+    def test_the_clients_own_backup_file_counts_as_the_settings(self):
+        # Deleting the .lua and leaving the .lua.bak has the addon come back
+        # with the settings you just asked to be rid of.
+        self.write("Account/ACC/SavedVariables/Bagnon.lua",
+                   "Account/ACC/SavedVariables/Bagnon.lua.bak")
+        self.assertEqual(len(self.named()), 2)
+
+    def test_another_addons_settings_are_never_touched(self):
+        self.write("Account/ACC/SavedVariables/Bagnon.lua",
+                   "Account/ACC/SavedVariables/Bagnon_Config.lua",
+                   "Account/ACC/SavedVariables/NotBagnon.lua",
+                   "Account/ACC/config-cache.wtf")
+        self.assertEqual(self.named(), ["Account/ACC/SavedVariables/Bagnon.lua"])
+
+    def test_the_case_of_every_folder_in_the_path_is_ignored(self):
+        # Windows and Wine are both case-blind about this, and real WTF trees
+        # in the wild are spelled Account, ACCOUNT and account.
+        self.write("account/ACC/savedvariables/bagnon.lua")
+        self.assertEqual(len(self.named()), 1)
+
+    def test_a_client_that_has_never_been_run_has_no_settings(self):
+        self.assertIsNone(addons.wtf_dir(self.root))
+        self.assertEqual(self.named(), [])
+
+    def test_deleting_keeps_a_copy_beside_each_file_when_asked(self):
+        self.write("Account/ACC/SavedVariables/Bagnon.lua",
+                   "Account/ACC/Frostmourne/Bob/SavedVariables/Bagnon.lua")
+        deleted, problems = addons.remove_saved_variables(
+            addons.saved_variables(self.root, "Bagnon"), backup=True)
+        self.assertEqual((len(deleted), problems), (2, []))
+        self.assertEqual(self.left(), [
+            "Account/ACC/Frostmourne/Bob/SavedVariables/Bagnon.lua.replaced",
+            "Account/ACC/SavedVariables/Bagnon.lua.replaced",
+        ])
+
+    def test_deleting_without_a_copy_leaves_nothing(self):
+        self.write("Account/ACC/SavedVariables/Bagnon.lua")
+        addons.remove_saved_variables(addons.saved_variables(self.root, "Bagnon"), backup=False)
+        self.assertEqual(self.left(), [])
+
+    def test_a_file_that_cannot_be_removed_is_reported_not_raised(self):
+        """One locked file must not leave the rest half-done and silent."""
+        self.write("Account/ACC/SavedVariables/Bagnon.lua")
+        gone = self.wow / "WTF" / "Account/ACC/SavedVariables/Bagnon.lua"
+        found = addons.saved_variables(self.root, "Bagnon")
+        gone.unlink()  # whatever the reason, the file is not removable now
+        deleted, problems = addons.remove_saved_variables(found, backup=False)
+        self.assertEqual(deleted, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("Bagnon.lua", problems[0])
