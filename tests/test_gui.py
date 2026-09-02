@@ -837,5 +837,81 @@ class WindowTests(unittest.TestCase):
         dlg.destroy()
 
 
+@unittest.skipIf(tk is None, globals().get("WHY", "no Tk"))
+class RescanSaysWhatItSkipped(unittest.TestCase):
+    """A folder you can see in AddOns and cannot see in the list needs a reason.
+
+    Reported against 0.9.0 as "it is not finding PlayerbotManager": the folder
+    was there, the scan dropped it, and the window said nothing about it at all.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = pathlib.Path(self.tmp.name)
+        self.addons = base / "Interface" / "AddOns"
+        self.addons.mkdir(parents=True)
+        self._config, self._manifest = core.CONFIG_DIR, core.MANIFEST
+        core.CONFIG_DIR = base / "config"
+        core.MANIFEST = core.CONFIG_DIR / "manifest.json"
+        core.CONFIG_DIR.mkdir()
+        core.MANIFEST.write_text(json.dumps({"addons_dir": str(self.addons), "addons": {}}))
+
+        self.root = tk.Tk()
+        self.app = gui.App(self.root)
+        self.app.refresh()
+        self.pump()
+
+    def tearDown(self):
+        core.CONFIG_DIR, core.MANIFEST = self._config, self._manifest
+        self.app.stop()
+        gc.collect()
+        self.root.destroy()
+        self.tmp.cleanup()
+
+    def pump(self, times: int = 8) -> None:
+        for _ in range(times):
+            self.root.update_idletasks()
+            self.root.update()
+            self.app._drain()
+
+    def rescan_reporting(self) -> list:
+        shown = []
+        real = gui.messagebox.showinfo
+        gui.messagebox.showinfo = lambda title, message, **k: shown.append(message)
+        try:
+            self.app.rescan()
+            self.pump()
+        finally:
+            gui.messagebox.showinfo = real
+        return shown
+
+    def test_a_folder_the_game_cannot_load_is_named_with_its_fix(self):
+        broken = self.addons / "PlayerbotManager"
+        broken.mkdir()
+        (broken / "PlayerbotManager.toc.txt").write_text("## Title: Playerbot Manager\n")
+
+        shown = self.rescan_reporting()
+        self.assertTrue(shown, "the skipped folder was never mentioned")
+        self.assertIn("PlayerbotManager", shown[0])
+        self.assertIn("folder(s) the game cannot load", self.app.status.cget("text"))
+
+    def test_a_loadable_folder_is_listed_and_not_complained_about(self):
+        good = self.addons / "PlayerbotManager"
+        good.mkdir()
+        # The spelling a case-sensitive filesystem keeps and Wine ignores.
+        (good / "Playerbotmanager.toc").write_text("## Title: Playerbot Manager\n")
+
+        self.assertEqual(self.rescan_reporting(), [])
+        self.assertIn("PlayerbotManager", self.app.tree.get_children())
+
+    def test_the_same_skipped_folder_is_not_reported_twice(self):
+        parked = self.addons / "Not Working"
+        (parked / "OldOne").mkdir(parents=True)
+        (parked / "OldOne" / "OldOne.toc").write_text("## Title: x\n")
+
+        self.assertTrue(self.rescan_reporting())
+        self.assertEqual(self.rescan_reporting(), [], "a kept folder must not nag")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

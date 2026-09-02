@@ -2473,3 +2473,89 @@ class RescanForgetsWhatYouDeleted(unittest.TestCase):
         addons.rescan(self.install, self.root)
         addons.rescan(self.install, self.root)
         self.assertNotIn("HandInstalled", self.entries())
+
+
+class FindingAnAddonWhateverItsTocIsCalled(unittest.TestCase):
+    """Reported against 0.9.0: PlayerbotManager sat in AddOns and never appeared.
+
+    The scan asked for exactly <Folder>/<Folder>.toc. The game does not: it
+    matches that name the way its filesystem does, so a Wine install on Linux
+    loads Playerbotmanager.toc out of PlayerbotManager/ without complaint. A
+    folder the game loads has to be a folder this tool lists.
+
+    And when a folder really is not loadable, saying nothing is the worst
+    answer available -- the addon is visibly right there, so a scan that just
+    leaves it out looks broken. Name the folder and the fix.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name) / "AddOns"
+        self.root.mkdir()
+
+    def folder(self, name: str) -> pathlib.Path:
+        made = self.root / name
+        made.mkdir()
+        return made
+
+    def test_a_toc_spelled_with_different_case_is_still_the_addon(self):
+        folder = self.folder("PlayerbotManager")
+        (folder / "Playerbotmanager.toc").write_text("## Title: Playerbot Manager\n## Version: 1.2\n")
+
+        found = addons.scan_installed(self.root)
+        self.assertIn("PlayerbotManager", found)
+        self.assertEqual(found["PlayerbotManager"]["version"], "1.2")
+        self.assertEqual(addons.scan_problems(self.root), {})
+
+    def test_the_exact_spelling_is_still_preferred(self):
+        # A folder holding both must read the one the game reads.
+        folder = self.folder("MyAddon")
+        (folder / "MyAddon.toc").write_text("## Version: right\n")
+        (folder / "myaddon.toc").write_text("## Version: wrong\n")
+        self.assertEqual(addons.scan_installed(self.root)["MyAddon"]["version"], "right")
+
+    def test_a_toc_named_after_something_else_is_named_and_explained(self):
+        folder = self.folder("PlayerbotManager-master")
+        (folder / "PlayerbotManager.toc").write_text("## Title: Playerbot Manager\n")
+
+        self.assertNotIn("PlayerbotManager-master", addons.scan_installed(self.root))
+        why = addons.scan_problems(self.root)["PlayerbotManager-master"]
+        self.assertIn("PlayerbotManager.toc", why)
+        self.assertIn("PlayerbotManager-master.toc", why)
+
+    def test_an_addon_left_one_folder_deep_is_named_and_explained(self):
+        outer = self.folder("PlayerbotManager")
+        inner = outer / "PlayerbotManager"
+        inner.mkdir()
+        (inner / "PlayerbotManager.toc").write_text("## Title: Playerbot Manager\n")
+
+        self.assertNotIn("PlayerbotManager", addons.scan_installed(self.root))
+        why = addons.scan_problems(self.root)["PlayerbotManager"]
+        self.assertIn("one folder deeper", why)
+        self.assertIn("PlayerbotManager", why)
+
+    def test_a_toc_windows_saved_as_txt_is_named_and_explained(self):
+        folder = self.folder("PlayerbotManager")
+        (folder / "PlayerbotManager.toc.txt").write_text("## Title: Playerbot Manager\n")
+
+        why = addons.scan_problems(self.root)["PlayerbotManager"]
+        self.assertIn(".toc.txt", why)
+
+    def test_a_folder_that_is_not_an_addon_is_left_in_peace(self):
+        # Empty Blizzard_* stubs and folders of notes are not problems, and a
+        # warning about each of them is noise that buries the one that matters.
+        self.folder("Blizzard_AchievementUI")
+        notes = self.folder("Unsure-Old")
+        (notes / "notes.txt").write_text("what was this")
+        self.assertEqual(addons.scan_problems(self.root), {})
+
+    def test_a_folder_of_parked_addons_says_so_once(self):
+        parked = self.folder("Not Working")
+        for name in ("OldOne", "OtherOne"):
+            (parked / name).mkdir()
+            (parked / name / f"{name}.toc").write_text("## Title: x\n")
+
+        why = addons.scan_problems(self.root)["Not Working"]
+        self.assertIn("OldOne", why)
+        self.assertIn("OtherOne", why)

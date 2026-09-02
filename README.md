@@ -185,6 +185,15 @@ the repo can be bound separately, and each then updates — and reports updates 
 Bind the repository as a whole and the tool says so once, in the run log, rather than
 leaving it to be discovered as strange behaviour later.
 
+A folder in `AddOns` is an addon when it holds a `.toc` named after itself — the rule the
+game uses, matched the way the game matches it. That match ignores case, so
+`PlayerbotManager/Playerbotmanager.toc` is an addon here exactly as it is in the client,
+where Windows and Wine both find it. A folder that plainly holds an addon and still will not
+load — the `.toc` named after something else, the addon left one level down inside the folder
+its zip made, a `.toc.txt` saved by an Explorer that hides extensions — is named with its fix
+rather than silently dropped: a folder you can see in `AddOns` and cannot see in the list
+makes the scan look broken.
+
 `scan` reads each `.toc` for an `X-Website` or `X-Repository` header and *suggests* a GitHub
 source where it finds one. Suggestions are never applied on their own — a header is the
 author's claim about where the code lives, which is not the same as your decision to install

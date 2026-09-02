@@ -169,6 +169,10 @@ def cmd_scan(args, state: dict) -> None:
         note(f"{forgotten} unmanaged addon(s) no longer on disk -- dropped from the list")
     if guessed:
         note(f"{guessed} with a source found or suggested -- see `addons.py list`")
+    # A folder that is plainly an addon and is not in the count needs a word:
+    # "scan found 28" when the folder is right there reads as a broken scan.
+    for name, why in core.scan_problems(root).items():
+        warn(f"{name}: {why}")
     note("")
     note("Bind one with:  addons.py set <Addon> github:owner/repo")
     note("            or: addons.py set <Addon> local:/path/to/folder")

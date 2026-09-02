@@ -638,6 +638,7 @@ class App(ttk.Frame):
         self.worker: _Worker | None = None
         self.failures = self.updated = self.outdated = 0
         self.checking = False
+        self._reported_unloadable: set[str] = set()
 
         # The version belongs where a user can read it off without hunting: a
         # GUI has no --version, and "which build are you running?" is the first
@@ -984,7 +985,44 @@ class App(ttk.Frame):
         core.save(self.state)
         self.refresh()
         gone = f" {forgotten} deleted addon(s) dropped." if forgotten else ""
-        self.say(f"{installed} addon folder(s); {guessed} with a source found or suggested.{gone}")
+        problems = self._unloadable(core.addons_dir(install))
+        skipped = f" {len(problems)} folder(s) the game cannot load." if problems else ""
+        self.say(
+            f"{installed} addon folder(s); {guessed} with a source found or suggested."
+            f"{gone}{skipped}"
+        )
+        self._report_unloadable(problems)
+
+    def _unloadable(self, root: Path) -> dict:
+        """Folders that hold an addon and still will not load. Never fatal."""
+        try:
+            return core.scan_problems(root)
+        except OSError:
+            return {}
+
+    def _report_unloadable(self, problems: dict) -> None:
+        """Say out loud why a folder that is plainly there is not in the list.
+
+        Being told "28 addon folder(s)" when you can see 29 in your file manager
+        reads as the scan being broken. It is usually a folder the game will not
+        load either -- a .toc named after the wrong thing, an addon left one
+        level deep inside its zip's folder -- and naming the fix is the whole
+        point of noticing.
+
+        Once per distinct set of folders: this repeats on every rescan otherwise,
+        and a folder of parked addons is a thing people keep on purpose.
+        """
+        if not problems or set(problems) == self._reported_unloadable:
+            self._reported_unloadable = set(problems)
+            return
+        self._reported_unloadable = set(problems)
+        lines = "\n\n".join(f"{name}\n    {why}" for name, why in problems.items())
+        messagebox.showinfo(
+            "Folders the game will not load",
+            "These are in your AddOns folder, but World of Warcraft does not load "
+            "them, so they are not in the list:\n\n" + lines,
+            parent=self,
+        )
 
     def set_source(self) -> None:
         names = self.selection()

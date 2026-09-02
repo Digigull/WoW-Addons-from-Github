@@ -411,6 +411,29 @@ def read_toc(toc: Path) -> dict:
     return fields
 
 
+def find_toc(folder: Path) -> Path | None:
+    """The .toc the game would load for this folder, or None if there is none.
+
+    WoW loads AddOns/<Folder>/<Folder>.toc and nothing else -- but it matches
+    that name the way its filesystem does, which is case-insensitively on
+    Windows and, for a Wine install on Linux, case-insensitively too. So
+    PlayerbotManager/Playerbotmanager.toc is an addon the game loads happily,
+    and a scan that only asked for the exact spelling reported the folder as
+    not an addon at all and left it out of the list entirely.
+    """
+    exact = folder / f"{folder.name}.toc"
+    if exact.is_file():
+        return exact
+    wanted = f"{folder.name.lower()}.toc"
+    try:
+        for child in folder.iterdir():
+            if child.name.lower() == wanted and child.is_file():
+                return child
+    except OSError:
+        pass
+    return None
+
+
 def guess_source(fields: dict) -> str | None:
     """Pull a github:owner/repo out of a .toc if the author left one."""
     for key in ("x-repository", "x-website", "x-project-url", "x-github", "x-curse-project-url"):
@@ -446,8 +469,8 @@ def scan_installed(root: Path) -> dict[str, dict]:
     for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
         if not child.is_dir():
             continue
-        toc = child / f"{child.name}.toc"
-        if not toc.is_file():
+        toc = find_toc(child)
+        if toc is None:
             continue
         fields = read_toc(toc)
         found[child.name] = {
@@ -458,6 +481,74 @@ def scan_installed(root: Path) -> dict[str, dict]:
             "link_target": link_target(child),
         }
     return found
+
+
+def folder_problem(folder: Path) -> str | None:
+    """Why a folder in AddOns is not being listed as an addon, if you can fix it.
+
+    A scan that silently drops a folder is indistinguishable, from the outside,
+    from a scan that is broken: the addon is right there in AddOns and the list
+    says it is not. Most skipped folders are nothing -- an empty Blizzard_*
+    stub, a folder of notes -- and saying so about each of those is noise. The
+    ones worth a word are the folders that plainly hold an addon and still will
+    not load, because the fix is a rename or a move the person can do in a file
+    manager in ten seconds.
+
+    Returns None for a folder that is simply not an addon.
+    """
+    try:
+        children = list(folder.iterdir())
+    except OSError as exc:
+        return f"cannot be read ({exc.strerror or exc})"
+
+    # Not is_file(): a broken symlink, or a directory someone named MyAddon.toc,
+    # is exactly the case where the name is right and the game still loads
+    # nothing -- and where "no addon here" is the least useful thing to say.
+    named = [c for c in children if c.name.lower() == f"{folder.name.lower()}.toc"]
+    if named:
+        return (f"'{named[0].name}' is there but is not a readable file -- "
+                "a broken shortcut, or a folder with that name.")
+
+    files = [child for child in children if child.is_file()]
+    hidden = [f.name for f in files if f.name.lower() == f"{folder.name.lower()}.toc.txt"]
+    if hidden:
+        return (f"holds '{hidden[0]}' -- Windows hid the real extension. "
+                f"Rename it to '{folder.name}.toc'.")
+
+    tocs = sorted(f.name for f in files if f.name.lower().endswith(".toc"))
+    if tocs:
+        stem = tocs[0][:-4]
+        return (f"holds '{tocs[0]}' but no '{folder.name}.toc' -- the game only loads a "
+                f".toc named after its folder. Rename the folder to '{stem}', "
+                f"or the file to '{folder.name}.toc'.")
+
+    nested = sorted(
+        child.name for child in children if child.is_dir() and find_toc(child) is not None
+    )
+    if nested:
+        listed = ", ".join(nested[:3]) + (", ..." if len(nested) > 3 else "")
+        return (f"the addon{'s are' if len(nested) > 1 else ' is'} one folder deeper, in "
+                f"{folder.name}/ ({listed}) -- move {'them' if len(nested) > 1 else 'it'} "
+                f"up into AddOns.")
+
+    code = sorted(f.name for f in files if f.name.lower().endswith((".lua", ".xml")))
+    if code:
+        return (f"holds {code[0]} but no '{folder.name}.toc' -- the game loads no folder "
+                "without one, so this is not an addon it can run.")
+
+    return None
+
+
+def scan_problems(root: Path) -> dict[str, str]:
+    """Folders in AddOns that look like an addon and are not one, and why."""
+    problems: dict[str, str] = {}
+    for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+        if not child.is_dir() or find_toc(child) is not None:
+            continue
+        reason = folder_problem(child)
+        if reason:
+            problems[child.name] = reason
+    return problems
 
 
 def rescan(state: dict, root: Path) -> tuple[int, int, int]:
@@ -671,9 +762,9 @@ def resolve_source(addon: str, source: str) -> tuple[str, str, Path | None]:
         return source, kind, None
 
     local_path = Path(rest).expanduser().resolve()
-    if local_path.is_dir() and not (local_path / f"{local_path.name}.toc").is_file():
+    if local_path.is_dir() and find_toc(local_path) is None:
         candidate = local_path / addon
-        if (candidate / f"{addon}.toc").is_file():
+        if find_toc(candidate) is not None:
             local_path = candidate
         else:
             die(f"{local_path} holds no {addon}/{addon}.toc")
@@ -1836,7 +1927,7 @@ def addon_dirs_in(tree: Path, depth: int = 1) -> list[tuple[Path, str]]:
     hits = [
         (child, child.name)
         for child in sorted(tree.iterdir())
-        if child.is_dir() and (child / f"{child.name}.toc").is_file()
+        if child.is_dir() and find_toc(child) is not None
     ]
     if hits:
         return hits
@@ -1845,7 +1936,7 @@ def addon_dirs_in(tree: Path, depth: int = 1) -> list[tuple[Path, str]]:
     if tocs:
         # Prefer a .toc named after this folder; otherwise the shortest stem,
         # which skips flavour suffixes like MyAddon-Classic.toc.
-        exact = [t for t in tocs if t.stem == tree.name]
+        exact = [t for t in tocs if t.stem.lower() == tree.name.lower()]
         chosen = exact[0] if exact else min(tocs, key=lambda t: len(t.stem))
         return [(tree, chosen.stem)]
 
@@ -2055,7 +2146,7 @@ def install_local(source_path: Path, target: Path, mode: str, dry_run: bool, *, 
     report = report or _nothing
     if not source_path.is_dir():
         die(f"no such folder: {source_path}")
-    if not (source_path / f"{source_path.name}.toc").is_file():
+    if find_toc(source_path) is None:
         report("warn", f"{source_path} has no {source_path.name}.toc -- installing anyway")
 
     destination = target / source_path.name
