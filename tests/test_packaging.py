@@ -601,6 +601,47 @@ class Releasing(unittest.TestCase):
         self.assertIn("needs: [appimage, windows, version-matches-tag]", self.workflow_commands())
 
 
+class TheWindowTestsReallyRunInCI(unittest.TestCase):
+    """The gui job exists to fail when the window tests skip themselves.
+
+    They skip on a machine with no Tk and no display, which is right for a
+    developer on a server and useless as CI: a job where every test silently
+    skips reports success for having done nothing.
+    """
+
+    JOB = (ROOT / ".github" / "workflows" / "tests.yml").read_text()
+
+    def test_the_job_installs_tk_and_a_display(self):
+        self.assertIn("python3-tk", self.JOB)
+        self.assertIn("xvfb", self.JOB)
+
+    def test_the_guard_matches_how_unittest_reports_a_skip(self):
+        """And not merely the word, which a test NAME is allowed to contain.
+
+        `grep -q "skipped"` failed a green run because one test is called
+        test_the_same_skipped_folder_is_not_reported_twice -- about a scan
+        skipping a folder, which is a thing this tool does and therefore a
+        thing its tests are named after. The guard has to read unittest's
+        report, not the transcript.
+        """
+        import re
+
+        pattern = None
+        for line in self.JOB.splitlines():
+            if "grep -q" in line and "skipped" in line:
+                pattern = line.split("'")[1] if "'" in line else line
+        self.assertIsNotNone(pattern, "nothing guards against a silently skipped run")
+
+        guard = re.compile(pattern)
+        # What unittest -v really prints, both ways it says it.
+        self.assertTrue(guard.search("test_x (m.C.test_x) ... skipped 'no usable Tk'"))
+        self.assertTrue(guard.search("OK (skipped=91)"))
+        # ...and what it prints for a test that merely has the word in its name.
+        self.assertFalse(guard.search(
+            "test_the_same_skipped_folder_is_not_reported_twice (m.C.test_x) ... ok"))
+        self.assertFalse(guard.search("Ran 91 tests in 13.9s"))
+
+
 class Scripts(unittest.TestCase):
     def test_the_build_and_smoke_scripts_are_executable(self):
         for name in ("build.sh", "smoke-test.sh"):
