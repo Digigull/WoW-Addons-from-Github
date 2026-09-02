@@ -1078,7 +1078,8 @@ class App(ttk.Frame):
         self.state = core.load()
         self.outbox: queue.Queue = queue.Queue()
         self.worker: _Worker | None = None
-        self.failures = self.updated = self.outdated = 0
+        self.failures = self.updated = self.outdated = self.wiped = 0
+        self.wiped_kept = True
         self.checking = False
         self._reported_unloadable: set[str] = set()
         # Rows created by Install addon…, whose names are still a guess until
@@ -1617,6 +1618,8 @@ class App(ttk.Frame):
         self.updated = 0
         self.checking = check
         self.outdated = 0
+        self.wiped = 0
+        self.wiped_kept = True
         self.progress.configure(maximum=len(names), value=0)
         self.counter.configure(text=f"0/{len(names)}")
         self.say("Checking…" if check else "Working…")
@@ -1703,12 +1706,11 @@ class App(ttk.Frame):
         deleted, problems = core.remove_saved_variables(
             core.saved_variables(root, result.name), backup=keep
         )
-        if deleted:
-            result.notes.append((
-                "note",
-                f"{len(deleted)} saved variables file(s) deleted"
-                + (" — copies kept" if keep else " — no copy kept"),
-            ))
+        # Counted for the run summary rather than written on the row: the row
+        # says "recently updated", and a delete somebody asked for still
+        # deserves one acknowledgement that it happened.
+        self.wiped += len(deleted)
+        self.wiped_kept = self.wiped_kept and keep
         for problem in problems:
             result.notes.append(("warn", f"saved variables: {problem}"))
 
@@ -1755,9 +1757,8 @@ class App(ttk.Frame):
                 self.tree.set(result.name, "status", f"update available: {result.version}")
                 self.tree.item(result.name, tags=["suggested"])
             else:
-                note = "; ".join(m for _l, m in result.notes)
-                self.tree.set(result.name, "status", note or "updated")
-                self.tree.item(result.name, tags=[])
+                self.tree.set(result.name, "status", self._settled_status(result, entry))
+                self.tree.item(result.name, tags=self._settled_tags(result, entry))
 
         if result.failed:
             self.failures += 1
@@ -1766,6 +1767,36 @@ class App(ttk.Frame):
                 self.outdated += 1
             else:
                 self.updated += 1
+
+    def _settled_status(self, result: core.Result, entry: dict) -> str:
+        """What the Status column says about an addon that just installed.
+
+        "recently updated", not a sentence about what happened on the way
+        there. The engine narrates each step it takes -- a folder moved aside,
+        settings deleted -- and every one of those was asked for a moment
+        earlier in the confirm dialog. Replaying it in a 170-pixel column
+        crowded out the one thing this column is scanned for, which is which
+        rows just changed.
+
+        Two things still outrank it, because neither is something the person
+        already knows:
+
+          a warning -- something that did NOT go to plan, inside a run that
+          otherwise succeeded, like a settings file that would not delete
+
+          a row that installs a whole repository, which is the same flag
+          refresh() puts there and is rarely what was meant
+        """
+        warnings = "; ".join(message for level, message in result.notes if level == "warn")
+        if warnings:
+            return warnings
+        if core.covers_several_addons(entry):
+            return f"installs {len(entry['folders'])} addons"
+        return "recently updated"
+
+    def _settled_tags(self, result: core.Result, entry: dict) -> list[str]:
+        wrong = any(level == "warn" for level, _m in result.notes)
+        return ["suggested"] if wrong or core.covers_several_addons(entry) else []
 
     def _finished(self) -> None:
         # Saved either way: a check writes no addon files, but the versions it
@@ -1789,7 +1820,13 @@ class App(ttk.Frame):
             self.say(f"Checked — {found}{tail}. Nothing was downloaded.{budget}")
         else:
             done = f"Done — {self.updated} updated{tail}."
-            self.say(done + (" Restart the client, or /reload." if self.updated else "") + budget)
+            wiped = ""
+            if self.wiped:
+                wiped = (f" {self.wiped} saved variables file(s) deleted"
+                         + (" — copies kept beside them." if self.wiped_kept
+                            else " — no copies kept."))
+            self.say(done + wiped
+                     + (" Restart the client, or /reload." if self.updated else "") + budget)
         self._sync_buttons()
 
 

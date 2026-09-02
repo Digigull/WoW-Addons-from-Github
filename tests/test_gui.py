@@ -192,7 +192,50 @@ class WindowTests(WindowHarness):
 
         self.run_update(fake)
         self.assertEqual(self.app.tree.set("Bound", "installed"), "v2")
-        self.assertIn("updated", self.status_of("Bound"))
+        self.assertEqual(self.status_of("Bound"), "recently updated")
+
+    def test_what_happened_on_the_way_is_not_left_on_the_row(self):
+        """The Status column is scanned for what changed, not for how.
+
+        The engine narrates each step it takes -- a folder moved aside,
+        settings deleted -- and every one of those was agreed to a moment
+        earlier in the confirm dialog. In a 170-pixel column it crowded out the
+        only thing this column is read for.
+        """
+        def fake(name, entry, root, **kw):
+            entry["installed"] = "v2"
+            result = core.Result(name, core.CHANGED, "v1 -> v2", version="v2", folders=[name])
+            result.notes.append(("note", "moving existing folder aside -> Bound.replaced"))
+            return result
+
+        self.run_update(fake)
+        self.assertEqual(self.status_of("Bound"), "recently updated")
+        self.assertEqual(self.app.tree.item("Bound", "tags"), "")
+
+    def test_a_warning_inside_a_successful_run_does_stay(self):
+        # Not narration: something that did not go to plan. Silence about it
+        # would be the row claiming a clean run it did not have.
+        def fake(name, entry, root, **kw):
+            entry["installed"] = "v2"
+            result = core.Result(name, core.CHANGED, "v1 -> v2", version="v2", folders=[name])
+            result.notes.append(("warn", "saved variables: Bound.lua: Permission denied"))
+            return result
+
+        self.run_update(fake)
+        self.assertIn("Permission denied", self.status_of("Bound"))
+        self.assertEqual(self.app.tree.item("Bound", "tags"), ("suggested",))
+
+    def test_a_row_that_installs_a_whole_repository_still_says_so(self):
+        # The one note worth the column: this row now rewrites every addon in
+        # the repository whenever any one of them changes.
+        def fake(name, entry, root, **kw):
+            entry["installed"] = "v2"
+            entry["folders"] = ["Bound", "Bound_Extra", "Bound_Third"]
+            return core.Result(name, core.CHANGED, "v1 -> v2", version="v2",
+                               folders=entry["folders"])
+
+        self.run_update(fake)
+        self.assertEqual(self.status_of("Bound"), "installs 3 addons")
 
     def test_a_failure_stays_on_its_row(self):
         # The rule: one unreachable repo marks that row failed and leaves the
@@ -1242,7 +1285,11 @@ class WipingSettingsAsPartOfAnInstall(InstallHarness):
             "Account/ACC/Frostmourne/Bob/SavedVariables/Bagnon.lua.replaced",
             "Account/ACC/SavedVariables/Bagnon.lua.replaced",
         ])
-        self.assertIn("saved variables", self.status_of("Bagnon"))
+        self.assertEqual(self.status_of("Bagnon"), "recently updated")
+        # Said once, where a run reports itself -- not on the row, which is
+        # scanned for what changed, not for how.
+        self.assertIn("2 saved variables file(s) deleted", self.app.status.cget("text"))
+        self.assertIn("copies kept", self.app.status.cget("text"))
 
     def test_no_copy_is_kept_when_that_is_what_was_asked(self):
         self.there_already()
