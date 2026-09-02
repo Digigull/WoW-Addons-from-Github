@@ -21,6 +21,77 @@ script:
 "WoW Addons from GitHub.exe" update --check
 ```
 
+## New in v1.0.0
+
+**Install an addon you do not have yet.** Every button in the window used to work on
+folders that were already in your AddOns folder: a rescan finds one, Set source binds it.
+Getting a *new* addon in meant downloading and unzipping an archive by hand first — which
+is the exact job this tool exists to do for you. **Install addon…** now takes whatever you
+have on the clipboard (`owner/repo`, the page URL, a link to a branch, a link to one addon
+inside a repository) and fetches it. In the terminal: `addons.py install owner/repo`.
+
+A repository holding several addons shows them as tick boxes, and each one you tick becomes
+its own row with its own binding — never one row that reinstalls all of them whenever any
+one of them changes. A repository holding a single addon is bound whole, which keeps it
+following that repository's releases rather than commit ids. The row is named after the
+folder that actually lands in AddOns, because that is the name the client loads and the
+name a rescan will find.
+
+**A repository that is one addon with a `.toc` per client is now a question, not a
+guess.** [NotPlater](https://github.com/RichSteini/NotPlater) is one root holding
+`NotPlater-2.4.3.toc` and `NotPlater-3.3.5.toc` — TBC and Wrath, the same files, with no
+base `.toc` between them. 3.3.5 has no notion of flavour `.toc`s at all: it loads
+`<Folder>/<Folder>.toc` and nothing else, so the folder in AddOns has to be named after the
+one you want. The old rule here was "take the shortest stem", and both stems are the same
+length — it installed the 2.4.3 build for somebody running 3.3.5, and said nothing.
+
+Both dialogs now offer the `.toc` files as tick boxes and **refuse to proceed with none
+ticked**. There is no "install all of them" for this shape, because all of them would be
+one addon installed twice over under names only one of which your client loads — tick both
+only if you want both folders. The choice is recorded as
+`github:RichSteini/NotPlater#NotPlater-3.3.5.toc`, and that row still follows the
+repository's own releases.
+
+`FrostSeek.toc` beside `FrostSeek_Wrath.toc` is deliberately **not** this: there a base
+`.toc` exists that every other extends, which is the convention the client resolves itself
+out of one folder. Nothing is asked in that case. And a repository that is the addon no
+longer offers its own bundled libraries as though they were separate addons — NotPlater
+ships `libs-2.4.3/LibSharedMedia-3.0/`, which was being listed as something you could
+choose to install.
+
+**Installing over an addon you already have asks first**, in a window that keeps two very
+different questions apart. *Make a backup* — ticked — moves the folder that is there now to
+`<Name>.replaced` instead of deleting it, and is not offered at all for a folder this tool
+put there itself.
+
+Below a rule, under a red **Delete!** heading, is the part that is not undoable: **delete
+the associated saved variables**, off by default, naming every file it means — the
+account-wide one and one per character, in `WTF/Account/…/SavedVariables/`. Ticking it
+enables *back up the saved variables first*, which is itself ticked: those are settings you
+made over months, and no repository anywhere has a copy of them. They are deleted **after**
+the addon installs, never before, so a download that fails takes nothing with it. Nothing
+touches your saved variables unless you tick that box: `addons.py install
+--reset-settings` is the only other way to ask for it.
+
+**An addon whose `.toc` is spelled in a different case is found again.** The scan asked for
+exactly `PlayerbotManager/PlayerbotManager.toc`. The game does not: it matches that name
+the way its filesystem does, which is case-insensitively on Windows and, through Wine on
+Linux, there too. So the client happily loaded `PlayerbotManager/Playerbotmanager.toc`
+while this tool decided the folder was not an addon at all and left it out of the list —
+silently, which is the part that made it look like a broken scan rather than a finicky rule.
+
+And a folder that really will not load is now named, with the fix, instead of being
+dropped without a word: a `.toc` named after something else, an addon left one level down
+inside the folder its zip made, a `.toc.txt` saved by an Explorer that hides extensions, a
+folder of Lua with no `.toc` at all. Folders that are simply not addons — empty
+`Blizzard_*` stubs, a folder of notes — stay quiet, or the one that matters would be buried.
+
+**The Status column says *recently updated*** after an update, rather than replaying what
+happened on the way there. The column is 170 pixels wide and is scanned for which rows just
+changed; a sentence about a folder being moved aside — something you agreed to in the
+confirm dialog a moment earlier — crowded that out. Anything that did *not* go to plan
+still stays on its row.
+
 ## New in v0.9.0
 
 **A rescan now clears out addons you deleted.** Deleting an addon folder by hand and
@@ -234,15 +305,17 @@ Also in this release:
   FUSE 2. Either install it (`sudo apt install libfuse2`, or `libfuse2t64` on newer
   releases) or skip it entirely with `--appimage-extract-and-run`.
 
-## Why this is marked a pre-release
+## Why this one is not a pre-release
 
-Every build is checked by CI on both platforms: it starts, Tk really works inside the
-bundle, the window opens and stays open, and it scans a folder end to end. **But nobody
-has yet run either download on a desktop against a real WoW install.** That is a different
-thing, and until somebody has, "pre-release" is the honest label.
+Every build before this was flagged **Pre-release**, and the label meant something
+specific: CI checks each one on both platforms — it starts, Tk really works inside the
+bundle, the window opens and stays open, and it scans a folder end to end — but nobody had
+run either download on a desktop against a real WoW install. That is a different thing.
 
-If you try it, the two places to watch are the folder picker against a real
-`Interface/AddOns`, and a `local:` source under Wine or Proton.
+Somebody has now, on a 3.3.5a client under Wine, and the last few releases came straight
+out of what that turned up: an addon the scan could not see, a repository that installed
+the wrong client's build, and no way to install an addon you did not already have. So the
+label goes.
 
 ## What it does
 

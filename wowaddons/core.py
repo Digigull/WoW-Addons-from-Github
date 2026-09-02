@@ -411,6 +411,29 @@ def read_toc(toc: Path) -> dict:
     return fields
 
 
+def find_toc(folder: Path) -> Path | None:
+    """The .toc the game would load for this folder, or None if there is none.
+
+    WoW loads AddOns/<Folder>/<Folder>.toc and nothing else -- but it matches
+    that name the way its filesystem does, which is case-insensitively on
+    Windows and, for a Wine install on Linux, case-insensitively too. So
+    PlayerbotManager/Playerbotmanager.toc is an addon the game loads happily,
+    and a scan that only asked for the exact spelling reported the folder as
+    not an addon at all and left it out of the list entirely.
+    """
+    exact = folder / f"{folder.name}.toc"
+    if exact.is_file():
+        return exact
+    wanted = f"{folder.name.lower()}.toc"
+    try:
+        for child in folder.iterdir():
+            if child.name.lower() == wanted and child.is_file():
+                return child
+    except OSError:
+        pass
+    return None
+
+
 def guess_source(fields: dict) -> str | None:
     """Pull a github:owner/repo out of a .toc if the author left one."""
     for key in ("x-repository", "x-website", "x-project-url", "x-github", "x-curse-project-url"):
@@ -446,8 +469,8 @@ def scan_installed(root: Path) -> dict[str, dict]:
     for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
         if not child.is_dir():
             continue
-        toc = child / f"{child.name}.toc"
-        if not toc.is_file():
+        toc = find_toc(child)
+        if toc is None:
             continue
         fields = read_toc(toc)
         found[child.name] = {
@@ -458,6 +481,74 @@ def scan_installed(root: Path) -> dict[str, dict]:
             "link_target": link_target(child),
         }
     return found
+
+
+def folder_problem(folder: Path) -> str | None:
+    """Why a folder in AddOns is not being listed as an addon, if you can fix it.
+
+    A scan that silently drops a folder is indistinguishable, from the outside,
+    from a scan that is broken: the addon is right there in AddOns and the list
+    says it is not. Most skipped folders are nothing -- an empty Blizzard_*
+    stub, a folder of notes -- and saying so about each of those is noise. The
+    ones worth a word are the folders that plainly hold an addon and still will
+    not load, because the fix is a rename or a move the person can do in a file
+    manager in ten seconds.
+
+    Returns None for a folder that is simply not an addon.
+    """
+    try:
+        children = list(folder.iterdir())
+    except OSError as exc:
+        return f"cannot be read ({exc.strerror or exc})"
+
+    # Not is_file(): a broken symlink, or a directory someone named MyAddon.toc,
+    # is exactly the case where the name is right and the game still loads
+    # nothing -- and where "no addon here" is the least useful thing to say.
+    named = [c for c in children if c.name.lower() == f"{folder.name.lower()}.toc"]
+    if named:
+        return (f"'{named[0].name}' is there but is not a readable file -- "
+                "a broken shortcut, or a folder with that name.")
+
+    files = [child for child in children if child.is_file()]
+    hidden = [f.name for f in files if f.name.lower() == f"{folder.name.lower()}.toc.txt"]
+    if hidden:
+        return (f"holds '{hidden[0]}' -- Windows hid the real extension. "
+                f"Rename it to '{folder.name}.toc'.")
+
+    tocs = sorted(f.name for f in files if f.name.lower().endswith(".toc"))
+    if tocs:
+        stem = tocs[0][:-4]
+        return (f"holds '{tocs[0]}' but no '{folder.name}.toc' -- the game only loads a "
+                f".toc named after its folder. Rename the folder to '{stem}', "
+                f"or the file to '{folder.name}.toc'.")
+
+    nested = sorted(
+        child.name for child in children if child.is_dir() and find_toc(child) is not None
+    )
+    if nested:
+        listed = ", ".join(nested[:3]) + (", ..." if len(nested) > 3 else "")
+        return (f"the addon{'s are' if len(nested) > 1 else ' is'} one folder deeper, in "
+                f"{folder.name}/ ({listed}) -- move {'them' if len(nested) > 1 else 'it'} "
+                f"up into AddOns.")
+
+    code = sorted(f.name for f in files if f.name.lower().endswith((".lua", ".xml")))
+    if code:
+        return (f"holds {code[0]} but no '{folder.name}.toc' -- the game loads no folder "
+                "without one, so this is not an addon it can run.")
+
+    return None
+
+
+def scan_problems(root: Path) -> dict[str, str]:
+    """Folders in AddOns that look like an addon and are not one, and why."""
+    problems: dict[str, str] = {}
+    for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+        if not child.is_dir() or find_toc(child) is not None:
+            continue
+        reason = folder_problem(child)
+        if reason:
+            problems[child.name] = reason
+    return problems
 
 
 def rescan(state: dict, root: Path) -> tuple[int, int, int]:
@@ -671,9 +762,9 @@ def resolve_source(addon: str, source: str) -> tuple[str, str, Path | None]:
         return source, kind, None
 
     local_path = Path(rest).expanduser().resolve()
-    if local_path.is_dir() and not (local_path / f"{local_path.name}.toc").is_file():
+    if local_path.is_dir() and find_toc(local_path) is None:
         candidate = local_path / addon
-        if (candidate / f"{addon}.toc").is_file():
+        if find_toc(candidate) is not None:
             local_path = candidate
         else:
             die(f"{local_path} holds no {addon}/{addon}.toc")
@@ -1158,6 +1249,28 @@ def split_repo_spec(repo_spec: str) -> tuple[str, str | None, str | None]:
     return repo_spec, branch, folder
 
 
+def names_a_toc(pick: str) -> bool:
+    """Does this choice name a .toc at the repository root rather than a folder?
+
+    Some repositories ARE the addon and ship several .toc files side by side,
+    one per client -- NotPlater is NotPlater-2.4.3.toc and NotPlater-3.3.5.toc
+    in one root, and the folder you unzip it into has to be named after the one
+    you want, because the client loads <Folder>/<Folder>.toc and nothing else.
+
+    There is no folder to name in that repository, so the source names the .toc
+    instead: `github:RichSteini/NotPlater#NotPlater-3.3.5.toc`. The suffix is
+    what tells the two apart, everywhere, and it cannot collide with a real
+    choice: a directory called `X.toc` is not a thing anybody ships.
+    """
+    return pick.lower().endswith(".toc")
+
+
+def addon_name_for(pick: str) -> str:
+    """The AddOns folder a chosen folder-or-.toc installs as."""
+    leaf = pick.rsplit("/", 1)[-1]
+    return leaf[:-len(".toc")] if names_a_toc(leaf) else leaf
+
+
 def wanted_folders(folder: str | None) -> list[str]:
     """The folders a source names, in order, with blanks and slashes trimmed."""
     if not folder:
@@ -1481,7 +1594,9 @@ def latest_github(repo_spec: str) -> tuple[str, str]:
     """(version, zip url) for the newest thing at owner/repo[@branch][#folder]."""
     repo, branch, folder = split_repo_spec(repo_spec)
 
-    chosen = wanted_folders(folder)
+    # A .toc pick names no folder -- the repository root is the addon -- so it
+    # keeps the repository's own version, releases and all.
+    chosen = [pick for pick in wanted_folders(folder) if not names_a_toc(pick)]
     if chosen:
         # A named folder overrides releases deliberately. A release asset is
         # packaged for one addon; there is no reason its contents line up with
@@ -1685,7 +1800,7 @@ def version_without_api(repo_spec: str) -> tuple[str, str]:
     ref = ref_without_api(repo, branch)
     url = archive_url(repo, ref, tag=names_a_tag(repo, ref))
 
-    chosen = wanted_folders(folder)
+    chosen = [pick for pick in wanted_folders(folder) if not names_a_toc(pick)]
     if not chosen:
         # No folder named: the ref's own commit is the version, and the ref
         # advertisement already told us it. Nothing is downloaded to check.
@@ -1697,12 +1812,36 @@ def version_without_api(repo_spec: str) -> tuple[str, str]:
     return version, url
 
 
+def root_tocs_in_archive(blob: bytes) -> list[str]:
+    """The files sitting at the top level of an archive, GitHub's wrapper stripped.
+
+    Only the names, and only that level: what this is for is spotting a
+    repository that IS the addon and ships a .toc per client.
+    """
+    with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+        listed = archive.namelist()
+        lead = without_wrapper(listed)
+        found = []
+        for name in listed:
+            if name.endswith("/"):
+                continue
+            path = name[len(lead):] if name.startswith(lead) else name
+            if path and "/" not in path:
+                found.append(path)
+        return found
+
+
 def addons_in_repo_without_api(repo_spec: str) -> list[str]:
     """The addon folders a repository holds, read out of its archive."""
     repo, branch, _folder = split_repo_spec(repo_spec)
     ref = ref_without_api(repo, branch)
     blob = archive_bytes(archive_url(repo, ref, tag=names_a_tag(repo, ref)))
-    return sorted(digests_in_archive(blob), key=str.lower)
+    root = root_tocs_in_archive(blob)
+    # Same rule as the API path: a .toc at the root means everything below it
+    # belongs to that one addon.
+    found = [] if any(names_a_toc(name) for name in root) else sorted(
+        digests_in_archive(blob), key=str.lower)
+    return found + toc_alternatives(root)
 
 
 def addons_in_repo(repo_spec: str, *, no_api: bool = False) -> list[str]:
@@ -1738,19 +1877,78 @@ def addons_in_repo(repo_spec: str, *, no_api: bool = False) -> list[str]:
         elif item.get("type") == "blob" and path.lower().endswith(".toc"):
             tocs.setdefault(path.rsplit("/", 1)[0] if "/" in path else "", []).append(path)
 
+    root = tocs.get("", [])
     found = []
-    for directory, paths in tocs.items():
-        if not directory or directory.count("/") > 1:
-            continue
-        name = directory.rsplit("/", 1)[-1]
-        if any(path.rsplit("/", 1)[-1] == f"{name}.toc" for path in paths):
-            found.append(directory)
+    # A .toc at the root means the repository IS the addon, and everything
+    # under it is that addon's own files -- including its bundled libraries.
+    # NotPlater carries libs-2.4.3/LibSharedMedia-3.0/LibSharedMedia-3.0.toc,
+    # which is an addon by the letter of the rule and is nobody's answer to
+    # "which of these do you want installed".
+    if not root:
+        for directory, paths in tocs.items():
+            if not directory or directory.count("/") > 1:
+                continue
+            name = directory.rsplit("/", 1)[-1]
+            if any(path.rsplit("/", 1)[-1] == f"{name}.toc" for path in paths):
+                found.append(directory)
+
+    # A root holding several .toc files is one addon with several names, one
+    # per client. Each is a real install target and the choice between them is
+    # not one this tool can make for somebody -- it is which game they play.
+    found.extend(toc_alternatives(root))
 
     if tree.get("truncated") and not found:
         # Enormous repository. Say so rather than showing an empty list, which
         # would read as "this repo has no addons in it".
         die(f"{repo} is too large to list; name the folder yourself")
     return sorted(found, key=str.lower)
+
+
+def toc_flavour_base(stems: list[str]) -> str | None:
+    """The single name a set of .toc stems shares, if they are a flavour set.
+
+    The WoW convention, and what ayro-CMD/FrostSeek does: FrostSeek.toc beside
+    FrostSeek_Wrath.toc, FrostSeek_Cata.toc and four more, all in ONE folder
+    called FrostSeek. The client picks the .toc that matches itself; the folder
+    is named after the base. Splitting those into separate installs would break
+    every one of them.
+
+    Recognised by shape, because that is what the convention is: one stem that
+    every other extends with a separator. Returns None when no stem does --
+    which is the other kind of repository entirely, and the reason this is a
+    function rather than a rule of thumb.
+    """
+    if not stems:
+        return None
+    base = min(stems, key=lambda stem: (len(stem), stem.lower()))
+    for other in stems:
+        if other == base:
+            continue
+        if not other.lower().startswith(base.lower()):
+            return None
+        if other[len(base):len(base) + 1] not in "-_.":
+            return None
+    return base
+
+
+def toc_alternatives(names: list[str]) -> list[str]:
+    """Root .toc files that are alternative NAMES for one addon, or none at all.
+
+    RichSteini/NotPlater is one addon in one root holding NotPlater-2.4.3.toc
+    and NotPlater-3.3.5.toc -- one per client, with no base .toc between them.
+    Neither is a suffix any client understands: 3.3.5 has no notion of flavour
+    .tocs at all, it loads <Folder>/<Folder>.toc and nothing else. So the
+    folder has to be NAMED after the one you want, which makes this a question
+    only the person playing can answer -- and getting it wrong is quiet, because
+    an addon built for the wrong client is not something the game reports.
+
+    Empty when there is nothing to choose: one .toc, or a flavour set that the
+    client itself picks between (see `toc_flavour_base`).
+    """
+    tocs = sorted((name for name in names if names_a_toc(name)), key=str.lower)
+    if len(tocs) < 2 or toc_flavour_base([addon_name_for(name) for name in tocs]):
+        return []
+    return tocs
 
 
 def likely_addon(name: str, folders: list[str]) -> str | None:
@@ -1763,13 +1961,89 @@ def likely_addon(name: str, folders: list[str]) -> str | None:
     if not folders:
         return None
     for folder in folders:
-        if folder.rsplit("/", 1)[-1] == name:
+        if addon_name_for(folder) == name:
             return folder
     lowered = name.lower()
     for folder in folders:
-        if folder.rsplit("/", 1)[-1].lower() == lowered:
+        if addon_name_for(folder).lower() == lowered:
             return folder
     return None
+
+
+def install_plan(repo_spec: str, chosen: list[str], available: list[str]) -> list[tuple[str, str]]:
+    """The rows to create for installing a repository: (addon name, source).
+
+    One row per addon, never one row for a repository holding several. Binding
+    the whole repo works and is almost never meant: every addon in it would be
+    written into AddOns whenever this one row updates, and each would report an
+    update whenever any of them changed. Choosing is what the tick boxes are
+    for, and this is where a choice becomes rows.
+
+    A repository holding ONE addon is bound without naming its folder, even
+    though the folder is known. Naming it switches the row off the
+    repository's releases and onto the last commit touching that folder, so an
+    addon that publishes tagged releases would start reporting commit ids
+    instead of version numbers -- for an install of exactly the same files.
+
+    The row is named after the folder that will land in AddOns, not after the
+    repository: that name is what the client loads, what a rescan will find,
+    and therefore the only name under which the two can agree.
+    """
+    repo, branch, folder = split_repo_spec(repo_spec)
+    base = f"github:{repo}" + (f"@{branch}" if branch else "")
+    # A folder named in the pasted URL is a choice too -- clicking into one
+    # addon of several on github.com and copying the address is the clearest
+    # way anybody states which one they mean.
+    picks = wanted_folders(",".join(chosen)) or wanted_folders(folder)
+    if len(available) <= 1 and len(picks) <= 1 and not any(names_a_toc(p) for p in picks):
+        named = picks or available or [repo.rsplit("/", 1)[-1]]
+        return [(addon_name_for(named[0]), base)]
+    # A .toc pick keeps its name in the source even when it is the only one
+    # ticked: it is not the folder that would be installed by default, it is
+    # one of several names the same files can be installed under.
+    return [(addon_name_for(pick), f"{base}#{pick}") for pick in picks]
+
+
+def rename_entry(install: dict, old: str, new: str) -> bool:
+    """Move a row to the name of the folder that was actually installed.
+
+    An install names its row before it can know what the archive holds: the
+    best guess is the repository's name, and a repository called
+    NotPlater-3.3.5 whose addon is NotPlater makes that guess wrong. Left
+    alone, the manifest then holds a bound row naming a folder that does not
+    exist -- reported as *not installed* -- and the next rescan adds a second,
+    unmanaged row for the folder that does. Two rows, one addon, neither of
+    them right.
+
+    Refuses to overwrite a row holding a decision of somebody's: an unmanaged
+    row is only a note that a folder exists, and this replaces it with the
+    truth, but a bound row is a binding that was set on purpose.
+    """
+    entries = install.setdefault("addons", {})
+    if old == new or old not in entries:
+        return False
+    if entries.get(new, {}).get("source", "unmanaged") != "unmanaged":
+        return False
+    entries[new] = entries.pop(old)
+    return True
+
+
+def settle_names(install: dict, names: list[str]) -> list[tuple[str, str]]:
+    """Rename fresh rows to the folder that actually landed in AddOns.
+
+    An install has to name its row before it can know what the archive holds,
+    and a repository called NotPlater-3.3.5 whose addon is NotPlater makes that
+    guess wrong. Left alone the manifest holds a bound row naming a folder that
+    does not exist, and the next scan adds a second row for the folder that
+    does.
+    """
+    entries = install.get("addons", {})
+    moved = []
+    for name in names:
+        folders = entries.get(name, {}).get("folders") or []
+        if len(folders) == 1 and folders[0] != name and rename_entry(install, name, folders[0]):
+            moved.append((name, folders[0]))
+    return moved
 
 
 def download(url: str) -> bytes:
@@ -1807,6 +2081,114 @@ def fetch(url: str) -> bytes:
         return response.read()
 
 
+# ── saved variables (the WTF folder) ─────────────────────────────────────────
+# An addon's settings do not live with the addon. The client keeps them in
+#
+#   WTF/Account/<ACCOUNT>/SavedVariables/<Addon>.lua              account-wide
+#   WTF/Account/<ACCOUNT>/<Realm>/<Char>/SavedVariables/<Addon>.lua  per character
+#
+# plus a .lua.bak the client rotates beside each. Replacing an addon never
+# touches any of that, which is almost always what you want -- your bars stay
+# where you put them across an update. The exception is the reason this exists:
+# settings written by a different fork of the addon, or a version old enough
+# that the new one chokes on them, and the fix is to start clean.
+#
+# Nothing here is called unless somebody ticks a box that says so. Deleting
+# settings is not a side effect of installing anything.
+
+
+def _named(path: Path, name: str) -> list[Path]:
+    """Directories inside `path` called `name`, whatever case they are in.
+
+    The client is case-blind about all of this -- Windows because its
+    filesystem is, a Wine install because Wine makes it so -- and real WTF
+    folders in the wild are spelled Account, ACCOUNT and account.
+    """
+    try:
+        return [child for child in path.iterdir()
+                if child.is_dir() and child.name.lower() == name.lower()]
+    except OSError:
+        return []
+
+
+def _subdirs(path: Path) -> list[Path]:
+    try:
+        return sorted((child for child in path.iterdir() if child.is_dir()),
+                      key=lambda p: p.name.lower())
+    except OSError:
+        return []
+
+
+def wtf_dir(root: Path) -> Path | None:
+    """The WTF folder belonging to the client whose AddOns folder this is.
+
+    AddOns is <WoW>/Interface/AddOns, so WTF is two levels up. Found rather
+    than assumed: a folder that is not there is a perfectly ordinary answer for
+    a client that has never been run.
+    """
+    for candidate in _named(root.parent.parent, "WTF"):
+        return candidate
+    return None
+
+
+def saved_variable_dirs(wtf: Path) -> list[Path]:
+    """Every SavedVariables folder in a WTF tree: one per account, one per character."""
+    found = []
+    for accounts in _named(wtf, "Account"):
+        for account in _subdirs(accounts):
+            found.extend(_named(account, "SavedVariables"))
+            for realm in _subdirs(account):
+                if realm.name.lower() == "savedvariables":
+                    continue
+                for character in _subdirs(realm):
+                    found.extend(_named(character, "SavedVariables"))
+    return found
+
+
+def saved_variables(root: Path, addon: str) -> list[Path]:
+    """Every settings file the client keeps for one addon, account and character.
+
+    The .lua.bak beside each is included: it is the client's own previous copy,
+    and leaving it behind while deleting the .lua would have the addon come
+    back with the settings you just asked to be rid of.
+    """
+    wtf = wtf_dir(root)
+    if wtf is None:
+        return []
+    wanted = (f"{addon.lower()}.lua", f"{addon.lower()}.lua.bak")
+    found = []
+    for directory in saved_variable_dirs(wtf):
+        try:
+            found.extend(child for child in directory.iterdir()
+                         if child.is_file() and child.name.lower() in wanted)
+        except OSError:
+            continue
+    return sorted(found, key=lambda p: str(p).lower())
+
+
+def remove_saved_variables(paths: list[Path], *, backup: bool) -> tuple[list[Path], list[str]]:
+    """Delete these files, keeping a copy of each first if asked.
+
+    Returns (deleted, problems). A copy is `<file>.replaced`, beside the
+    original: the client loads <Addon>.lua and nothing else, so a file with
+    another name sitting next to it is invisible to the game and obvious to
+    whoever goes looking for it.
+
+    A file that cannot be removed is reported, not raised: one locked file must
+    not leave the rest half-done and the caller with no idea which half.
+    """
+    deleted, problems = [], []
+    for path in paths:
+        try:
+            if backup:
+                shutil.copy2(path, backup_name(path))
+            path.unlink()
+            deleted.append(path)
+        except OSError as exc:
+            problems.append(f"{path.name}: {exc.strerror or exc}")
+    return deleted, problems
+
+
 # ── installing ───────────────────────────────────────────────────────────────
 
 
@@ -1836,18 +2218,28 @@ def addon_dirs_in(tree: Path, depth: int = 1) -> list[tuple[Path, str]]:
     hits = [
         (child, child.name)
         for child in sorted(tree.iterdir())
-        if child.is_dir() and (child / f"{child.name}.toc").is_file()
+        if child.is_dir() and find_toc(child) is not None
     ]
     if hits:
         return hits
 
     tocs = sorted(tree.glob("*.toc"))
     if tocs:
-        # Prefer a .toc named after this folder; otherwise the shortest stem,
-        # which skips flavour suffixes like MyAddon-Classic.toc.
-        exact = [t for t in tocs if t.stem == tree.name]
-        chosen = exact[0] if exact else min(tocs, key=lambda t: len(t.stem))
-        return [(tree, chosen.stem)]
+        # A .toc named after this folder settles it: that is the one the client
+        # would load out of a folder by this name.
+        exact = [toc for toc in tocs if toc.stem.lower() == tree.name.lower()]
+        if exact:
+            return [(tree, exact[0].stem)]
+        # Several .tocs with no base between them are alternative NAMES for
+        # this one tree, one per client. Returned as separate candidates rather
+        # than guessed between: the rule used to be "shortest stem", which
+        # quietly installed NotPlater's 2.4.3 build for somebody on 3.3.5.
+        alternatives = toc_alternatives([toc.name for toc in tocs])
+        if alternatives:
+            return [(tree, addon_name_for(name)) for name in alternatives]
+        # A flavour set, or a single .toc: one folder, named after the base,
+        # holding all of them -- the client reads the one that matches itself.
+        return [(tree, toc_flavour_base([toc.stem for toc in tocs]))]
 
     subdirs = sorted(child for child in tree.iterdir() if child.is_dir())
     if len(subdirs) == 1:
@@ -1897,6 +2289,22 @@ def descend_to(tree: Path, folder: str) -> Path:
         if candidate.is_dir():
             return candidate
     die(f"the archive has no folder '{folder}' -- was it renamed or moved?")
+
+
+def descend_to_toc(tree: Path, toc: str) -> Path:
+    """The level of an extracted archive holding a named .toc file.
+
+    The same wrapper problem as `descend_to`: GitHub's source archive puts
+    everything one level down inside `owner-repo-1a2b3c/`, and a hand-rolled
+    release zip may have no wrapper at all.
+    """
+    subdirs = [child for child in tree.iterdir() if child.is_dir()]
+    candidates = [tree] + (subdirs if len(subdirs) == 1 else [])
+    for candidate in candidates:
+        if any(child.name.lower() == toc.lower() and child.is_file()
+               for child in candidate.iterdir()):
+            return candidate
+    die(f"the archive has no '{toc}' at its root -- was it renamed or moved?")
 
 
 def install_zip(
@@ -1950,6 +2358,10 @@ def install_zip(
         if chosen:
             folders = []
             for name in chosen:
+                if names_a_toc(name):
+                    # Not a folder in the archive: a name for the whole of it.
+                    folders.append((descend_to_toc(tmpdir, name), addon_name_for(name)))
+                    continue
                 found = addon_dirs_in(descend_to(tmpdir, name))
                 if not found:
                     die(f"no addon folder (a directory holding its own .toc) found in '{name}'")
@@ -1958,6 +2370,17 @@ def install_zip(
             folders = addon_dirs_in(tmpdir)
             if not folders:
                 die("no addon folder (a directory holding its own .toc) found in the archive")
+            alternatives = {name for tree, name in folders}
+            if len({tree for tree, _name in folders}) == 1 and len(alternatives) > 1:
+                # One set of files, several names it could be installed under:
+                # a repository that is the addon and ships a .toc per client.
+                # Installing all of them would put the same addon in AddOns
+                # two or three times over, under names only one of which the
+                # person meant -- so this is a question, not a default.
+                names = ", ".join(sorted(alternatives))
+                die(f"this repository holds one addon with {len(alternatives)} .toc files "
+                    f"({names}) -- one per client version.\n"
+                    f"     Name the one you want: #{sorted(alternatives)[0]}.toc")
 
         written = []
         for folder, name in folders:
@@ -2055,7 +2478,7 @@ def install_local(source_path: Path, target: Path, mode: str, dry_run: bool, *, 
     report = report or _nothing
     if not source_path.is_dir():
         die(f"no such folder: {source_path}")
-    if not (source_path / f"{source_path.name}.toc").is_file():
+    if find_toc(source_path) is None:
         report("warn", f"{source_path} has no {source_path.name}.toc -- installing anyway")
 
     destination = target / source_path.name
@@ -2100,20 +2523,28 @@ def displaced_folder(entry: dict, addon: str, root: Path) -> Path | None:
     what lands in AddOns. For `github:` the archive's contents are unknowable
     until it is downloaded, so the addon's own name is the best guess.
     """
+    destination = install_destination(entry, addon, root)
+    if destination is not None and destination.exists() and not is_link(destination):
+        return destination
+    return None
+
+
+def install_destination(entry: dict, addon: str, root: Path) -> Path | None:
+    """The folder in AddOns this entry's next install would write.
+
+    For a `local:` source the folder is named after the SOURCE, because that is
+    what lands in AddOns. For `github:` a named folder is a much better guess
+    than the addon's own name -- it is what lands in AddOns, and for a repo of
+    several addons the two are often different. Without one the archive's
+    contents are unknowable until it is downloaded, so the addon's name remains
+    the best guess.
+    """
     source = entry.get("source", "unmanaged")
     if source.startswith("local:"):
-        destination = root / Path(source[len("local:"):]).name
-    elif source.startswith("github:"):
-        # A named folder is a much better guess than the addon's own name: it
-        # is what lands in AddOns, and for a repo of several addons the two are
-        # often different. Without one the archive's contents are unknowable
-        # until it is downloaded, so the addon's name remains the best guess.
+        return root / Path(source[len("local:"):]).name
+    if source.startswith("github:"):
         _repo, _branch, folder = split_repo_spec(source[len("github:"):])
-        destination = root / (Path(folder).name if folder else addon)
-    else:
-        return None
-    if destination.exists() and not is_link(destination):
-        return destination
+        return root / (addon_name_for(folder) if folder else addon)
     return None
 
 

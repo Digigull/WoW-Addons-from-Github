@@ -51,7 +51,8 @@ Not sure which build you have? `--version` says, and the window puts it in its t
 ```
 python3 addons.py init ~/Games/Ascension
 python3 addons.py scan
-python3 addons.py set MyAddon github:someone/MyAddon
+python3 addons.py install someone/NewAddon                 # one you do not have yet
+python3 addons.py set MyAddon github:someone/MyAddon       # one you already have
 python3 addons.py update
 ```
 
@@ -99,6 +100,7 @@ Running from a checkout instead needs **Python 3.9 or newer**, and that is the w
 |---|---|
 | `init <path>` | Remember where the client is. Accepts your WoW folder, its `Interface` folder, or `Interface/AddOns` itself. |
 | `scan` | Read every addon already installed and record it, guessing a source from each `.toc` where it can. Drops unmanaged rows whose folder you have deleted; keeps bound ones, flagged *not installed*. |
+| `install <repo>` | Fetch an addon you do **not** have yet and bind it in one step. Takes `owner/repo`, `owner/repo#Folder` or any github.com link; `--folder` (repeatable) picks addons out of a repository that holds several — or the `.toc` out of one that ships several, `--folder NotPlater-3.3.5.toc` — and `--branch` follows a branch instead of releases. `--reset-settings` also deletes that addon's saved variables (account and every character) once it has installed, keeping a copy of each unless you add `--no-settings-backup`. |
 | `list` | Every addon, its source, and its installed version. Bound addons first, then the rest, each alphabetically. |
 | `set <Addon> <source>` | Bind one addon to where its updates come from. |
 | `accept` | Take every source that `scan` suggested, in one go. |
@@ -185,6 +187,42 @@ the repo can be bound separately, and each then updates — and reports updates 
 Bind the repository as a whole and the tool says so once, in the run log, rather than
 leaving it to be discovered as strange behaviour later.
 
+### A repository that is one addon with a `.toc` per client
+
+[RichSteini/NotPlater](https://github.com/RichSteini/NotPlater) is one addon in one root
+holding `NotPlater-2.4.3.toc` and `NotPlater-3.3.5.toc` — TBC and Wrath, same files. There
+is no `NotPlater.toc` between them, and 3.3.5 has no notion of flavour `.toc`s at all: it
+loads `<Folder>/<Folder>.toc` and nothing else. So the folder in `AddOns` has to be **named
+after the one you want**, which makes this a question only you can answer — it is which
+client you play.
+
+Both dialogs offer the `.toc` files as tick boxes and **refuse to proceed with none
+ticked**; there is no "install all of them", because all of them would be this one addon
+installed twice over under names only one of which your client loads. Tick both anyway if
+you actually want both folders. The source records the choice:
+
+```
+addons.py install RichSteini/NotPlater --folder NotPlater-3.3.5.toc
+github:RichSteini/NotPlater#NotPlater-3.3.5.toc
+```
+
+That row still follows the repository's own releases — there is no folder to date, the
+whole repository is the addon.
+
+This is **not** the same as `FrostSeek.toc` beside `FrostSeek_Wrath.toc` and five more.
+There a base `.toc` exists that every other extends, which is the convention the client
+itself resolves out of a single folder named `FrostSeek`; splitting those would break all
+of them. Nothing is asked in that case, and nothing should be.
+
+A folder in `AddOns` is an addon when it holds a `.toc` named after itself — the rule the
+game uses, matched the way the game matches it. That match ignores case, so
+`PlayerbotManager/Playerbotmanager.toc` is an addon here exactly as it is in the client,
+where Windows and Wine both find it. A folder that plainly holds an addon and still will not
+load — the `.toc` named after something else, the addon left one level down inside the folder
+its zip made, a `.toc.txt` saved by an Explorer that hides extensions — is named with its fix
+rather than silently dropped: a folder you can see in `AddOns` and cannot see in the list
+makes the scan look broken.
+
 `scan` reads each `.toc` for an `X-Website` or `X-Repository` header and *suggests* a GitHub
 source where it finds one. Suggestions are never applied on their own — a header is the
 author's claim about where the code lives, which is not the same as your decision to install
@@ -203,7 +241,8 @@ repository whose root *is* the addon (`repo-1a2b3c/MyAddon.toc`) all end up corr
 Addons are found wherever they sit in the archive: at the top, under GitHub's wrapper
 directory, laid out as `src/MyAddon/MyAddon.toc` beside a `docs/` folder, or as a repository
 whose root *is* the addon. An addon's own bundled libraries are never mistaken for the addon
-itself.
+itself — including a repository that is the addon and keeps its libraries beside it, where
+everything under the root belongs to the one addon at the root.
 
 ## Working on your own addon
 
@@ -289,6 +328,21 @@ Everything the terminal does, in one window:
 - **The addons you have bound are listed first**, then everything still unmanaged, each
   group alphabetically. On a real install most rows are addons this tool does not manage,
   and a single alphabetical list buries the handful it does among them.
+- **Install addon…** takes a repository — `owner/repo` or any github.com link — and
+  fetches an addon that is not in your AddOns folder at all yet. It reads what the
+  repository holds and, if that is several addons, asks which; each one you tick becomes
+  its own row and its own binding, rather than one row that reinstalls all of them
+  whenever any one of them changes. A repository holding a single addon is bound whole,
+  which keeps it following that repository's releases.
+- **Installing over an addon you already have asks first**, in a window that
+  keeps two very different questions apart. *Make a backup* — ticked — moves the folder
+  that is there now to `<Name>.replaced` instead of deleting it. Below a rule, under a red
+  **Delete!** heading, is the part that is not undoable: **delete the associated saved
+  variables** — off by default, and it names every file it means, account-wide and one per
+  character, so you can see the extent of it before agreeing. Ticking it enables *back up
+  the saved variables first*, which is itself ticked: those are settings you made, and no
+  repository anywhere has a copy. They are deleted **after** the addon installs, so a
+  download that fails takes nothing with it.
 - **Set source…** opens a dialog over the selected addon: a local folder (with Browse),
   a GitHub repo, an optional branch to track, an optional folder inside the repo, or
   unmanaged. Pasting a github.com link to a folder fills all three in.
@@ -302,8 +356,9 @@ Everything the terminal does, in one window:
   rather than mid-download, which leaves the manifest agreeing with the disk.
 - A repository that cannot be reached marks **that row** red and leaves the rest to
   finish. There is no error dialog to dismiss per failure.
-- Binding an addon that exists as real files says so in the dialog, and names the
-  `<Name>.replaced` folder it would move them to, *before* you click Save.
+- Binding **or installing** over an addon that exists as real files says so in the
+  dialog, and names the `<Name>.replaced` folder it would move them to, *before* you
+  click Save or Install.
 
 ## Things it will not do to your client
 
@@ -318,6 +373,11 @@ Everything the terminal does, in one window:
   not write, whatever it recorded about the addon you bound. Turn the copy
   off entirely with `--no-backup`, or the checkbox in the Set-source dialog, and an
   existing folder is replaced outright.
+- **It never touches your saved variables unless you tick the box that says so.**
+  Updating an addon leaves `WTF/Account/…/SavedVariables/<Addon>.lua` exactly where it is —
+  your bars stay where you put them. The only thing that deletes one is the **Delete!**
+  section of the install confirmation, or `install --reset-settings`, and both keep a
+  `.replaced` copy beside each file unless you turn that off too.
 - **A rescan never throws away a binding.** An unmanaged row whose folder you deleted is
   dropped from the list, because it held nothing of yours. A row you had bound is kept and
   flagged *not installed* — that is also how an addon you have bound but not yet fetched
@@ -558,7 +618,7 @@ workflow**, leave the branch on `main`, then:
 | **just check the builds** | *(blank)* | *(blank)* |
 
 A new tag is created at the commit that was actually built, and the release gets its title,
-notes, pre-release label and both binaries. Rebuilding edits the existing release in place —
+notes and both binaries. Rebuilding edits the existing release in place —
 same tag, same URL, nothing duplicated — which is what makes a failed release repairable
 without moving a tag, something the web UI cannot do.
 

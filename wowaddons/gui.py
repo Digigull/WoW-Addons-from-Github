@@ -30,6 +30,7 @@ import queue
 import threading
 import traceback
 import tkinter as tk
+from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -95,10 +96,254 @@ class _Worker(threading.Thread):
             self.outbox.put(("done", None))
 
 
+# ── the half both repository dialogs share ───────────────────────────────────
+
+
+class RepoDialog:
+    """What Set source and Install have in common: a repository box, and the
+    question "what addons does this repository hold?"
+
+    Both ask GitHub that, off the UI thread, a moment after typing stops, and
+    draw the same tick boxes from the answer. One implementation, because two
+    would drift -- and the drift would be in which folders a person is offered,
+    which is the one thing either dialog is for.
+
+    A host provides the widgets (`repo_hint`, `lookup_status`, `addon_boxes`,
+    `addon_list`) and the tk variables named in its own VARIABLES, says what
+    starts ticked (`_preticked`) and what a tick means to it
+    (`_folders_ticked`).
+    """
+
+    def _init_lookup(self, *, no_api: bool) -> None:
+        # Defaults to False so a test, or any other caller, gets the ordinary
+        # API lookup without having to know this mode exists.
+        self.checks_without_api = no_api
+        self.folder_boxes: dict[str, tk.BooleanVar] = {}
+        # What the repository holds, and -- separately -- what of it is being
+        # offered as a choice. They differ for a repo holding one addon: there
+        # is nothing to choose, and its folder name is still worth knowing.
+        self.available: list[str] = []
+        self.looked_up: list[str] = []
+        self.lookup_for = ""
+        self.lookups: queue.Queue = queue.Queue()
+        self._lookup_after = None
+        self._poll_after = None
+
+    def _preticked(self, folders: list[str]) -> set[str]:
+        """Which boxes start ticked. Nothing, unless the host knows better."""
+        return set()
+
+    def _client_choice(self, folders: list[str]) -> bool:
+        """Is the choice on offer which .toc, rather than which addon?
+
+        A repository that IS the addon and ships one .toc per client offers
+        names, not folders -- and the choice between them is which game you
+        play, which is not a thing this tool can work out.
+        """
+        return bool(folders) and all(core.names_a_toc(folder) for folder in folders)
+
+    def _pick_message(self, folders: list[str]) -> str:
+        if self._client_choice(folders):
+            return (f"one addon, {len(folders)} .toc files — one per client. "
+                    "Tick the one yours uses")
+        return f"{len(folders)} addons — tick the ones this row updates"
+
+    def _folders_ticked(self, *_a) -> None:
+        """What a tick means to this dialog."""
+
+    def destroy(self) -> None:
+        """Close, and let go of the tk variables while it is still safe to.
+
+        A tkinter Variable calls into the interpreter when it is garbage
+        collected. Left to the collector that happens at an arbitrary moment on
+        whatever thread happened to be allocating -- and this program has a
+        worker thread. Collected there, Tcl raises "main thread is not in main
+        loop", and on Windows it escalates to aborting the whole process with
+        "Tcl_AsyncDelete: async handler deleted by the wrong thread". A user
+        would see that as the app vanishing part-way through an update, having
+        closed this dialog some time earlier.
+
+        Releasing them here pins that moment to the main thread, during close,
+        which is the only point at which it is certainly safe.
+        """
+        self._stop_lookups()
+
+        held = [getattr(self, name, None) for name in self.VARIABLES]
+        # The tick boxes are variables too, made after __init__ so the
+        # VARIABLES list does not cover them. Clearing the dict is what
+        # actually releases them; extending `held` first only makes them
+        # finalise at the same moment as the rest, after super().destroy(),
+        # rather than a few lines earlier. Same thread either way, which is
+        # the part that matters.
+        held.extend(self.folder_boxes.values())
+        self.folder_boxes.clear()
+        for name in self.VARIABLES:
+            setattr(self, name, None)
+        super().destroy()
+        held.clear()  # __del__ runs now, on this thread, with Tcl still up
+
+    def _absorb_url(self, *_a) -> None:
+        """Show what a pasted URL was understood as, while it is being pasted.
+
+        Silently accepting a URL and only revealing the interpretation after
+        the button is pressed leaves somebody guessing whether it took the
+        branch they meant.
+        """
+        if self.repo is None:
+            return
+        text = self.repo.get()
+        found = core.parse_repo(text)
+        if found is None:
+            self.repo_hint.configure(text="not a GitHub repository" if text.strip() else "")
+            return
+        repo, branch, folder = found
+        if branch and not self.track.get():
+            # The URL named a branch; reflect that rather than dropping it.
+            self.track.set(True)
+            self.branch.set(branch)
+            self._sync()
+        # Clicking into one addon of several and copying the address is the
+        # clearest way anybody states which addon they mean. Keep it.
+        self._absorbed(folder)
+        shown = f"→ {repo}"
+        if branch:
+            shown += f" @ {branch}"
+        if folder:
+            shown += f" · {folder}"
+        self.repo_hint.configure(text=shown)
+        self._schedule_lookup()
+
+    def _absorbed(self, folder: str | None) -> None:
+        """Keep the folder a pasted URL named, if this dialog has a use for it."""
+
+    def _centre(self, parent) -> None:
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    def _stop_lookups(self) -> None:
+        """Timers first: an after() that fires into a half-torn-down dialog
+        reaches for widgets that are gone."""
+        for pending in ("_lookup_after", "_poll_after"):
+            token = getattr(self, pending, None)
+            if token is not None:
+                self.after_cancel(token)
+                setattr(self, pending, None)
+
+
+    def _schedule_lookup(self) -> None:
+        """Ask GitHub a moment after typing stops, not on every keystroke.
+
+        Typing `tullamods/Bagnon` would otherwise be sixteen requests for one
+        answer. The delay is cancelled and re-armed on each key, so exactly one
+        goes out per repository somebody actually settles on.
+        """
+        if self._lookup_after is not None:
+            self.after_cancel(self._lookup_after)
+        self._lookup_after = self.after(600, self._begin_lookup)
+
+    def _begin_lookup(self) -> None:
+        self._lookup_after = None
+        if self.repo is None:
+            return
+        found = core.parse_repo(self.repo.get())
+        if found is None:
+            self._hide_list()
+            return
+        repo, branch, _folder = found
+        spec = f"{repo}@{branch}" if branch else repo
+        if spec == self.lookup_for:
+            return
+        self.lookup_for = spec
+        self._show_list(f"looking in {repo}…", [])
+
+        # A worker, because a request on the main thread freezes the window --
+        # and nothing here touches a widget: it puts a result in a queue and
+        # _drain_lookups picks it up on the main thread. That rule is why this
+        # program does not abort with Tcl_AsyncDelete.
+        no_api = self.checks_without_api
+        def ask() -> None:
+            core.begin_run()
+            try:
+                self.lookups.put((spec, core.addons_in_repo(spec, no_api=no_api), None))
+            except Exception as exc:  # noqa: BLE001 - reported in the dialog
+                self.lookups.put((spec, [], str(exc)))
+            finally:
+                core.end_run()
+
+        threading.Thread(target=ask, daemon=True).start()
+        self._poll_lookups()
+
+    def _poll_lookups(self) -> None:
+        if self._poll_after is not None:
+            self.after_cancel(self._poll_after)
+        self._poll_after = self.after(100, self._drain_lookups)
+
+    def _drain_lookups(self) -> None:
+        self._poll_after = None
+        if self.repo is None:
+            return  # closed while the request was in flight
+        pending = False
+        while True:
+            try:
+                spec, folders, error = self.lookups.get_nowait()
+            except queue.Empty:
+                break
+            if spec != self.lookup_for:
+                continue  # an answer about a repo that has since been retyped
+            pending = True
+            self.available = list(folders)
+            if error:
+                self._show_list(f"could not read {spec}: {error}", [])
+            elif not folders:
+                # The repository root is the addon -- FrostSeek, Minn-Tinkers.
+                # There is nothing to choose, so say so and offer no choice.
+                self._show_list("one addon, installed whole — nothing to choose", [])
+            elif len(folders) == 1:
+                # One candidate is not a choice. Offering a single tick box
+                # would imply a decision, and ticking it would do real harm:
+                # naming a folder switches this row from the repository's
+                # RELEASES to the last commit touching that folder, so an addon
+                # that publishes tagged releases would silently start reporting
+                # commit ids instead of version numbers. Left unticked it
+                # installs exactly the same folder, and keeps its releases.
+                self._show_list(f"one addon: {folders[0]} — nothing to choose", [])
+            else:
+                self._show_list(self._pick_message(folders), folders)
+        if not pending:
+            self._poll_lookups()
+
+    def _hide_list(self) -> None:
+        self.lookup_for = ""
+        self.available = []
+        self.looked_up = []
+        self.addon_list.grid_remove()
+
+    def _show_list(self, message: str, folders: list[str]) -> None:
+        self.looked_up = folders
+        self.lookup_status.configure(text=message)
+        for child in self.addon_boxes.winfo_children():
+            child.destroy()
+        self.folder_boxes.clear()
+
+        ticked = self._preticked(folders)
+        for row, folder in enumerate(folders):
+            variable = tk.BooleanVar(value=folder in ticked)
+            self.folder_boxes[folder] = variable
+            ttk.Checkbutton(
+                self.addon_boxes, text=folder, variable=variable,
+                command=self._folders_ticked,
+            ).grid(row=row, column=0, sticky="w")
+        if folders:
+            self._folders_ticked()
+        self.addon_list.grid()
+
+
 # ── the set-source dialog ────────────────────────────────────────────────────
 
 
-class SourceDialog(tk.Toplevel):
+class SourceDialog(RepoDialog, tk.Toplevel):
     """Where one addon's source is chosen. Returns (source, copy) or None.
 
     The displacement warning lives here rather than after Save on purpose: this
@@ -116,9 +361,7 @@ class SourceDialog(tk.Toplevel):
         self.title(f'Source for "{addon}"')
         self.addon = addon
         self.addons_root = root
-        # Defaults to False so a test, or any other caller, gets the ordinary
-        # API lookup without having to know this mode exists.
-        self.checks_without_api = no_api
+        self._init_lookup(no_api=no_api)
         self.entry = entry
         self.result: tuple[str, bool] | None = None
         self.keep_backup = entry.get("backup", True)
@@ -135,16 +378,10 @@ class SourceDialog(tk.Toplevel):
         self.track = tk.BooleanVar(value=False)
         self.copy = tk.BooleanVar(value=entry.get("mode") == "copy")
         self.backup = tk.BooleanVar(value=entry.get("backup", True))
-        self.folder = tk.StringVar()
         # Ticked boxes write into `self.folder`, which stays the single source
         # of truth: _save reads only that, so a typed folder and a ticked one
         # cannot disagree, and a repository too large to list is still usable.
-        self.folder_boxes: dict[str, tk.BooleanVar] = {}
-        self.looked_up: list[str] = []
-        self.lookup_for = ""
-        self.lookups: queue.Queue = queue.Queue()
-        self._lookup_after = None
-        self._poll_after = None
+        self.folder = tk.StringVar()
 
         if source.startswith("local:"):
             self.choice.set("local")
@@ -176,12 +413,6 @@ class SourceDialog(tk.Toplevel):
         self.wait_visibility()
         self.grab_set()
         self.focus_set()
-
-    def _centre(self, parent) -> None:
-        self.update_idletasks()
-        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
-        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 3
-        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
 
     def _build(self, suggested: str | None) -> None:
         pad = {"padx": 8, "pady": 3}
@@ -278,147 +509,18 @@ class SourceDialog(tk.Toplevel):
         ttk.Button(buttons, text="Save", command=self._save).grid(row=0, column=1, padx=4)
         body.columnconfigure(1, weight=1)
 
-    def _absorb_url(self, *_a) -> None:
-        """Show what a pasted URL was understood as, while it is being pasted.
-
-        Silently accepting a URL and only revealing the interpretation after
-        Save leaves somebody guessing whether it took the branch they meant.
-        """
-        if self.repo is None:
-            return
-        text = self.repo.get()
-        found = core.parse_repo(text)
-        if found is None:
-            self.repo_hint.configure(text="not a GitHub repository" if text.strip() else "")
-            return
-        repo, branch, folder = found
-        if branch and not self.track.get():
-            # The URL named a branch; reflect that rather than dropping it.
-            self.track.set(True)
-            self.branch.set(branch)
-            self._sync()
-        if folder and not self.folder.get().strip():
-            # Clicking into one addon of several and copying the address is the
-            # clearest way anybody states which addon they mean. Keep it.
+    def _absorbed(self, folder: str | None) -> None:
+        if folder and self.folder is not None and not self.folder.get().strip():
             self.folder.set(folder)
-        shown = f"→ {repo}"
-        if branch:
-            shown += f" @ {branch}"
-        if folder:
-            shown += f" · {folder}"
-        self.repo_hint.configure(text=shown)
-        self._schedule_lookup()
 
-    # -- asking the repository what it holds ---------------------------------
-
-    def _schedule_lookup(self) -> None:
-        """Ask GitHub a moment after typing stops, not on every keystroke.
-
-        Typing `tullamods/Bagnon` would otherwise be sixteen requests for one
-        answer. The delay is cancelled and re-armed on each key, so exactly one
-        goes out per repository somebody actually settles on.
-        """
-        if self._lookup_after is not None:
-            self.after_cancel(self._lookup_after)
-        self._lookup_after = self.after(600, self._begin_lookup)
-
-    def _begin_lookup(self) -> None:
-        self._lookup_after = None
-        if self.repo is None:
-            return
-        found = core.parse_repo(self.repo.get())
-        if found is None:
-            self._hide_list()
-            return
-        repo, branch, _folder = found
-        spec = f"{repo}@{branch}" if branch else repo
-        if spec == self.lookup_for:
-            return
-        self.lookup_for = spec
-        self._show_list(f"looking in {repo}…", [])
-
-        # A worker, because a request on the main thread freezes the window --
-        # and nothing here touches a widget: it puts a result in a queue and
-        # _drain_lookups picks it up on the main thread. That rule is why this
-        # program does not abort with Tcl_AsyncDelete.
-        no_api = self.checks_without_api
-        def ask() -> None:
-            core.begin_run()
-            try:
-                self.lookups.put((spec, core.addons_in_repo(spec, no_api=no_api), None))
-            except Exception as exc:  # noqa: BLE001 - reported in the dialog
-                self.lookups.put((spec, [], str(exc)))
-            finally:
-                core.end_run()
-
-        threading.Thread(target=ask, daemon=True).start()
-        self._poll_lookups()
-
-    def _poll_lookups(self) -> None:
-        if self._poll_after is not None:
-            self.after_cancel(self._poll_after)
-        self._poll_after = self.after(100, self._drain_lookups)
-
-    def _drain_lookups(self) -> None:
-        self._poll_after = None
-        if self.repo is None:
-            return  # closed while the request was in flight
-        pending = False
-        while True:
-            try:
-                spec, folders, error = self.lookups.get_nowait()
-            except queue.Empty:
-                break
-            if spec != self.lookup_for:
-                continue  # an answer about a repo that has since been retyped
-            pending = True
-            if error:
-                self._show_list(f"could not read {spec}: {error}", [])
-            elif not folders:
-                # The repository root is the addon -- FrostSeek, Minn-Tinkers.
-                # There is nothing to choose, so say so and offer no choice.
-                self._show_list("one addon, installed whole — nothing to choose", [])
-            elif len(folders) == 1:
-                # One candidate is not a choice. Offering a single tick box
-                # would imply a decision, and ticking it would do real harm:
-                # naming a folder switches this row from the repository's
-                # RELEASES to the last commit touching that folder, so an addon
-                # that publishes tagged releases would silently start reporting
-                # commit ids instead of version numbers. Left unticked it
-                # installs exactly the same folder, and keeps its releases.
-                self._show_list(f"one addon: {folders[0]} — nothing to choose", [])
-            else:
-                self._show_list(
-                    f"{len(folders)} addons — tick the ones this row updates", folders
-                )
-        if not pending:
-            self._poll_lookups()
-
-    def _hide_list(self) -> None:
-        self.lookup_for = ""
-        self.looked_up = []
-        self.addon_list.grid_remove()
-
-    def _show_list(self, message: str, folders: list[str]) -> None:
-        self.looked_up = folders
-        self.lookup_status.configure(text=message)
-        for child in self.addon_boxes.winfo_children():
-            child.destroy()
-        self.folder_boxes.clear()
-
+    def _preticked(self, folders: list[str]) -> set[str]:
+        """What is saved, else one confident guess -- and no guess at all rather
+        than a wrong one, which would arrive ticked and be accepted unread."""
         already = core.wanted_folders(self.folder.get())
-        guess = core.likely_addon(self.addon, folders) if not already else None
-        for row, folder in enumerate(folders):
-            ticked = folder in already or folder == guess
-            variable = tk.BooleanVar(value=ticked)
-            self.folder_boxes[folder] = variable
-            ttk.Checkbutton(
-                self.addon_boxes, text=folder, variable=variable,
-                command=self._folders_ticked,
-            ).grid(row=row, column=0, sticky="w")
-        if folders:
-            self._folders_ticked()
-        self.addon_list.grid()
+        if already:
+            return set(already)
+        guess = core.likely_addon(self.addon, folders)
+        return {guess} if guess else set()
 
     def _folders_ticked(self, *_a) -> None:
         """Ticked boxes are written into the folder box, which _save reads."""
@@ -561,6 +663,20 @@ class SourceDialog(tk.Toplevel):
             # A branch in the pasted URL counts as asking to track it.
             branch = typed if (self.track.get() and typed) else (url_branch or "")
             folder = (self.folder.get().strip() or url_folder or "").strip("/")
+            if not folder and self._client_choice(self.looked_up):
+                # Not the same question as below. Every .toc here names the
+                # same files, so "all of them" would install this one addon
+                # two or three times over under names only one of which the
+                # client will load. There is nothing to say OK to.
+                messagebox.showerror(
+                    "Which client?",
+                    f"{repo} is one addon with {len(self.looked_up)} .toc files — one per "
+                    "client version.\n\nThe folder in AddOns has to be named after the one "
+                    "you want, so there is no sensible thing to install until you say "
+                    "which.\n\nTick the .toc your client uses.",
+                    parent=self,
+                )
+                return
             if not folder and len(self.looked_up) > 1:
                 # Saving with nothing ticked is a real choice -- it binds the
                 # whole repository -- but it is far more often an oversight, and
@@ -586,42 +702,411 @@ class SourceDialog(tk.Toplevel):
         self.result = None
         self.destroy()
 
-    def destroy(self) -> None:
-        """Close, and let go of the tk variables while it is still safe to.
 
-        A tkinter Variable calls into the interpreter when it is garbage
-        collected. Left to the collector that happens at an arbitrary moment on
-        whatever thread happened to be allocating -- and this program has a
-        worker thread. Collected there, Tcl raises "main thread is not in main
-        loop", and on Windows it escalates to aborting the whole process with
-        "Tcl_AsyncDelete: async handler deleted by the wrong thread". A user
-        would see that as the app vanishing part-way through an update, having
-        closed this dialog some time earlier.
 
-        Releasing them here pins that moment to the main thread, during close,
-        which is the only point at which it is certainly safe.
+# ── the install dialog ───────────────────────────────────────────────────────
+
+
+class InstallDialog(RepoDialog, tk.Toplevel):
+    """Where an addon you do not have yet comes from. Returns [(name, source)].
+
+    Every other button in this window works on what is already in AddOns: a
+    rescan finds a folder, Set source binds it to where its updates come from.
+    Getting a NEW addon in meant downloading and unzipping it by hand first and
+    then telling this tool about it -- and downloading and unzipping an addon
+    correctly is the exact job this tool exists to do for you.
+
+    It creates one row per addon and then installs it, rather than binding a
+    row and leaving the install to be discovered: pressing Install and getting
+    a row that says "not installed" would be a button that did not do what it
+    said.
+    """
+
+    VARIABLES = ("repo", "branch", "track")
+
+    def __init__(self, parent, root: Path, entries: dict, *, no_api: bool = False):
+        super().__init__(parent)
+        self.title("Install an addon")
+        self.addons_root = root
+        self.known = entries
+        self.result: list[tuple[str, str]] | None = None
+        self._init_lookup(no_api=no_api)
+        self.transient(parent)
+        self.resizable(False, False)
+
+        self.repo = tk.StringVar()
+        self.branch = tk.StringVar()
+        self.track = tk.BooleanVar(value=False)
+
+        self._build()
+        self._sync()
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Escape>", lambda _e: self._cancel())
+        self.bind("<Return>", lambda _e: self._install())
+        self._centre(parent)
+        # Order matters: a grab on a window that is not on screen yet fails, so
+        # wait for it to map first.
+        self.wait_visibility()
+        self.grab_set()
+        self.repo_entry.focus_set()
+
+    def _pick_message(self, folders: list[str]) -> str:
+        if self._client_choice(folders):
+            return (f"one addon, {len(folders)} .toc files — one per client. "
+                    "Tick the one yours uses")
+        return f"{len(folders)} addons — tick the ones to install"
+
+    def _build(self) -> None:
+        pad = {"padx": 8, "pady": 3}
+        body = ttk.Frame(self, padding=12)
+        body.grid(sticky="nsew")
+
+        ttk.Label(body, text="Install from:").grid(row=0, column=0, sticky="w", **pad)
+        self.repo_entry = ttk.Entry(body, textvariable=self.repo, width=46)
+        self.repo_entry.grid(row=0, column=1, sticky="ew", **pad)
+        self.repo_entry.bind("<KeyRelease>", self._absorb_url)
+        self.repo_hint = ttk.Label(body, text="", foreground="grey")
+        self.repo_hint.grid(row=0, column=2, sticky="w", **pad)
+        ttk.Label(body, text="owner/repo, or a github.com link", foreground="grey").grid(
+            row=1, column=1, sticky="w", **pad)
+
+        track = ttk.Frame(body)
+        track.grid(row=2, column=1, sticky="w", **pad)
+        self.track_box = ttk.Checkbutton(track, text="track branch:", variable=self.track,
+                                         command=self._sync)
+        self.track_box.grid(row=0, column=0, sticky="w")
+        self.branch_entry = ttk.Entry(track, textvariable=self.branch, width=18)
+        self.branch_entry.grid(row=0, column=1, sticky="w", padx=(6, 0))
+        ttk.Label(track, text="(otherwise: its latest release)", foreground="grey").grid(
+            row=0, column=2, sticky="w", padx=(6, 0))
+
+        # Hidden until a repository has been read, and hidden again for one
+        # holding a single addon: there is nothing to choose, and a one-item
+        # list would imply there were a decision to make.
+        self.addon_list = ttk.LabelFrame(body, text="Addons in this repository")
+        self.addon_list.grid(row=3, column=0, columnspan=3, sticky="ew", **pad)
+        self.addon_list.grid_remove()
+        self.lookup_status = ttk.Label(self.addon_list, text="", foreground="grey")
+        self.lookup_status.grid(row=0, column=0, sticky="w", padx=6, pady=(2, 4))
+        self.addon_boxes = ttk.Frame(self.addon_list)
+        self.addon_boxes.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 4))
+
+        self.caution = ttk.Label(body, text="", foreground="#a05000", wraplength=480,
+                                 justify="left")
+        self.caution.grid(row=4, column=0, columnspan=3, sticky="w", **pad)
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=5, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="Cancel", command=self._cancel).grid(row=0, column=0, padx=4)
+        ttk.Button(buttons, text="Install", command=self._install).grid(row=0, column=1, padx=4)
+        body.columnconfigure(1, weight=1)
+
+    def _folders_ticked(self, *_a) -> None:
+        self._sync()
+
+    def _show_list(self, message: str, folders: list[str]) -> None:
+        # What the repository turns out to hold changes what Install would do,
+        # so the caution has to be re-read against the answer -- including the
+        # answer "one addon", which offers no tick box to trigger it.
+        super()._show_list(message, folders)
+        self._sync()
+
+    def _sync(self, *_a) -> None:
+        if self.repo is None:
+            return  # a queued event arriving after the dialog was closed
+        self.branch_entry.configure(state="normal" if self.track.get() else "disabled")
+        self._show_caution()
+
+    # -- what Install would do -----------------------------------------------
+
+    def _spec(self) -> str | None:
+        """The repository this dialog is pointed at, or None if it is not one yet."""
+        found = core.parse_repo(self.repo.get()) if self.repo is not None else None
+        if found is None:
+            return None
+        repo, url_branch, url_folder = found
+        typed = self.branch.get().strip()
+        # A branch in the pasted URL counts as asking to track it.
+        branch = typed if (self.track.get() and typed) else (url_branch or "")
+        spec = repo + (f"@{branch}" if branch else "")
+        return spec + (f"#{url_folder}" if url_folder else "")
+
+    def _ticked(self) -> list[str]:
+        return [folder for folder, box in self.folder_boxes.items() if box.get()]
+
+    def _plan(self) -> list[tuple[str, str]]:
+        """The rows Install would create. Empty while there is nothing to act on."""
+        spec = self._spec()
+        if spec is None:
+            return []
+        return core.install_plan(spec, self._ticked(), self.available)
+
+    def _show_caution(self, *_a) -> None:
+        """Say what is about to happen to folders that are already there.
+
+        The same rule as Set source, for the same reason: replacing files
+        somebody installed by hand is the one thing here that cannot be undone,
+        and in a window there is no log to read about it afterwards.
         """
-        # Timers first: an after() that fires into a half-torn-down dialog
-        # reaches for widgets that are gone.
-        for pending in ("_lookup_after", "_poll_after"):
-            token = getattr(self, pending, None)
-            if token is not None:
-                self.after_cancel(token)
-                setattr(self, pending, None)
+        if self.repo is None:
+            return
+        if len(self.looked_up) > 1 and not self._ticked():
+            self.caution.configure(
+                foreground="grey",
+                text="Tick the .toc your client uses." if self._client_choice(self.looked_up)
+                     else "Tick the addons you want.",
+            )
+            return
 
+        lines = []
+        for name, source in self._plan():
+            entry = dict(self.known.get(name) or core.new_entry(name))
+            bound = entry.get("source", "unmanaged")
+            if bound != "unmanaged" and bound != source:
+                lines.append(f"{name} is already bound to {core.tilde(bound)}; installing "
+                             f"re-binds it to this repository.")
+            entry["source"] = source
+            doomed = core.displaced_folder(entry, name, self.addons_root)
+            if doomed is None or (entry.get("installed") and doomed.name in (entry.get("folders") or [])):
+                continue
+            if core.should_backup_folder(entry, doomed.name):
+                lines.append(f"⚠  {doomed.name} is real files in your AddOns folder right now, "
+                             f"and this tool did not put them there. They will be moved aside "
+                             f"to {core.backup_name(doomed).name} — once.")
+            else:
+                lines.append(f"⚠  {doomed.name} is real files this tool did not install, and "
+                             f"the backup is switched off — they will be DELETED, not kept.")
+        self.caution.configure(
+            foreground="#a05000" if any(line.startswith("⚠") for line in lines) else "#666666",
+            text="\n".join(lines),
+        )
+
+    # -- the buttons ---------------------------------------------------------
+
+    def _install(self) -> None:
+        if self._spec() is None:
+            account = core.github_account(self.repo.get())
+            if account:
+                # An organisation page names no repository, and is an easy thing
+                # to paste when the addons you want are published by one.
+                messagebox.showerror(
+                    "That is an account, not an addon",
+                    f"{account} is a GitHub account, which may hold many addons.\n\n"
+                    "Open the addon you want on github.com and paste that address —\n"
+                    f"or write it as {account}/repo-name.",
+                    parent=self,
+                )
+                return
+            messagebox.showerror(
+                "Nothing to install",
+                "Paste a github.com link, or write it as owner/repo.\n\n"
+                "Both of these work:\n"
+                "    tullamods/Bagnon\n"
+                "    https://github.com/tullamods/Bagnon",
+                parent=self,
+            )
+            return
+
+        plan = self._plan()
+        if not plan:
+            # The only way to get here: a repository of several addons with
+            # nothing ticked. Installing all of them is a choice Set source
+            # offers deliberately; it is not what an Install button should do
+            # by default, and here it can simply be asked for instead.
+            if self._client_choice(self.looked_up):
+                messagebox.showerror(
+                    "Which client?",
+                    f"{self._spec()} is one addon with {len(self.looked_up)} .toc files — "
+                    "one per client version.\n\nThe folder in AddOns has to be named after "
+                    "the one you want, so there is no sensible thing to install until you "
+                    "say which.\n\nTick the .toc your client uses.",
+                    parent=self,
+                )
+                return
+            messagebox.showerror(
+                "Which addon?",
+                f"{self._spec()} holds {len(self.looked_up)} addons.\n\n"
+                "Tick the ones you want to install.",
+                parent=self,
+            )
+            return
+
+        rebinding = [name for name, source in plan
+                     if self.known.get(name, {}).get("source", "unmanaged")
+                     not in ("unmanaged", source)]
+        if rebinding and not messagebox.askokcancel(
+            "Already bound",
+            f"{', '.join(rebinding)} already has a source set.\n\n"
+            "OK re-binds it to this repository and installs from there.\n"
+            "Cancel leaves it as it is.",
+            parent=self, default=messagebox.CANCEL, icon=messagebox.WARNING,
+        ):
+            return
+
+        self.result = plan
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.destroy()
+
+
+# ── the overwrite confirmation ───────────────────────────────────────────────
+
+
+class OverwriteDialog(tk.Toplevel):
+    """Asked before an install replaces an addon that is already there.
+
+    Two questions, kept apart because the answers are not equally reversible.
+    Replacing the folder is undone by installing again -- the source still has
+    it. Deleting saved variables is undone by nothing: those are settings you
+    made, over months, and no repository anywhere has a copy of them.
+
+    That is why the second half sits below a rule under its own red heading,
+    starts switched off, and says exactly which files it means. A destructive
+    option that reads like the rest of the form is one people tick by accident.
+    """
+
+    VARIABLES = ("keep_folder", "delete_saved", "backup_saved")
+    SHOWN = 6          # files listed before the list is summarised
+
+    def __init__(self, parent, addon: str, root: Path, entry: dict):
+        super().__init__(parent)
+        self.title(f'Already there: "{addon}"')
+        self.addon = addon
+        self.destination = core.install_destination(entry, addon, root) or (root / addon)
+        # A folder this tool wrote, or a link into a checkout, is not at risk:
+        # replacing it loses nothing that cannot be fetched again.
+        self.at_risk = (not core.is_link(self.destination)
+                        and core.should_backup_folder(entry, self.destination.name))
+        self.wtf = core.wtf_dir(root)
+        self.saved = core.saved_variables(root, self.destination.name)
+        self.result: dict | None = None
+        self.transient(parent)
+        self.resizable(False, False)
+
+        self.keep_folder = tk.BooleanVar(value=True)
+        self.delete_saved = tk.BooleanVar(value=False)
+        # Ticked, but greyed out until deleting is asked for: if somebody does
+        # turn the destructive option on, the safe answer to the next question
+        # should already be the one selected.
+        self.backup_saved = tk.BooleanVar(value=True)
+
+        self._build()
+        self._sync()
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Escape>", lambda _e: self._cancel())
+        self._centre(parent)
+        self.wait_visibility()
+        self.grab_set()
+        self.focus_set()
+
+    def _centre(self, parent) -> None:
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    def _build(self) -> None:
+        pad = {"padx": 10, "pady": 3}
+        body = ttk.Frame(self, padding=12)
+        body.grid(sticky="nsew")
+        body.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            body, wraplength=520, justify="left",
+            text=f"{self.destination.name} is already in your AddOns folder. "
+                 f"Installing replaces it.",
+        ).grid(row=0, column=0, sticky="w", **pad)
+
+        if self.at_risk:
+            self.keep_box = ttk.Checkbutton(
+                body, variable=self.keep_folder,
+                text=f"Make a backup — move it to {core.backup_name(self.destination).name} first",
+            )
+            self.keep_box.grid(row=1, column=0, sticky="w", **pad)
+        else:
+            # Nothing of yours is in there. Offering to keep a copy of it would
+            # be offering to keep a copy of a download.
+            self.keep_folder.set(False)
+            ttk.Label(body, foreground="grey", wraplength=520, justify="left",
+                      text="That folder was put there by this tool, so replacing it "
+                           "loses nothing.").grid(row=1, column=0, sticky="w", **pad)
+
+        ttk.Separator(body, orient="horizontal").grid(
+            row=2, column=0, sticky="ew", padx=10, pady=(10, 2))
+        ttk.Label(body, text="Delete!", foreground="#b00020",
+                  font=("TkDefaultFont", 10, "bold")).grid(row=3, column=0, sticky="w", **pad)
+
+        found = len(self.saved)
+        self.delete_box = ttk.Checkbutton(
+            body, variable=self.delete_saved, command=self._sync,
+            text=f"Delete associated saved variables file{'' if found == 1 else 's'}"
+                 + (f" ({found})" if found else ""),
+        )
+        self.delete_box.grid(row=4, column=0, sticky="w", **pad)
+
+        listing = ttk.Frame(body)
+        listing.grid(row=5, column=0, sticky="w", padx=(34, 10))
+        for row, line in enumerate(self._lines()):
+            ttk.Label(listing, text=line, foreground="grey").grid(row=row, column=0, sticky="w")
+
+        self.backup_box = ttk.Checkbutton(
+            body, variable=self.backup_saved,
+            text="Backup associated saved variable files — keep a .replaced copy of each",
+        )
+        self.backup_box.grid(row=6, column=0, sticky="w", padx=(34, 10), pady=3)
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=7, column=0, sticky="e", pady=(12, 0))
+        ttk.Button(buttons, text="Cancel", command=self._cancel).grid(row=0, column=0, padx=4)
+        ttk.Button(buttons, text="Install", command=self._go).grid(row=0, column=1, padx=4)
+
+    def _lines(self) -> list[str]:
+        """The files, named. A delete nobody can see the extent of is a trap.
+
+        Shown relative to WTF, which is where account settings and one folder
+        per character are told apart -- and telling them apart is most of what
+        somebody needs to know before agreeing to this.
+        """
+        if not self.saved:
+            return ["no saved variables found for this addon"
+                    + ("" if self.wtf else " — no WTF folder yet")]
+        shown = [str(path.relative_to(self.wtf) if self.wtf else path)
+                 for path in self.saved[:self.SHOWN]]
+        if len(self.saved) > self.SHOWN:
+            shown.append(f"…and {len(self.saved) - self.SHOWN} more")
+        return shown
+
+    def _sync(self, *_a) -> None:
+        if self.delete_saved is None:
+            return
+        deleting = bool(self.delete_saved.get()) and bool(self.saved)
+        self.delete_box.configure(state="normal" if self.saved else "disabled")
+        self.backup_box.configure(state="normal" if deleting else "disabled")
+
+    def _go(self) -> None:
+        self.result = {
+            "keep_folder": bool(self.keep_folder.get()),
+            "delete_saved": bool(self.delete_saved.get()) and bool(self.saved),
+            "backup_saved": bool(self.backup_saved.get()),
+        }
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.destroy()
+
+    def destroy(self) -> None:
+        # Same rule as the other dialogs: a tk variable finalised on a worker
+        # thread aborts the process rather than raising. See SourceDialog.
         held = [getattr(self, name, None) for name in self.VARIABLES]
-        # The tick boxes are variables too, made after __init__ so the
-        # VARIABLES list does not cover them. Clearing the dict is what
-        # actually releases them; extending `held` first only makes them
-        # finalise at the same moment as the rest, after super().destroy(),
-        # rather than a few lines earlier. Same thread either way, which is
-        # the part that matters.
-        held.extend(self.folder_boxes.values())
-        self.folder_boxes.clear()
         for name in self.VARIABLES:
             setattr(self, name, None)
         super().destroy()
-        held.clear()  # __del__ runs now, on this thread, with Tcl still up
+        held.clear()
 
 
 # ── the window ───────────────────────────────────────────────────────────────
@@ -636,8 +1121,16 @@ class App(ttk.Frame):
         self.state = core.load()
         self.outbox: queue.Queue = queue.Queue()
         self.worker: _Worker | None = None
-        self.failures = self.updated = self.outdated = 0
+        self.failures = self.updated = self.outdated = self.wiped = 0
+        self.wiped_kept = True
         self.checking = False
+        self._reported_unloadable: set[str] = set()
+        # Rows created by Install addon…, whose names are still a guess until
+        # the archive is open.
+        self._fresh: set[str] = set()
+        # {addon: keep a copy first} for saved variables somebody asked to have
+        # deleted, held until the install they belong to has succeeded.
+        self._pending_saved: dict[str, bool] = {}
 
         # The version belongs where a user can read it off without hunting: a
         # GUI has no --version, and "which build are you running?" is the first
@@ -747,18 +1240,23 @@ class App(ttk.Frame):
         buttons.grid(row=2, column=0, sticky="ew", pady=(8, 4))
         self.rescan_button = ttk.Button(buttons, text="Rescan", command=self.rescan)
         self.rescan_button.grid(row=0, column=0, padx=(0, 4))
+        # First after Rescan, because it is the other way an addon gets into
+        # the list -- and the only one that does not require having installed
+        # it by hand already.
+        self.install_button = ttk.Button(buttons, text="Install addon…", command=self.install_addon)
+        self.install_button.grid(row=0, column=1, padx=4)
         self.source_button = ttk.Button(buttons, text="Set source…", command=self.set_source)
-        self.source_button.grid(row=0, column=1, padx=4)
+        self.source_button.grid(row=0, column=2, padx=4)
         self.accept_button = ttk.Button(buttons, text="Accept suggestion", command=self.accept_suggestion)
-        self.accept_button.grid(row=0, column=2, padx=4)
+        self.accept_button.grid(row=0, column=3, padx=4)
         self.check_button = ttk.Button(buttons, text="Check for updates", command=self.check_all)
-        self.check_button.grid(row=0, column=3, padx=4)
+        self.check_button.grid(row=0, column=4, padx=4)
         self.update_button = ttk.Button(buttons, text="Update selected", command=self.update_selected)
-        self.update_button.grid(row=0, column=4, padx=4)
+        self.update_button.grid(row=0, column=5, padx=4)
         self.update_all_button = ttk.Button(buttons, text="Update all", command=self.update_all)
-        self.update_all_button.grid(row=0, column=5, padx=4)
+        self.update_all_button.grid(row=0, column=6, padx=4)
         self.cancel_button = ttk.Button(buttons, text="Stop", command=self.cancel, state="disabled")
-        self.cancel_button.grid(row=0, column=6, padx=4)
+        self.cancel_button.grid(row=0, column=7, padx=4)
 
         # Its own row: the caption is a sentence, because the trade it makes is
         # not guessable from a three-word label. A checkbox that quietly stops
@@ -771,7 +1269,7 @@ class App(ttk.Frame):
             variable=self.no_api,
             command=self._toggle_no_api,
         )
-        self.no_api_box.grid(row=1, column=0, columnspan=7, sticky="w", pady=(6, 0))
+        self.no_api_box.grid(row=1, column=0, columnspan=8, sticky="w", pady=(6, 0))
 
         status = ttk.Frame(self)
         status.grid(row=3, column=0, sticky="ew")
@@ -911,6 +1409,7 @@ class App(ttk.Frame):
         suggests = any(entries.get(n, {}).get("suggested") for n in self.tree.selection())
         for button, state in (
             (self.rescan_button, "disabled" if running else "normal"),
+            (self.install_button, "disabled" if running else "normal"),
             (self.check_button, "disabled" if running else "normal"),
             (self.source_button, one),
             (self.accept_button, "normal" if suggests and not running else "disabled"),
@@ -984,7 +1483,44 @@ class App(ttk.Frame):
         core.save(self.state)
         self.refresh()
         gone = f" {forgotten} deleted addon(s) dropped." if forgotten else ""
-        self.say(f"{installed} addon folder(s); {guessed} with a source found or suggested.{gone}")
+        problems = self._unloadable(core.addons_dir(install))
+        skipped = f" {len(problems)} folder(s) the game cannot load." if problems else ""
+        self.say(
+            f"{installed} addon folder(s); {guessed} with a source found or suggested."
+            f"{gone}{skipped}"
+        )
+        self._report_unloadable(problems)
+
+    def _unloadable(self, root: Path) -> dict:
+        """Folders that hold an addon and still will not load. Never fatal."""
+        try:
+            return core.scan_problems(root)
+        except OSError:
+            return {}
+
+    def _report_unloadable(self, problems: dict) -> None:
+        """Say out loud why a folder that is plainly there is not in the list.
+
+        Being told "28 addon folder(s)" when you can see 29 in your file manager
+        reads as the scan being broken. It is usually a folder the game will not
+        load either -- a .toc named after the wrong thing, an addon left one
+        level deep inside its zip's folder -- and naming the fix is the whole
+        point of noticing.
+
+        Once per distinct set of folders: this repeats on every rescan otherwise,
+        and a folder of parked addons is a thing people keep on purpose.
+        """
+        if not problems or set(problems) == self._reported_unloadable:
+            self._reported_unloadable = set(problems)
+            return
+        self._reported_unloadable = set(problems)
+        lines = "\n\n".join(f"{name}\n    {why}" for name, why in problems.items())
+        messagebox.showinfo(
+            "Folders the game will not load",
+            "These are in your AddOns folder, but World of Warcraft does not load "
+            "them, so they are not in the list:\n\n" + lines,
+            parent=self,
+        )
 
     def set_source(self) -> None:
         names = self.selection()
@@ -1008,6 +1544,67 @@ class App(ttk.Frame):
         core.save(self.state)
         self.refresh()
         self.say(f"{name} -> {core.tilde(self.entries()[name]['source'])}")
+
+    def install_addon(self) -> None:
+        """Install something that is not in AddOns yet, from a pasted repository.
+
+        Binding and installing are one action here on purpose. Every other row
+        in this table describes a folder that already exists; a row created by
+        this button describes one that does not, and stopping at the binding
+        would leave the list asserting an addon is installed when nothing has
+        been downloaded.
+        """
+        root = self.root_dir()
+        if root is None:
+            self.say("Set your WoW folder first.")
+            return
+        if self.guard(lambda: core.addons_dir(self.install())) is None:
+            return
+        dialog = InstallDialog(self.master, root, self.entries(),
+                               no_api=core.checks_without_api(self.install()))
+        self.master.wait_window(dialog)
+        if not dialog.result:
+            return
+
+        wanted = []
+        for name, source in dialog.result:
+            decision = self._confirm_overwrite(name, source, root)
+            if decision is None:
+                continue  # this one was declined; anything else ticked still goes
+            if self.guard(lambda n=name, s=source, d=decision:
+                          core.set_source(self.install(), n, s, backup=d["keep_folder"])) is None:
+                return
+            if decision["delete_saved"]:
+                # Acted on after the install, not now: a download that fails
+                # must not take somebody's settings with it.
+                self._pending_saved[name] = decision["backup_saved"]
+            wanted.append(name)
+        if not wanted:
+            self.say("Nothing installed.")
+            return
+        core.save(self.state)
+        self.refresh()
+        # The rows exist but hold nothing yet, so their names are provisional:
+        # what the archive turns out to contain decides what they are called.
+        self._fresh.update(wanted)
+        self.start(wanted)
+
+    def _confirm_overwrite(self, name: str, source: str, root: Path) -> dict | None:
+        """Ask before replacing a folder that is already in AddOns. None = don't.
+
+        Only when there is something to replace. An install that lands in empty
+        space has nothing to confirm, and a dialog that appears every time
+        teaches people to click through the one that matters.
+        """
+        entry = dict(self.entries().get(name) or core.new_entry(name))
+        entry["source"] = source
+        destination = core.install_destination(entry, name, root)
+        if destination is None or not destination.exists():
+            return {"keep_folder": entry.get("backup", True),
+                    "delete_saved": False, "backup_saved": True}
+        dialog = OverwriteDialog(self.master, name, root, entry)
+        self.master.wait_window(dialog)
+        return dialog.result
 
     def accept_suggestion(self) -> None:
         """Take the .toc's suggestion for the selected rows, on an explicit click.
@@ -1064,6 +1661,8 @@ class App(ttk.Frame):
         self.updated = 0
         self.checking = check
         self.outdated = 0
+        self.wiped = 0
+        self.wiped_kept = True
         self.progress.configure(maximum=len(names), value=0)
         self.counter.configure(text=f"0/{len(names)}")
         self.say("Checking…" if check else "Working…")
@@ -1113,8 +1712,71 @@ class App(ttk.Frame):
         finally:
             self._reschedule()
 
+    def _settled_name(self, result: core.Result) -> str:
+        """The name a just-installed row should be listed under.
+
+        An install has to name its row before it can know what the archive
+        holds: the repository's name is the best guess available, and a
+        repository called NotPlater-3.3.5 whose addon folder is NotPlater makes
+        that guess wrong. Once the folder is on disk there is no need to keep
+        guessing -- and leaving it wrong would show the addon twice, as a bound
+        row that reads "not installed" beside the unmanaged row the next rescan
+        adds for the folder that is actually there.
+        """
+        if result.name not in self._fresh or result.failed:
+            return result.name
+        self._fresh.discard(result.name)
+        settled = core.settle_names(self.install(), [result.name])
+        if not settled:
+            return result.name
+        core.save(self.state)
+        self._redraw_keeping_status()
+        return settled[0][1]
+
+    def _delete_saved_variables(self, requested: str, result: core.Result) -> None:
+        """Carry out the delete the confirm dialog agreed to, once and afterwards.
+
+        Afterwards, because settings are the one thing here that no source can
+        fetch again: if the download failed, the old addon is still installed
+        and wiping what it remembers would be a loss with nothing gained. The
+        request is dropped either way -- it belonged to that install, not to
+        whatever this row does next.
+        """
+        keep = self._pending_saved.pop(requested, None)
+        root = self.root_dir()
+        if keep is None or root is None or result.failed or self.checking:
+            return
+        deleted, problems = core.remove_saved_variables(
+            core.saved_variables(root, result.name), backup=keep
+        )
+        # Counted for the run summary rather than written on the row: the row
+        # says "recently updated", and a delete somebody asked for still
+        # deserves one acknowledgement that it happened.
+        self.wiped += len(deleted)
+        self.wiped_kept = self.wiped_kept and keep
+        for problem in problems:
+            result.notes.append(("warn", f"saved variables: {problem}"))
+
+    def _redraw_keeping_status(self) -> None:
+        """Rebuild the table without wiping what this run has said on each row.
+
+        refresh() draws from the manifest, which knows nothing about "waiting"
+        or "downloading…" -- so a mid-run redraw would blank the progress of
+        every other addon in the same run.
+        """
+        held = {name: (self.tree.set(name, "status"), self.tree.item(name, "tags"))
+                for name in self.tree.get_children()}
+        self.refresh()
+        for name, (status, tags) in held.items():
+            if status and self.tree.exists(name):
+                self.tree.set(name, "status", status)
+                self.tree.item(name, tags=list(tags))
+
     def _show_result(self, result: core.Result) -> None:
         self.progress.configure(value=self.progress["value"] + 1)
+        requested = result.name
+        result = replace(result, name=self._settled_name(result))
+        self._delete_saved_variables(requested, result)
         entry = self.entries().get(result.name, {})
 
         # Remember what the source said, so Latest survives closing the window.
@@ -1138,9 +1800,8 @@ class App(ttk.Frame):
                 self.tree.set(result.name, "status", f"update available: {result.version}")
                 self.tree.item(result.name, tags=["suggested"])
             else:
-                note = "; ".join(m for _l, m in result.notes)
-                self.tree.set(result.name, "status", note or "updated")
-                self.tree.item(result.name, tags=[])
+                self.tree.set(result.name, "status", self._settled_status(result, entry))
+                self.tree.item(result.name, tags=self._settled_tags(result, entry))
 
         if result.failed:
             self.failures += 1
@@ -1149,6 +1810,36 @@ class App(ttk.Frame):
                 self.outdated += 1
             else:
                 self.updated += 1
+
+    def _settled_status(self, result: core.Result, entry: dict) -> str:
+        """What the Status column says about an addon that just installed.
+
+        "recently updated", not a sentence about what happened on the way
+        there. The engine narrates each step it takes -- a folder moved aside,
+        settings deleted -- and every one of those was asked for a moment
+        earlier in the confirm dialog. Replaying it in a 170-pixel column
+        crowded out the one thing this column is scanned for, which is which
+        rows just changed.
+
+        Two things still outrank it, because neither is something the person
+        already knows:
+
+          a warning -- something that did NOT go to plan, inside a run that
+          otherwise succeeded, like a settings file that would not delete
+
+          a row that installs a whole repository, which is the same flag
+          refresh() puts there and is rarely what was meant
+        """
+        warnings = "; ".join(message for level, message in result.notes if level == "warn")
+        if warnings:
+            return warnings
+        if core.covers_several_addons(entry):
+            return f"installs {len(entry['folders'])} addons"
+        return "recently updated"
+
+    def _settled_tags(self, result: core.Result, entry: dict) -> list[str]:
+        wrong = any(level == "warn" for level, _m in result.notes)
+        return ["suggested"] if wrong or core.covers_several_addons(entry) else []
 
     def _finished(self) -> None:
         # Saved either way: a check writes no addon files, but the versions it
@@ -1172,7 +1863,13 @@ class App(ttk.Frame):
             self.say(f"Checked — {found}{tail}. Nothing was downloaded.{budget}")
         else:
             done = f"Done — {self.updated} updated{tail}."
-            self.say(done + (" Restart the client, or /reload." if self.updated else "") + budget)
+            wiped = ""
+            if self.wiped:
+                wiped = (f" {self.wiped} saved variables file(s) deleted"
+                         + (" — copies kept beside them." if self.wiped_kept
+                            else " — no copies kept."))
+            self.say(done + wiped
+                     + (" Restart the client, or /reload." if self.updated else "") + budget)
         self._sync_buttons()
 
 

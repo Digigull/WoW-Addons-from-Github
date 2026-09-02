@@ -161,7 +161,7 @@ jobs:
       # `gh` is already on the runner, so the release needs no third-party
       # action -- which suits a project whose selling point is a small trust
       # surface.
-      # The title, the notes and the pre-release flag are applied whether or not
+      # The title, the notes and the release status are applied whether or not
       # a release already exists for this tag -- and it usually WILL already
       # exist, because "Draft a new release" in the web UI is how most people
       # create the tag in the first place, and that publishes a release the
@@ -171,14 +171,15 @@ jobs:
       # as harmless idempotency and is not: when the release was pre-created,
       # `view` succeeded, `create` was skipped, and the flag and the notes went
       # with it. v0.3.0 published that way -- assets correct, but untitled, with
-      # no notes, and not marked a pre-release. The assets were the easy part.
+      # no notes, and the wrong status. The assets were the easy part.
       #
-      # --prerelease, deliberately. Both downloads are verified by CI on every
-      # build, but neither has been run on real hardware against an actual WoW
-      # install. GitHub's "Pre-release" label says exactly that, and it is one
-      # click to promote once somebody has. Drop the flag here when that is
-      # true -- and note that re-running this workflow re-asserts it, so a
-      # release promoted by hand would be demoted again.
+      # Released for real, not --prerelease. Both downloads were flagged as
+      # pre-releases while nobody had run either of them on a desktop against
+      # an actual WoW install; somebody has now, on Wrath under Wine, which is
+      # what that label was waiting for. `--prerelease=false` rather than an
+      # omitted flag, and asserted below: "Draft a new release" offers a
+      # pre-release tick box, so a release pre-created that way has to be
+      # demoted rather than left however it was made.
       - name: Publish the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -200,9 +201,9 @@ jobs:
           # links to its OWN assets rather than to whatever is newest.
           #
           # `/releases/latest/download/...` would need no substitution and is
-          # wrong here: every release this workflow publishes is flagged as a
-          # pre-release, and `latest` skips pre-releases, so those links would
-          # 404 for as long as that is true.
+          # still wrong: it means "whatever is newest", so the moment a later
+          # release exists, this one's notes hand people the wrong build --
+          # every page describing changes it does not link to.
           sed "s|__TAG__|${RELEASE_TAG}|g" .github/release-notes.md > notes.md
           if grep -q "__TAG__" notes.md; then
             echo "::error::the download links in release-notes.md were not substituted"
@@ -210,10 +211,10 @@ jobs:
           fi
 
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            echo "release already exists; applying title, notes and pre-release flag"
+            echo "release already exists; applying title, notes and release status"
             gh release edit "${RELEASE_TAG}" \
               --title "${RELEASE_TAG}" \
-              --prerelease \
+              --prerelease=false \
               --notes-file notes.md
           else
             # --target names the commit to tag. Without it gh tags the
@@ -222,7 +223,7 @@ jobs:
             gh release create "${RELEASE_TAG}" \
               --target "${RELEASE_COMMIT}" \
               --title "${RELEASE_TAG}" \
-              --prerelease \
+              --prerelease=false \
               --notes-file notes.md
           fi
           gh release upload "${RELEASE_TAG}" dist/* --clobber
@@ -234,7 +235,7 @@ jobs:
             --jq '"title=\(.name) prerelease=\(.isPrerelease) notes=\(.body|length) chars"'
           published=$(gh release view "${RELEASE_TAG}" --json isPrerelease --jq .isPrerelease)
           notes=$(gh release view "${RELEASE_TAG}" --json body --jq '.body|length')
-          if [ "$published" != "true" ] || [ "$notes" -lt 100 ]; then
+          if [ "$published" != "false" ] || [ "$notes" -lt 100 ]; then
             echo "::error::the release published without its metadata"
             exit 1
           fi

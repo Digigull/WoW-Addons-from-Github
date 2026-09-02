@@ -464,10 +464,10 @@ class Releasing(unittest.TestCase):
     def test_the_download_links_are_per_release(self):
         """Each release must link to its own assets, not to whatever is newest.
 
-        `/releases/latest/download/...` would need no substitution and is wrong
-        here: every release this workflow publishes is marked a pre-release, and
-        `latest` skips pre-releases, so those links would 404 for as long as
-        that stays true.
+        `/releases/latest/download/...` would need no substitution and is
+        still wrong: it means "whatever is newest", so the moment a later
+        release exists, an older release's page hands people the wrong build --
+        every set of notes describing changes it does not link to.
         """
         notes = self.NOTES.read_text()
         self.assertIn("/releases/download/__TAG__/", notes)
@@ -501,21 +501,26 @@ class Releasing(unittest.TestCase):
         self.assertIn("libfuse", notes)
 
     def test_the_metadata_is_applied_even_when_the_release_exists(self):
-        """`view || create` silently drops the notes and the pre-release flag.
+        """`view || create` silently drops the notes and the release status.
 
         It reads as harmless idempotency. It is not: creating the tag through
         "Draft a new release" in the web UI -- which is how most people make a
         tag -- publishes the release before the workflow runs, so `view`
-        succeeds, `create` is skipped, and the title, notes and --prerelease go
+        succeeded, `create` was skipped, and the title, notes and status went
         with it. v0.3.0 published exactly that way: right assets, no title, no
-        notes, not a pre-release, and the step exited 0.
+        notes, the wrong status, and the step exited 0.
         """
         commands = self.workflow_commands()
         self.assertIn("gh release edit", commands, "nothing applies metadata to an existing release")
         self.assertNotIn("|| gh release create", commands, "the bug that shipped v0.3.0 is back")
         # Both branches must set all three, or one route silently differs.
         self.assertEqual(commands.count("--notes-file notes.md"), 2)
-        self.assertEqual(commands.count("--prerelease"), 2)
+        # Spelled out rather than omitted, in both: the same web UI that
+        # pre-creates the release offers a pre-release tick box, so a release
+        # made that way has to be demoted rather than left as it was found.
+        self.assertEqual(commands.count("--prerelease=false"), 2)
+        self.assertNotRegex(commands, r"--prerelease(?!=false)",
+                            "a release flagged pre-release again")
 
     def test_the_publish_verifies_what_it_published(self):
         # The failing step exited 0. Checking the exit codes was not enough,
@@ -594,6 +599,47 @@ class Releasing(unittest.TestCase):
         # Otherwise a mismatched tag still publishes; the check would just go
         # red beside it.
         self.assertIn("needs: [appimage, windows, version-matches-tag]", self.workflow_commands())
+
+
+class TheWindowTestsReallyRunInCI(unittest.TestCase):
+    """The gui job exists to fail when the window tests skip themselves.
+
+    They skip on a machine with no Tk and no display, which is right for a
+    developer on a server and useless as CI: a job where every test silently
+    skips reports success for having done nothing.
+    """
+
+    JOB = (ROOT / ".github" / "workflows" / "tests.yml").read_text()
+
+    def test_the_job_installs_tk_and_a_display(self):
+        self.assertIn("python3-tk", self.JOB)
+        self.assertIn("xvfb", self.JOB)
+
+    def test_the_guard_matches_how_unittest_reports_a_skip(self):
+        """And not merely the word, which a test NAME is allowed to contain.
+
+        `grep -q "skipped"` failed a green run because one test is called
+        test_the_same_skipped_folder_is_not_reported_twice -- about a scan
+        skipping a folder, which is a thing this tool does and therefore a
+        thing its tests are named after. The guard has to read unittest's
+        report, not the transcript.
+        """
+        import re
+
+        pattern = None
+        for line in self.JOB.splitlines():
+            if "grep -q" in line and "skipped" in line:
+                pattern = line.split("'")[1] if "'" in line else line
+        self.assertIsNotNone(pattern, "nothing guards against a silently skipped run")
+
+        guard = re.compile(pattern)
+        # What unittest -v really prints, both ways it says it.
+        self.assertTrue(guard.search("test_x (m.C.test_x) ... skipped 'no usable Tk'"))
+        self.assertTrue(guard.search("OK (skipped=91)"))
+        # ...and what it prints for a test that merely has the word in its name.
+        self.assertFalse(guard.search(
+            "test_the_same_skipped_folder_is_not_reported_twice (m.C.test_x) ... ok"))
+        self.assertFalse(guard.search("Ran 91 tests in 13.9s"))
 
 
 class Scripts(unittest.TestCase):

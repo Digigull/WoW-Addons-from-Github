@@ -44,7 +44,10 @@ jobs:
         run: |
           set -o pipefail
           xvfb-run -a python3 -m unittest tests.test_gui -v 2>&1 | tee gui.log
-          if grep -q "skipped" gui.log; then
+          # unittest's own two ways of saying it, and only those: a bare
+          # `grep skipped` also matched the NAME of a test about a scan
+          # skipping a folder, and failed a green run for saying the word.
+          if grep -qE '\.\.\. skipped|\(skipped=' gui.log; then
             echo "::error::the window tests skipped -- they were supposed to run here"
             exit 1
           fi

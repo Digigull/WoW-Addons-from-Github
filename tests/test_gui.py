@@ -38,12 +38,27 @@ if tk is not None:
 
 
 @unittest.skipIf(tk is None, globals().get("WHY", "no Tk"))
-class WindowTests(unittest.TestCase):
+class WindowHarness(unittest.TestCase):
+    """A real window over a scratch AddOns folder. No network, no real manifest.
+
+    Shared rather than copied per test class: the setup that matters is the
+    redirection of CONFIG_DIR, and a copy of it that drifts would write into
+    somebody's actual manifest while the tests looked green.
+    """
+
+    ADDONS: dict = {}
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         base = pathlib.Path(self.tmp.name)
         self.addons = base / "Interface" / "AddOns"
         self.addons.mkdir(parents=True)
+        # Dialogs to close before the root goes. addCleanup runs *after*
+        # tearDown, by which point there is no interpreter left to destroy a
+        # window with -- and a dialog torn down with the root cannot release
+        # its tk variables on this thread, which is the whole point of its
+        # destroy().
+        self.opened = []
 
         # Point the manifest at the scratch directory rather than the real one,
         # so running the tests cannot rewrite somebody's actual addon list.
@@ -53,11 +68,7 @@ class WindowTests(unittest.TestCase):
         core.CONFIG_DIR.mkdir()
         core.MANIFEST.write_text(json.dumps({
             "addons_dir": str(self.addons),
-            "addons": {
-                "Bound": {"source": "github:o/r", "mode": "link", "installed": "v1", "folders": ["Bound"]},
-                "Loose": {"source": "unmanaged", "mode": "link", "installed": None,
-                          "folders": ["Loose"], "suggested": "github:someone/Loose"},
-            },
+            "addons": dict(self.ADDONS),
         }))
 
         self.root = tk.Tk()
@@ -70,6 +81,8 @@ class WindowTests(unittest.TestCase):
 
     def tearDown(self):
         core.CONFIG_DIR, core.MANIFEST = self._config, self._manifest
+        for dialog in self.opened:
+            dialog.destroy()
         self.app.stop()
         # Collect while the interpreter is still up. A tk variable finalised
         # after root.destroy(), or on a worker thread, calls into a Tcl that is
@@ -87,6 +100,14 @@ class WindowTests(unittest.TestCase):
 
     def status_of(self, name: str) -> str:
         return self.app.tree.set(name, "status")
+
+
+class WindowTests(WindowHarness):
+    ADDONS = {
+        "Bound": {"source": "github:o/r", "mode": "link", "installed": "v1", "folders": ["Bound"]},
+        "Loose": {"source": "unmanaged", "mode": "link", "installed": None,
+                  "folders": ["Loose"], "suggested": "github:someone/Loose"},
+    }
 
     # -- the table -----------------------------------------------------------
 
@@ -171,7 +192,50 @@ class WindowTests(unittest.TestCase):
 
         self.run_update(fake)
         self.assertEqual(self.app.tree.set("Bound", "installed"), "v2")
-        self.assertIn("updated", self.status_of("Bound"))
+        self.assertEqual(self.status_of("Bound"), "recently updated")
+
+    def test_what_happened_on_the_way_is_not_left_on_the_row(self):
+        """The Status column is scanned for what changed, not for how.
+
+        The engine narrates each step it takes -- a folder moved aside,
+        settings deleted -- and every one of those was agreed to a moment
+        earlier in the confirm dialog. In a 170-pixel column it crowded out the
+        only thing this column is read for.
+        """
+        def fake(name, entry, root, **kw):
+            entry["installed"] = "v2"
+            result = core.Result(name, core.CHANGED, "v1 -> v2", version="v2", folders=[name])
+            result.notes.append(("note", "moving existing folder aside -> Bound.replaced"))
+            return result
+
+        self.run_update(fake)
+        self.assertEqual(self.status_of("Bound"), "recently updated")
+        self.assertEqual(self.app.tree.item("Bound", "tags"), "")
+
+    def test_a_warning_inside_a_successful_run_does_stay(self):
+        # Not narration: something that did not go to plan. Silence about it
+        # would be the row claiming a clean run it did not have.
+        def fake(name, entry, root, **kw):
+            entry["installed"] = "v2"
+            result = core.Result(name, core.CHANGED, "v1 -> v2", version="v2", folders=[name])
+            result.notes.append(("warn", "saved variables: Bound.lua: Permission denied"))
+            return result
+
+        self.run_update(fake)
+        self.assertIn("Permission denied", self.status_of("Bound"))
+        self.assertEqual(self.app.tree.item("Bound", "tags"), ("suggested",))
+
+    def test_a_row_that_installs_a_whole_repository_still_says_so(self):
+        # The one note worth the column: this row now rewrites every addon in
+        # the repository whenever any one of them changes.
+        def fake(name, entry, root, **kw):
+            entry["installed"] = "v2"
+            entry["folders"] = ["Bound", "Bound_Extra", "Bound_Third"]
+            return core.Result(name, core.CHANGED, "v1 -> v2", version="v2",
+                               folders=entry["folders"])
+
+        self.run_update(fake)
+        self.assertEqual(self.status_of("Bound"), "installs 3 addons")
 
     def test_a_failure_stays_on_its_row(self):
         # The rule: one unreachable repo marks that row failed and leaves the
@@ -275,6 +339,46 @@ class WindowTests(unittest.TestCase):
         dlg._folders_ticked()
         dlg._save()
         self.assertEqual(dlg.result, ("github:o/r#Main,Main_Companion", False))
+
+    def test_a_toc_per_client_repo_offers_the_tocs_and_says_why(self):
+        """RichSteini/NotPlater: one addon, two .toc files, no base between them.
+
+        The folder in AddOns has to be named after the one you want, so this is
+        a choice — and one the tool cannot make, because it is which client you
+        play. Saying "2 addons" would be a lie about what is on offer.
+        """
+        dlg = self.looked_up_dialog("Bound", "o/r",
+                                    ["NotPlater-2.4.3.toc", "NotPlater-3.3.5.toc"])
+        self.assertEqual(sorted(dlg.folder_boxes),
+                         ["NotPlater-2.4.3.toc", "NotPlater-3.3.5.toc"])
+        self.assertIn(".toc files", dlg.lookup_status.cget("text"))
+        dlg.destroy()
+
+    def test_saving_a_toc_choice_with_nothing_ticked_is_refused_outright(self):
+        # Not the "OK installs ALL of them" question: every .toc here names the
+        # same files, so all of them would install one addon twice over under
+        # names only one of which the client loads. There is nothing to say OK to.
+        dlg = self.looked_up_dialog("Bound", "o/r",
+                                    ["NotPlater-2.4.3.toc", "NotPlater-3.3.5.toc"])
+        shown = []
+        real_error, real_ask = gui.messagebox.showerror, gui.messagebox.askokcancel
+        gui.messagebox.showerror = lambda title, message, **k: shown.append(title)
+        gui.messagebox.askokcancel = lambda *a, **k: self.fail("this is not an OK/Cancel question")
+        try:
+            dlg._save()
+        finally:
+            gui.messagebox.showerror, gui.messagebox.askokcancel = real_error, real_ask
+        self.assertEqual(shown, ["Which client?"])
+        self.assertIsNone(dlg.result)
+        dlg.destroy()
+
+    def test_ticking_one_toc_binds_that_build(self):
+        dlg = self.looked_up_dialog("Bound", "o/r",
+                                    ["NotPlater-2.4.3.toc", "NotPlater-3.3.5.toc"])
+        dlg.folder_boxes["NotPlater-3.3.5.toc"].set(True)
+        dlg._folders_ticked()
+        dlg._save()
+        self.assertEqual(dlg.result, ("github:o/r#NotPlater-3.3.5.toc", False))
 
     def test_what_is_already_saved_comes_back_ticked(self):
         entry = {"source": "github:o/r#Beta", "installed": None, "folders": []}
@@ -837,5 +941,450 @@ class WindowTests(unittest.TestCase):
         dlg.destroy()
 
 
+class RescanSaysWhatItSkipped(WindowHarness):
+    """A folder you can see in AddOns and cannot see in the list needs a reason.
+
+    Reported against 0.9.0 as "it is not finding PlayerbotManager": the folder
+    was there, the scan dropped it, and the window said nothing about it at all.
+    """
+
+    def rescan_reporting(self) -> list:
+        shown = []
+        real = gui.messagebox.showinfo
+        gui.messagebox.showinfo = lambda title, message, **k: shown.append(message)
+        try:
+            self.app.rescan()
+            self.pump()
+        finally:
+            gui.messagebox.showinfo = real
+        return shown
+
+    def test_a_folder_the_game_cannot_load_is_named_with_its_fix(self):
+        broken = self.addons / "PlayerbotManager"
+        broken.mkdir()
+        (broken / "PlayerbotManager.toc.txt").write_text("## Title: Playerbot Manager\n")
+
+        shown = self.rescan_reporting()
+        self.assertTrue(shown, "the skipped folder was never mentioned")
+        self.assertIn("PlayerbotManager", shown[0])
+        self.assertIn("folder(s) the game cannot load", self.app.status.cget("text"))
+
+    def test_a_loadable_folder_is_listed_and_not_complained_about(self):
+        good = self.addons / "PlayerbotManager"
+        good.mkdir()
+        # The spelling a case-sensitive filesystem keeps and Wine ignores.
+        (good / "Playerbotmanager.toc").write_text("## Title: Playerbot Manager\n")
+
+        self.assertEqual(self.rescan_reporting(), [])
+        self.assertIn("PlayerbotManager", self.app.tree.get_children())
+
+    def test_the_same_skipped_folder_is_not_reported_twice(self):
+        parked = self.addons / "Not Working"
+        (parked / "OldOne").mkdir(parents=True)
+        (parked / "OldOne" / "OldOne.toc").write_text("## Title: x\n")
+
+        self.assertTrue(self.rescan_reporting())
+        self.assertEqual(self.rescan_reporting(), [], "a kept folder must not nag")
+
+
+
+
+class InstallHarness(WindowHarness):
+    """Pressing Install with both dialogs and the network stood in for.
+
+    A harness rather than a base class with tests in it: a test class that
+    inherits tests re-runs every one of them, which is a slower suite saying
+    the same thing twice.
+    """
+
+    def offer(self, folders):
+        def listing(spec, *, no_api=False):
+            return list(folders)
+        real = core.addons_in_repo
+        core.addons_in_repo = listing
+        self.addCleanup(lambda: setattr(core, "addons_in_repo", real))
+
+    def looked_up_dialog(self, repo, folders):
+        self.offer(folders)
+        dlg = gui.InstallDialog(self.root, self.addons, self.app.entries())
+        self.opened.append(dlg)
+        dlg.repo.set(repo)
+        dlg._absorb_url()          # what typing into the box does
+        dlg._begin_lookup()
+        for _ in range(40):
+            self.pump(2)
+            dlg._drain_lookups()
+            if dlg.looked_up or "nothing to choose" in dlg.lookup_status.cget("text"):
+                break
+        said = dlg.lookup_status.cget("text")
+        if said.startswith("could not read"):
+            self.fail(f"the repository lookup failed unexpectedly: {said!r}")
+        return dlg
+
+
+    def install(self, plan, installs, overwrite="never asked", fails=()):
+        """Press Install, with both dialogs and the network stood in for.
+
+        `overwrite` is what the confirm dialog returns when a folder is already
+        there; the default fails the test if it is opened at all, so a dialog
+        appearing where it should not is never silent.
+        """
+        asked = []
+
+        class FakeInstall(tk.Toplevel):
+            def __init__(inner, parent, root, entries, *, no_api=False):
+                super().__init__(parent)
+                inner.result = list(plan)
+                inner.after(1, inner.destroy)
+
+        class FakeOverwrite(tk.Toplevel):
+            def __init__(inner, parent, addon, root, entry):
+                super().__init__(parent)
+                asked.append(addon)
+                if overwrite == "never asked":
+                    raise AssertionError(f"asked to confirm overwriting {addon}")
+                inner.result = overwrite
+                inner.after(1, inner.destroy)
+
+        def update_addon(name, entry, root, **kw):
+            if name in fails:
+                return core.Result(name=name, outcome=core.FAILED, detail="no such repo")
+            folders = installs.get(name, [name])
+            entry["installed"] = "v1"
+            entry["folders"] = folders
+            return core.Result(name=name, outcome=core.CHANGED, version="v1", folders=folders)
+
+        real = (gui.InstallDialog, gui.OverwriteDialog, core.update_addon)
+        gui.InstallDialog, gui.OverwriteDialog, core.update_addon = (
+            FakeInstall, FakeOverwrite, update_addon)
+        try:
+            self.app.install_addon()
+            for _ in range(200):
+                self.pump(1)
+                if self.app.worker is None:
+                    return asked
+            self.fail("the worker never finished")
+        finally:
+            gui.InstallDialog, gui.OverwriteDialog, core.update_addon = real
+
+class InstallingSomethingNew(InstallHarness):
+    """The Install button: an addon that is not in AddOns yet, from a link.
+
+    Everything else in the window works on folders that already exist, which
+    left "get me this addon" as the one job you still had to do by hand -- by
+    downloading and unzipping an archive correctly, which is the job this tool
+    exists to do for you.
+    """
+
+    # -- what the dialog decides ---------------------------------------------
+
+    def test_a_repo_holding_one_addon_installs_whole_under_the_folder_name(self):
+        # Naming the folder would switch the row off the repo's releases onto
+        # that folder's last commit, for an install of the same files.
+        dlg = self.looked_up_dialog("o/Bagnon-wotlk", ["Bagnon"])
+        self.assertEqual(dlg._plan(), [("Bagnon", "github:o/Bagnon-wotlk")])
+
+    def test_a_repo_that_is_itself_the_addon_is_named_after_the_repo(self):
+        dlg = self.looked_up_dialog("o/FrostSeek", [])
+        self.assertEqual(dlg._plan(), [("FrostSeek", "github:o/FrostSeek")])
+
+    def test_each_ticked_addon_becomes_its_own_row(self):
+        # One row per addon, never one row for the repository: a single row
+        # would install all of them whenever any one of them changed.
+        dlg = self.looked_up_dialog("o/r", ["Alpha", "Beta", "Gamma"])
+        dlg.folder_boxes["Alpha"].set(True)
+        dlg.folder_boxes["Gamma"].set(True)
+        dlg._folders_ticked()
+        self.assertEqual(dlg._plan(), [
+            ("Alpha", "github:o/r#Alpha"),
+            ("Gamma", "github:o/r#Gamma"),
+        ])
+
+    def test_a_toc_per_client_repo_plans_a_row_named_after_the_toc(self):
+        dlg = self.looked_up_dialog("o/NotPlater",
+                                    ["NotPlater-2.4.3.toc", "NotPlater-3.3.5.toc"])
+        dlg.folder_boxes["NotPlater-3.3.5.toc"].set(True)
+        dlg._folders_ticked()
+        # The row is named after the folder the client will load, and the
+        # source keeps the .toc even though only one is ticked: it is not the
+        # default install, it is one of two names for the same files.
+        self.assertEqual(dlg._plan(),
+                         [("NotPlater-3.3.5", "github:o/NotPlater#NotPlater-3.3.5.toc")])
+
+    def test_installing_a_toc_per_client_repo_needs_a_tick(self):
+        dlg = self.looked_up_dialog("o/NotPlater",
+                                    ["NotPlater-2.4.3.toc", "NotPlater-3.3.5.toc"])
+        self.assertIn("Tick the .toc your client uses", dlg.caution.cget("text"))
+        shown = []
+        real = gui.messagebox.showerror
+        gui.messagebox.showerror = lambda title, message, **k: shown.append(title)
+        try:
+            dlg._install()
+        finally:
+            gui.messagebox.showerror = real
+        self.assertEqual(shown, ["Which client?"])
+        self.assertIsNone(dlg.result)
+
+    def test_a_repo_of_several_with_nothing_ticked_is_refused(self):
+        dlg = self.looked_up_dialog("o/r", ["Alpha", "Beta"])
+        shown = []
+        real = gui.messagebox.showerror
+        gui.messagebox.showerror = lambda title, message, **k: shown.append(title)
+        try:
+            dlg._install()
+        finally:
+            gui.messagebox.showerror = real
+        self.assertEqual(shown, ["Which addon?"])
+        self.assertIsNone(dlg.result)
+        self.assertTrue(dlg.winfo_exists(), "the dialog must stay open to be answered")
+
+    def test_a_branch_in_the_pasted_link_is_kept(self):
+        dlg = self.looked_up_dialog("https://github.com/o/r/tree/wotlk", [])
+        self.assertTrue(dlg.track.get())
+        self.assertEqual(dlg._plan(), [("r", "github:o/r@wotlk")])
+
+    def test_a_link_into_one_addon_of_several_installs_that_one(self):
+        dlg = self.looked_up_dialog("https://github.com/o/r/tree/main/Beta",
+                                    ["Alpha", "Beta"])
+        self.assertEqual(dlg._plan(), [("Beta", "github:o/r@main#Beta")])
+
+    def test_replacing_a_hand_installed_folder_is_said_in_advance(self):
+        (self.addons / "Bagnon").mkdir()
+        (self.addons / "Bagnon" / "Bagnon.toc").write_text("## Title: mine\n")
+        dlg = self.looked_up_dialog("o/Bagnon", ["Bagnon"])
+        self.assertIn("moved aside", dlg.caution.cget("text"))
+
+    # -- and what the window does with it ------------------------------------
+
+    def test_installing_binds_the_row_and_fetches_it(self):
+        self.install([("Bagnon", "github:o/Bagnon")], {})
+        entry = self.app.entries()["Bagnon"]
+        self.assertEqual(entry["source"], "github:o/Bagnon")
+        self.assertEqual(entry["installed"], "v1")
+        self.assertIn("Bagnon", self.app.tree.get_children())
+
+    def test_the_row_takes_the_name_of_the_folder_that_landed(self):
+        """A row named before the archive was open is a guess, not a fact.
+
+        Left wrong, the addon shows up twice: a bound row reading "not
+        installed" beside the unmanaged row the next rescan adds for the folder
+        that is actually there.
+        """
+        self.install([("NotPlater-3.3.5", "github:o/NotPlater-3.3.5")],
+                     {"NotPlater-3.3.5": ["NotPlater"]})
+        self.assertIn("NotPlater", self.app.entries())
+        self.assertNotIn("NotPlater-3.3.5", self.app.entries())
+        self.assertEqual(self.app.entries()["NotPlater"]["installed"], "v1")
+        self.assertIn("NotPlater", self.app.tree.get_children())
+
+    def test_a_row_that_was_already_right_is_left_alone(self):
+        self.install([("Bagnon", "github:o/Bagnon")], {"Bagnon": ["Bagnon"]})
+        self.assertEqual(list(self.app.entries()), ["Bagnon"])
+
+    def test_the_button_is_off_while_a_run_is_going(self):
+        self.app.worker = _StillRunning()
+        try:
+            self.app._sync_buttons()
+            self.assertEqual(str(self.app.install_button["state"]), "disabled")
+        finally:
+            self.app.worker = None
+        self.app._sync_buttons()
+        self.assertEqual(str(self.app.install_button["state"]), "normal")
+
+
+class _StillRunning:
+    def is_alive(self):
+        return True
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class AskingBeforeReplacingWhatIsThere(WindowHarness):
+    """The confirm dialog: replace the folder, and optionally wipe the settings.
+
+    The two halves are deliberately unequal. Replacing a folder is undone by
+    installing again. Deleting saved variables is undone by nothing -- those are
+    settings somebody made over months, and no repository has a copy.
+    """
+
+    def wtf(self, addon, *relatives):
+        wtf = self.addons.parent.parent / "WTF"
+        for relative in relatives:
+            path = wtf / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"-- {addon}\n")
+        return wtf
+
+    def existing(self, name="Bagnon", ours=False):
+        folder = self.addons / name
+        folder.mkdir()
+        (folder / f"{name}.toc").write_text("## Title: mine\n")
+        entry = {"source": f"github:o/{name}", "mode": "link",
+                 "installed": "v1" if ours else None,
+                 "folders": [name], "backup": True}
+        return entry
+
+    def dialog(self, name="Bagnon", ours=False):
+        dlg = gui.OverwriteDialog(self.root, name, self.addons, self.existing(name, ours))
+        self.opened.append(dlg)
+        return dlg
+
+    def test_a_hand_installed_folder_is_offered_a_backup_by_default(self):
+        dlg = self.dialog()
+        self.assertTrue(dlg.at_risk)
+        self.assertTrue(dlg.keep_folder.get())
+        self.assertIn("Bagnon.replaced", dlg.keep_box.cget("text"))
+
+    def test_a_folder_this_tool_wrote_is_not_offered_a_pointless_copy(self):
+        # Nothing of yours is in there; keeping a copy of a download is not a
+        # safeguard, it is litter in the AddOns folder.
+        dlg = self.dialog(ours=True)
+        self.assertFalse(dlg.at_risk)
+        self.assertFalse(dlg.keep_folder.get())
+        self.assertFalse(hasattr(dlg, "keep_box"))
+
+    def test_deleting_settings_starts_off_and_its_backup_starts_unavailable(self):
+        self.wtf("Bagnon", "Account/ACC/SavedVariables/Bagnon.lua")
+        dlg = self.dialog()
+        self.assertFalse(dlg.delete_saved.get())
+        self.assertEqual(str(dlg.backup_box["state"]), "disabled")
+        self.assertTrue(dlg.backup_saved.get(), "the safe answer is the one already chosen")
+
+    def test_ticking_delete_makes_the_backup_choice_available(self):
+        self.wtf("Bagnon", "Account/ACC/SavedVariables/Bagnon.lua")
+        dlg = self.dialog()
+        dlg.delete_saved.set(True)
+        dlg._sync()
+        self.assertEqual(str(dlg.backup_box["state"]), "normal")
+
+    def test_account_and_character_files_are_both_found_and_named(self):
+        self.wtf("Bagnon",
+                 "Account/ACC/SavedVariables/Bagnon.lua",
+                 "Account/ACC/SavedVariables/Bagnon.lua.bak",
+                 "Account/ACC/Frostmourne/Bob/SavedVariables/Bagnon.lua",
+                 "Account/ACC/SavedVariables/Someone_Else.lua")
+        dlg = self.dialog()
+        self.assertEqual(len(dlg.saved), 3)
+        shown = "\n".join(dlg._lines())
+        self.assertIn("Account/ACC/SavedVariables/Bagnon.lua", shown.replace("\\", "/"))
+        self.assertIn("Bob/SavedVariables/Bagnon.lua", shown.replace("\\", "/"))
+        self.assertNotIn("Someone_Else", shown)
+
+    def test_nothing_to_delete_disables_the_delete_box_entirely(self):
+        dlg = self.dialog()
+        self.assertEqual(dlg.saved, [])
+        self.assertEqual(str(dlg.delete_box["state"]), "disabled")
+        self.assertIn("no saved variables found", " ".join(dlg._lines()))
+
+    def test_the_answer_is_the_three_booleans(self):
+        self.wtf("Bagnon", "Account/ACC/SavedVariables/Bagnon.lua")
+        dlg = self.dialog()
+        dlg.delete_saved.set(True)
+        dlg.backup_saved.set(False)
+        dlg._go()
+        self.assertEqual(dlg.result, {"keep_folder": True, "delete_saved": True,
+                                      "backup_saved": False})
+
+    def test_cancel_answers_nothing(self):
+        dlg = self.dialog()
+        dlg._cancel()
+        self.assertIsNone(dlg.result)
+
+
+class WipingSettingsAsPartOfAnInstall(InstallHarness):
+    """Ticking Delete! in the confirm dialog, and what the install then does."""
+
+    def saved(self, addon="Bagnon"):
+        wtf = self.addons.parent.parent / "WTF"
+        for relative in (f"Account/ACC/SavedVariables/{addon}.lua",
+                         f"Account/ACC/Frostmourne/Bob/SavedVariables/{addon}.lua"):
+            path = wtf / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("-- settings\n")
+        return sorted(p.name for p in wtf.rglob("*") if p.is_file())
+
+    def there_already(self, name="Bagnon"):
+        folder = self.addons / name
+        folder.mkdir()
+        (folder / f"{name}.toc").write_text("## Title: mine\n")
+
+    def files_left(self):
+        wtf = self.addons.parent.parent / "WTF"
+        return sorted(str(p.relative_to(wtf)).replace("\\", "/")
+                      for p in wtf.rglob("*") if p.is_file())
+
+    def test_no_folder_there_means_no_question(self):
+        # The default `overwrite` fails the test if the dialog is opened.
+        self.assertEqual(self.install([("Bagnon", "github:o/Bagnon")], {}), [])
+
+    def test_a_folder_already_there_is_confirmed_first(self):
+        self.there_already()
+        asked = self.install([("Bagnon", "github:o/Bagnon")], {},
+                             overwrite={"keep_folder": True, "delete_saved": False,
+                                        "backup_saved": True})
+        self.assertEqual(asked, ["Bagnon"])
+        self.assertEqual(self.app.entries()["Bagnon"]["installed"], "v1")
+
+    def test_cancelling_installs_nothing_and_binds_nothing(self):
+        self.there_already()
+        self.install([("Bagnon", "github:o/Bagnon")], {}, overwrite=None)
+        self.assertNotIn("Bagnon", self.app.entries())
+        self.assertIn("Nothing installed", self.app.status.cget("text"))
+
+    def test_the_backup_choice_reaches_the_manifest(self):
+        self.there_already()
+        self.install([("Bagnon", "github:o/Bagnon")], {},
+                     overwrite={"keep_folder": False, "delete_saved": False,
+                                "backup_saved": True})
+        self.assertIs(self.app.entries()["Bagnon"]["backup"], False)
+
+    def test_settings_are_deleted_only_when_asked_and_a_copy_is_kept(self):
+        self.there_already()
+        self.saved()
+        self.install([("Bagnon", "github:o/Bagnon")], {},
+                     overwrite={"keep_folder": True, "delete_saved": True,
+                                "backup_saved": True})
+        self.assertEqual(self.files_left(), [
+            "Account/ACC/Frostmourne/Bob/SavedVariables/Bagnon.lua.replaced",
+            "Account/ACC/SavedVariables/Bagnon.lua.replaced",
+        ])
+        self.assertEqual(self.status_of("Bagnon"), "recently updated")
+        # Said once, where a run reports itself -- not on the row, which is
+        # scanned for what changed, not for how.
+        self.assertIn("2 saved variables file(s) deleted", self.app.status.cget("text"))
+        self.assertIn("copies kept", self.app.status.cget("text"))
+
+    def test_no_copy_is_kept_when_that_is_what_was_asked(self):
+        self.there_already()
+        self.saved()
+        self.install([("Bagnon", "github:o/Bagnon")], {},
+                     overwrite={"keep_folder": True, "delete_saved": True,
+                                "backup_saved": False})
+        self.assertEqual(self.files_left(), [])
+
+    def test_settings_survive_an_install_that_failed(self):
+        """The one ordering that matters.
+
+        Settings are the only thing here no source can fetch again. If the
+        download failed the old addon is still installed, and wiping what it
+        remembers would be a loss with nothing gained.
+        """
+        self.there_already()
+        self.saved()
+        self.install([("Bagnon", "github:o/Bagnon")], {}, fails={"Bagnon"},
+                     overwrite={"keep_folder": True, "delete_saved": True,
+                                "backup_saved": False})
+        self.assertEqual(self.files_left(), [
+            "Account/ACC/Frostmourne/Bob/SavedVariables/Bagnon.lua",
+            "Account/ACC/SavedVariables/Bagnon.lua",
+        ])
+
+    def test_a_delete_is_not_carried_over_to_the_next_run(self):
+        self.there_already()
+        self.saved()
+        self.install([("Bagnon", "github:o/Bagnon")], {}, fails={"Bagnon"},
+                     overwrite={"keep_folder": True, "delete_saved": True,
+                                "backup_saved": False})
+        self.assertEqual(self.app._pending_saved, {})

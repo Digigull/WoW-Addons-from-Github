@@ -35,6 +35,22 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from wowaddons import core as addons  # noqa: E402
 
 
+def case_sensitive_filesystem() -> bool:
+    """Can two files differing only in case exist here?
+
+    Not on Windows, and not on a default macOS volume. Asked of the filesystem
+    rather than of sys.platform, because that is the thing that actually
+    decides it -- a case-insensitive mount on Linux answers the same way
+    Windows does, and would fail the same test for the same reason.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        (pathlib.Path(tmp) / "Case").write_text("x")
+        return not (pathlib.Path(tmp) / "case").exists()
+
+
+CASE_SENSITIVE = case_sensitive_filesystem()
+
+
 def setUpModule():
     """No test in this file may reach the network, including through git.
 
@@ -1120,10 +1136,11 @@ class AnAccountIsNotAnAddon(unittest.TestCase):
 
 
 class OneAddonBuiltForSeveralClients(unittest.TestCase):
-    """Four shapes a "which client?" repository takes, and what each needs.
+    """The shapes a "which client?" repository takes, and what each needs.
 
-    Only one of them needs the user to choose. Getting this wrong is quiet:
-    an addon built for the wrong client is not something the game reports.
+    Two of them cannot be resolved without asking, and both used to be guessed.
+    Getting it wrong is quiet: an addon built for the wrong client is not
+    something the game reports, it just does not work.
     """
 
     def install(self, files, **kw):
@@ -1139,6 +1156,66 @@ class OneAddonBuiltForSeveralClients(unittest.TestCase):
                 "r-1a2b/MyAddon.toc": "a", "r-1a2b/MyAddon_Vanilla.toc": "b",
                 "r-1a2b/MyAddon_Wrath.toc": "c", "r-1a2b/MyAddon_Cata.toc": "d",
             }),
+            ["MyAddon"],
+        )
+
+    def test_a_toc_per_client_in_one_root_is_refused_rather_than_guessed(self):
+        """RichSteini/NotPlater, and the reason this shape is not the one above.
+
+        NotPlater-2.4.3.toc and NotPlater-3.3.5.toc share a root and share
+        every file, but there is no NotPlater.toc between them -- so neither
+        suffix is one a client resolves, and the folder must be named after the
+        one you want. Installing "all of them" would put the same addon in
+        AddOns twice under two names, only one of which is yours.
+
+        The old rule here was "shortest stem", and both stems are the same
+        length: it installed the 2.4.3 build for somebody running 3.3.5, and
+        said nothing.
+        """
+        files = {"r-1a2b/NotPlater-2.4.3.toc": "TBC",
+                 "r-1a2b/NotPlater-3.3.5.toc": "WRATH",
+                 "r-1a2b/NotPlater.lua": "core"}
+        with self.assertRaises(addons.Fail) as caught:
+            self.install(files)
+        message = str(caught.exception)
+        self.assertIn("NotPlater-2.4.3", message)
+        self.assertIn("NotPlater-3.3.5", message)
+        self.assertIn("#", message, "the message must say how to choose")
+
+    def test_naming_the_toc_installs_that_build_under_that_name(self):
+        files = {"r-1a2b/NotPlater-2.4.3.toc": "TBC",
+                 "r-1a2b/NotPlater-3.3.5.toc": "WRATH",
+                 "r-1a2b/NotPlater.lua": "core",
+                 "r-1a2b/libs-3.3.5/Ace/Ace.toc": "lib"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            written = addons.install_zip(mkzip(files), root, False, only="NotPlater-3.3.5.toc")
+            self.assertEqual(written, ["NotPlater-3.3.5"])
+            addon = root / "NotPlater-3.3.5"
+            # The whole root goes in, under the chosen name: the other client's
+            # .toc is harmless there, and the libraries are not optional.
+            self.assertEqual((addon / "NotPlater-3.3.5.toc").read_text(), "WRATH")
+            self.assertTrue((addon / "NotPlater.lua").is_file())
+            self.assertTrue((addon / "libs-3.3.5" / "Ace").is_dir())
+
+    def test_both_builds_can_be_installed_if_that_is_what_was_asked(self):
+        # Two folders, same files, one .toc each. Not something to do by
+        # accident -- which is why it takes two ticks -- and not this tool's
+        # business to refuse when it is asked for on purpose.
+        files = {"r-1a2b/NotPlater-2.4.3.toc": "TBC", "r-1a2b/NotPlater-3.3.5.toc": "WRATH"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            written = addons.install_zip(mkzip(files), root, False,
+                                         only="NotPlater-2.4.3.toc,NotPlater-3.3.5.toc")
+            self.assertEqual(sorted(written), ["NotPlater-2.4.3", "NotPlater-3.3.5"])
+            self.assertEqual((root / "NotPlater-2.4.3" / "NotPlater-2.4.3.toc").read_text(), "TBC")
+            self.assertEqual((root / "NotPlater-3.3.5" / "NotPlater-3.3.5.toc").read_text(), "WRATH")
+
+    def test_a_toc_named_after_its_folder_still_settles_it_outright(self):
+        # A release zip laid out as MyAddon/ holding MyAddon.toc and
+        # MyAddon-old.toc is not a choice: the client loads MyAddon.toc.
+        self.assertEqual(
+            self.install({"MyAddon/MyAddon.toc": "a", "MyAddon/MyAddon-2.4.3.toc": "b"}),
             ["MyAddon"],
         )
 
@@ -1368,6 +1445,38 @@ class OfferingWhatARepositoryHolds(unittest.TestCase):
         # FrostSeek, Minn-Tinkers. There is no choice to make.
         self.serve(["FrostSeek.toc", "FrostSeek_Wrath.toc", "Core.lua"])
         self.assertEqual(addons.addons_in_repo("o/r"), [])
+
+    def test_one_toc_per_client_with_no_base_is_offered_as_the_choice_it_is(self):
+        """RichSteini/NotPlater: NotPlater-2.4.3.toc and NotPlater-3.3.5.toc.
+
+        One addon, one root, and no base .toc between them -- so neither is a
+        flavour suffix any client understands, and the folder in AddOns has to
+        be named after the one you want. That is a choice, and the .toc suffix
+        in the offered name is what says so.
+        """
+        # The real repository, libraries included: it carries
+        # libs-2.4.3/LibSharedMedia-3.0/LibSharedMedia-3.0.toc, which is an
+        # addon by the letter of the rule and is nobody's answer to "which of
+        # these did you want". A .toc at the root means the whole repository is
+        # one addon and everything under it is its own.
+        self.serve(["NotPlater-2.4.3.toc", "NotPlater-3.3.5.toc", "NotPlater.lua",
+                    "libs-2.4.3/LibSharedMedia-3.0/LibSharedMedia-3.0.toc"])
+        self.assertEqual(addons.addons_in_repo("o/r"),
+                         ["NotPlater-2.4.3.toc", "NotPlater-3.3.5.toc"])
+
+    def test_a_flavour_set_is_still_not_a_choice(self):
+        # FrostSeek.toc + FrostSeek_Wrath.toc: the client picks between those
+        # itself, out of one folder named FrostSeek.
+        self.serve(["FrostSeek.toc", "FrostSeek_Wrath.toc", "FrostSeek_Cata.toc"])
+        self.assertEqual(addons.addons_in_repo("o/r"), [])
+
+    def test_the_row_a_person_already_has_pre_ticks_its_own_toc(self):
+        # Their folder is called NotPlater-3.3.5, which is exactly what
+        # NotPlater-3.3.5.toc installs as -- the suffix must not hide that.
+        offered = ["NotPlater-2.4.3.toc", "NotPlater-3.3.5.toc"]
+        self.assertEqual(addons.likely_addon("NotPlater-3.3.5", offered),
+                         "NotPlater-3.3.5.toc")
+        self.assertIsNone(addons.likely_addon("NotPlater", offered))
 
     def test_an_addon_one_level_down_is_offered(self):
         self.serve(["src/MyAddon/MyAddon.toc", "docs/readme.md"])
@@ -2473,3 +2582,302 @@ class RescanForgetsWhatYouDeleted(unittest.TestCase):
         addons.rescan(self.install, self.root)
         addons.rescan(self.install, self.root)
         self.assertNotIn("HandInstalled", self.entries())
+
+
+class FindingAnAddonWhateverItsTocIsCalled(unittest.TestCase):
+    """Reported against 0.9.0: PlayerbotManager sat in AddOns and never appeared.
+
+    The scan asked for exactly <Folder>/<Folder>.toc. The game does not: it
+    matches that name the way its filesystem does, so a Wine install on Linux
+    loads Playerbotmanager.toc out of PlayerbotManager/ without complaint. A
+    folder the game loads has to be a folder this tool lists.
+
+    And when a folder really is not loadable, saying nothing is the worst
+    answer available -- the addon is visibly right there, so a scan that just
+    leaves it out looks broken. Name the folder and the fix.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name) / "AddOns"
+        self.root.mkdir()
+
+    def folder(self, name: str) -> pathlib.Path:
+        made = self.root / name
+        made.mkdir()
+        return made
+
+    def test_a_toc_spelled_with_different_case_is_still_the_addon(self):
+        folder = self.folder("PlayerbotManager")
+        (folder / "Playerbotmanager.toc").write_text("## Title: Playerbot Manager\n## Version: 1.2\n")
+
+        found = addons.scan_installed(self.root)
+        self.assertIn("PlayerbotManager", found)
+        self.assertEqual(found["PlayerbotManager"]["version"], "1.2")
+        self.assertEqual(addons.scan_problems(self.root), {})
+
+    def test_the_toc_named_exactly_after_the_folder_wins(self):
+        # The one the client loads, whatever else is lying beside it.
+        folder = self.folder("MyAddon")
+        (folder / "MyAddon.toc").write_text("## Version: right\n")
+        (folder / "MyAddon-old.toc").write_text("## Version: wrong\n")
+        self.assertEqual(addons.scan_installed(self.root)["MyAddon"]["version"], "right")
+
+    @unittest.skipUnless(CASE_SENSITIVE, "two .tocs differing only in case cannot exist here")
+    def test_the_exact_spelling_is_preferred_over_a_case_variant(self):
+        """A folder holding both must read the one the game reads.
+
+        Only askable on a case-sensitive filesystem: anywhere else the second
+        write lands on the first file, and there is nothing to prefer. Which
+        is also why the preference cannot go wrong there -- the exact spelling
+        opens whatever is on disk.
+        """
+        folder = self.folder("MyAddon")
+        (folder / "MyAddon.toc").write_text("## Version: right\n")
+        (folder / "myaddon.toc").write_text("## Version: wrong\n")
+        self.assertEqual(addons.scan_installed(self.root)["MyAddon"]["version"], "right")
+
+    def test_a_toc_named_after_something_else_is_named_and_explained(self):
+        folder = self.folder("PlayerbotManager-master")
+        (folder / "PlayerbotManager.toc").write_text("## Title: Playerbot Manager\n")
+
+        self.assertNotIn("PlayerbotManager-master", addons.scan_installed(self.root))
+        why = addons.scan_problems(self.root)["PlayerbotManager-master"]
+        self.assertIn("PlayerbotManager.toc", why)
+        self.assertIn("PlayerbotManager-master.toc", why)
+
+    def test_an_addon_left_one_folder_deep_is_named_and_explained(self):
+        outer = self.folder("PlayerbotManager")
+        inner = outer / "PlayerbotManager"
+        inner.mkdir()
+        (inner / "PlayerbotManager.toc").write_text("## Title: Playerbot Manager\n")
+
+        self.assertNotIn("PlayerbotManager", addons.scan_installed(self.root))
+        why = addons.scan_problems(self.root)["PlayerbotManager"]
+        self.assertIn("one folder deeper", why)
+        self.assertIn("PlayerbotManager", why)
+
+    def test_a_toc_windows_saved_as_txt_is_named_and_explained(self):
+        folder = self.folder("PlayerbotManager")
+        (folder / "PlayerbotManager.toc.txt").write_text("## Title: Playerbot Manager\n")
+
+        why = addons.scan_problems(self.root)["PlayerbotManager"]
+        self.assertIn(".toc.txt", why)
+
+    def test_a_folder_that_is_not_an_addon_is_left_in_peace(self):
+        # Empty Blizzard_* stubs and folders of notes are not problems, and a
+        # warning about each of them is noise that buries the one that matters.
+        self.folder("Blizzard_AchievementUI")
+        notes = self.folder("Unsure-Old")
+        (notes / "notes.txt").write_text("what was this")
+        self.assertEqual(addons.scan_problems(self.root), {})
+
+    def test_a_folder_of_parked_addons_says_so_once(self):
+        parked = self.folder("Not Working")
+        for name in ("OldOne", "OtherOne"):
+            (parked / name).mkdir()
+            (parked / name / f"{name}.toc").write_text("## Title: x\n")
+
+        why = addons.scan_problems(self.root)["Not Working"]
+        self.assertIn("OldOne", why)
+        self.assertIn("OtherOne", why)
+
+
+class InstallingSomethingNotOnDiskYet(unittest.TestCase):
+    """What "install this repository" turns into: rows, and what they are called.
+
+    Both front ends ask this the same way, so the rules live here rather than
+    in either of them: one row per addon, a repository holding one addon bound
+    whole, and the row named after the folder the client will load.
+    """
+
+    def test_a_repository_that_is_itself_the_addon_is_named_after_the_repo(self):
+        self.assertEqual(addons.install_plan("o/FrostSeek", [], []),
+                         [("FrostSeek", "github:o/FrostSeek")])
+
+    def test_a_repository_holding_one_addon_takes_the_folder_name(self):
+        # The row has to be called what the client will load, not what the
+        # repository is called: a rescan can only agree with it under that name.
+        self.assertEqual(addons.install_plan("o/Bagnon-wotlk", [], ["Bagnon"]),
+                         [("Bagnon", "github:o/Bagnon-wotlk")])
+
+    def test_one_addon_is_bound_whole_rather_than_by_folder(self):
+        """Naming the folder costs the releases, and installs the same files.
+
+        A source naming a folder is versioned by the last commit touching that
+        folder, so an addon that publishes tagged releases would start
+        reporting commit ids instead of version numbers -- for nothing.
+        """
+        plan = addons.install_plan("o/r", [], ["OnlyOne"])
+        self.assertEqual(plan, [("OnlyOne", "github:o/r")])
+
+    def test_each_chosen_addon_becomes_its_own_row(self):
+        plan = addons.install_plan("o/r", ["Alpha", "Gamma"], ["Alpha", "Beta", "Gamma"])
+        self.assertEqual(plan, [("Alpha", "github:o/r#Alpha"),
+                                ("Gamma", "github:o/r#Gamma")])
+
+    def test_a_branch_survives_into_every_row(self):
+        plan = addons.install_plan("o/r@wotlk", ["Alpha", "Beta"], ["Alpha", "Beta"])
+        self.assertEqual([source for _n, source in plan],
+                         ["github:o/r@wotlk#Alpha", "github:o/r@wotlk#Beta"])
+
+    def test_a_folder_named_in_the_spec_counts_as_the_choice(self):
+        # Clicking into one addon on github.com and copying the address is the
+        # clearest statement of which one is meant.
+        plan = addons.install_plan("o/r#src/MyAddon", [], ["src/MyAddon", "src/Other"])
+        self.assertEqual(plan, [("MyAddon", "github:o/r#src/MyAddon")])
+
+    def test_several_addons_and_no_choice_is_no_plan(self):
+        # Installing all of them is a real choice, and not one to make for
+        # somebody: the caller asks instead.
+        self.assertEqual(addons.install_plan("o/r", [], ["Alpha", "Beta"]), [])
+
+
+class NamingARowAfterWhatLanded(unittest.TestCase):
+    """A row is named before the archive is open, so the name is a guess.
+
+    Left wrong, one addon shows up twice: a bound row reading "not installed"
+    beside the unmanaged row the next rescan adds for the folder that is really
+    there.
+    """
+
+    def install(self, addons_map):
+        return {"addons": addons_map}
+
+    def test_a_row_moves_to_the_folder_that_was_installed(self):
+        install = self.install({
+            "NotPlater-3.3.5": {"source": "github:o/NotPlater-3.3.5",
+                                "installed": "v1", "folders": ["NotPlater"]},
+        })
+        self.assertEqual(addons.settle_names(install, ["NotPlater-3.3.5"]),
+                         [("NotPlater-3.3.5", "NotPlater")])
+        self.assertEqual(install["addons"]["NotPlater"]["installed"], "v1")
+        self.assertNotIn("NotPlater-3.3.5", install["addons"])
+
+    def test_a_row_that_was_already_right_is_left_alone(self):
+        install = self.install({
+            "Bagnon": {"source": "github:o/Bagnon", "installed": "v1", "folders": ["Bagnon"]},
+        })
+        self.assertEqual(addons.settle_names(install, ["Bagnon"]), [])
+
+    def test_an_archive_of_several_folders_keeps_its_row(self):
+        # Nothing to rename it to: the row is the repository, not one folder.
+        install = self.install({
+            "Details": {"source": "github:o/Details", "installed": "v1",
+                        "folders": ["Details", "Details_Streamer"]},
+        })
+        self.assertEqual(addons.settle_names(install, ["Details"]), [])
+
+    def test_an_unmanaged_row_for_the_same_folder_is_replaced(self):
+        # The scan's note that a folder exists; the install is now the truth
+        # about it.
+        install = self.install({
+            "repo": {"source": "github:o/repo", "installed": "v1", "folders": ["TheAddon"]},
+            "TheAddon": {"source": "unmanaged", "installed": None, "folders": ["TheAddon"]},
+        })
+        self.assertEqual(addons.settle_names(install, ["repo"]), [("repo", "TheAddon")])
+        self.assertEqual(install["addons"]["TheAddon"]["source"], "github:o/repo")
+
+    def test_a_binding_somebody_set_is_never_overwritten(self):
+        install = self.install({
+            "repo": {"source": "github:o/repo", "installed": "v1", "folders": ["TheAddon"]},
+            "TheAddon": {"source": "local:/home/me/src/TheAddon", "installed": "linked",
+                         "folders": ["TheAddon"]},
+        })
+        self.assertEqual(addons.settle_names(install, ["repo"]), [])
+        self.assertEqual(install["addons"]["TheAddon"]["source"], "local:/home/me/src/TheAddon")
+
+
+class TheSettingsInTheWtfFolder(unittest.TestCase):
+    """Finding, and deleting, what the client remembers about one addon.
+
+    Nothing here runs unless somebody ticks a box that says so. It exists for
+    the case where the settings are the problem -- written by a different fork,
+    or a version old enough that the new one chokes on them -- and the fix is to
+    start clean.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.wow = pathlib.Path(self.tmp.name) / "World of Warcraft 3.3.5a"
+        self.root = self.wow / "Interface" / "AddOns"
+        self.root.mkdir(parents=True)
+
+    def write(self, *relatives):
+        for relative in relatives:
+            path = self.wow / "WTF" / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("-- settings\n")
+
+    def named(self, addon="Bagnon"):
+        wtf = self.wow / "WTF"
+        return sorted(str(p.relative_to(wtf)).replace("\\", "/")
+                      for p in addons.saved_variables(self.root, addon))
+
+    def left(self):
+        wtf = self.wow / "WTF"
+        return sorted(str(p.relative_to(wtf)).replace("\\", "/")
+                      for p in wtf.rglob("*") if p.is_file())
+
+    def test_account_and_character_settings_are_both_found(self):
+        self.write("Account/ACC/SavedVariables/Bagnon.lua",
+                   "Account/ACC/Frostmourne/Bob/SavedVariables/Bagnon.lua",
+                   "Account/ACC/Frostmourne/Alice/SavedVariables/Bagnon.lua")
+        self.assertEqual(self.named(), [
+            "Account/ACC/Frostmourne/Alice/SavedVariables/Bagnon.lua",
+            "Account/ACC/Frostmourne/Bob/SavedVariables/Bagnon.lua",
+            "Account/ACC/SavedVariables/Bagnon.lua",
+        ])
+
+    def test_the_clients_own_backup_file_counts_as_the_settings(self):
+        # Deleting the .lua and leaving the .lua.bak has the addon come back
+        # with the settings you just asked to be rid of.
+        self.write("Account/ACC/SavedVariables/Bagnon.lua",
+                   "Account/ACC/SavedVariables/Bagnon.lua.bak")
+        self.assertEqual(len(self.named()), 2)
+
+    def test_another_addons_settings_are_never_touched(self):
+        self.write("Account/ACC/SavedVariables/Bagnon.lua",
+                   "Account/ACC/SavedVariables/Bagnon_Config.lua",
+                   "Account/ACC/SavedVariables/NotBagnon.lua",
+                   "Account/ACC/config-cache.wtf")
+        self.assertEqual(self.named(), ["Account/ACC/SavedVariables/Bagnon.lua"])
+
+    def test_the_case_of_every_folder_in_the_path_is_ignored(self):
+        # Windows and Wine are both case-blind about this, and real WTF trees
+        # in the wild are spelled Account, ACCOUNT and account.
+        self.write("account/ACC/savedvariables/bagnon.lua")
+        self.assertEqual(len(self.named()), 1)
+
+    def test_a_client_that_has_never_been_run_has_no_settings(self):
+        self.assertIsNone(addons.wtf_dir(self.root))
+        self.assertEqual(self.named(), [])
+
+    def test_deleting_keeps_a_copy_beside_each_file_when_asked(self):
+        self.write("Account/ACC/SavedVariables/Bagnon.lua",
+                   "Account/ACC/Frostmourne/Bob/SavedVariables/Bagnon.lua")
+        deleted, problems = addons.remove_saved_variables(
+            addons.saved_variables(self.root, "Bagnon"), backup=True)
+        self.assertEqual((len(deleted), problems), (2, []))
+        self.assertEqual(self.left(), [
+            "Account/ACC/Frostmourne/Bob/SavedVariables/Bagnon.lua.replaced",
+            "Account/ACC/SavedVariables/Bagnon.lua.replaced",
+        ])
+
+    def test_deleting_without_a_copy_leaves_nothing(self):
+        self.write("Account/ACC/SavedVariables/Bagnon.lua")
+        addons.remove_saved_variables(addons.saved_variables(self.root, "Bagnon"), backup=False)
+        self.assertEqual(self.left(), [])
+
+    def test_a_file_that_cannot_be_removed_is_reported_not_raised(self):
+        """One locked file must not leave the rest half-done and silent."""
+        self.write("Account/ACC/SavedVariables/Bagnon.lua")
+        gone = self.wow / "WTF" / "Account/ACC/SavedVariables/Bagnon.lua"
+        found = addons.saved_variables(self.root, "Bagnon")
+        gone.unlink()  # whatever the reason, the file is not removable now
+        deleted, problems = addons.remove_saved_variables(found, backup=False)
+        self.assertEqual(deleted, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("Bagnon.lua", problems[0])
