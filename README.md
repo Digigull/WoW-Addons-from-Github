@@ -618,7 +618,7 @@ workflow**, leave the branch on `main`, then:
 | **just check the builds** | *(blank)* | *(blank)* |
 
 A new tag is created at the commit that was actually built, and the release gets its title,
-notes, pre-release label and both binaries. Rebuilding edits the existing release in place —
+notes and both binaries. Rebuilding edits the existing release in place —
 same tag, same URL, nothing duplicated — which is what makes a failed release repairable
 without moving a tag, something the web UI cannot do.
 

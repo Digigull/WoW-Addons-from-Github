@@ -464,10 +464,10 @@ class Releasing(unittest.TestCase):
     def test_the_download_links_are_per_release(self):
         """Each release must link to its own assets, not to whatever is newest.
 
-        `/releases/latest/download/...` would need no substitution and is wrong
-        here: every release this workflow publishes is marked a pre-release, and
-        `latest` skips pre-releases, so those links would 404 for as long as
-        that stays true.
+        `/releases/latest/download/...` would need no substitution and is
+        still wrong: it means "whatever is newest", so the moment a later
+        release exists, an older release's page hands people the wrong build --
+        every set of notes describing changes it does not link to.
         """
         notes = self.NOTES.read_text()
         self.assertIn("/releases/download/__TAG__/", notes)
@@ -501,21 +501,26 @@ class Releasing(unittest.TestCase):
         self.assertIn("libfuse", notes)
 
     def test_the_metadata_is_applied_even_when_the_release_exists(self):
-        """`view || create` silently drops the notes and the pre-release flag.
+        """`view || create` silently drops the notes and the release status.
 
         It reads as harmless idempotency. It is not: creating the tag through
         "Draft a new release" in the web UI -- which is how most people make a
         tag -- publishes the release before the workflow runs, so `view`
-        succeeds, `create` is skipped, and the title, notes and --prerelease go
+        succeeded, `create` was skipped, and the title, notes and status went
         with it. v0.3.0 published exactly that way: right assets, no title, no
-        notes, not a pre-release, and the step exited 0.
+        notes, the wrong status, and the step exited 0.
         """
         commands = self.workflow_commands()
         self.assertIn("gh release edit", commands, "nothing applies metadata to an existing release")
         self.assertNotIn("|| gh release create", commands, "the bug that shipped v0.3.0 is back")
         # Both branches must set all three, or one route silently differs.
         self.assertEqual(commands.count("--notes-file notes.md"), 2)
-        self.assertEqual(commands.count("--prerelease"), 2)
+        # Spelled out rather than omitted, in both: the same web UI that
+        # pre-creates the release offers a pre-release tick box, so a release
+        # made that way has to be demoted rather than left as it was found.
+        self.assertEqual(commands.count("--prerelease=false"), 2)
+        self.assertNotRegex(commands, r"--prerelease(?!=false)",
+                            "a release flagged pre-release again")
 
     def test_the_publish_verifies_what_it_published(self):
         # The failing step exited 0. Checking the exit codes was not enough,

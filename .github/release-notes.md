@@ -305,15 +305,17 @@ Also in this release:
   FUSE 2. Either install it (`sudo apt install libfuse2`, or `libfuse2t64` on newer
   releases) or skip it entirely with `--appimage-extract-and-run`.
 
-## Why this is marked a pre-release
+## Why this one is not a pre-release
 
-Every build is checked by CI on both platforms: it starts, Tk really works inside the
-bundle, the window opens and stays open, and it scans a folder end to end. **But nobody
-has yet run either download on a desktop against a real WoW install.** That is a different
-thing, and until somebody has, "pre-release" is the honest label.
+Every build before this was flagged **Pre-release**, and the label meant something
+specific: CI checks each one on both platforms — it starts, Tk really works inside the
+bundle, the window opens and stays open, and it scans a folder end to end — but nobody had
+run either download on a desktop against a real WoW install. That is a different thing.
 
-If you try it, the two places to watch are the folder picker against a real
-`Interface/AddOns`, and a `local:` source under Wine or Proton.
+Somebody has now, on a 3.3.5a client under Wine, and the last few releases came straight
+out of what that turned up: an addon the scan could not see, a repository that installed
+the wrong client's build, and no way to install an addon you did not already have. So the
+label goes.
 
 ## What it does
 
