@@ -35,6 +35,22 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from wowaddons import core as addons  # noqa: E402
 
 
+def case_sensitive_filesystem() -> bool:
+    """Can two files differing only in case exist here?
+
+    Not on Windows, and not on a default macOS volume. Asked of the filesystem
+    rather than of sys.platform, because that is the thing that actually
+    decides it -- a case-insensitive mount on Linux answers the same way
+    Windows does, and would fail the same test for the same reason.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        (pathlib.Path(tmp) / "Case").write_text("x")
+        return not (pathlib.Path(tmp) / "case").exists()
+
+
+CASE_SENSITIVE = case_sensitive_filesystem()
+
+
 def setUpModule():
     """No test in this file may reach the network, including through git.
 
@@ -2601,8 +2617,22 @@ class FindingAnAddonWhateverItsTocIsCalled(unittest.TestCase):
         self.assertEqual(found["PlayerbotManager"]["version"], "1.2")
         self.assertEqual(addons.scan_problems(self.root), {})
 
-    def test_the_exact_spelling_is_still_preferred(self):
-        # A folder holding both must read the one the game reads.
+    def test_the_toc_named_exactly_after_the_folder_wins(self):
+        # The one the client loads, whatever else is lying beside it.
+        folder = self.folder("MyAddon")
+        (folder / "MyAddon.toc").write_text("## Version: right\n")
+        (folder / "MyAddon-old.toc").write_text("## Version: wrong\n")
+        self.assertEqual(addons.scan_installed(self.root)["MyAddon"]["version"], "right")
+
+    @unittest.skipUnless(CASE_SENSITIVE, "two .tocs differing only in case cannot exist here")
+    def test_the_exact_spelling_is_preferred_over_a_case_variant(self):
+        """A folder holding both must read the one the game reads.
+
+        Only askable on a case-sensitive filesystem: anywhere else the second
+        write lands on the first file, and there is nothing to prefer. Which
+        is also why the preference cannot go wrong there -- the exact spelling
+        opens whatever is on disk.
+        """
         folder = self.folder("MyAddon")
         (folder / "MyAddon.toc").write_text("## Version: right\n")
         (folder / "myaddon.toc").write_text("## Version: wrong\n")
