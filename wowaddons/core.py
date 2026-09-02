@@ -1863,6 +1863,79 @@ def likely_addon(name: str, folders: list[str]) -> str | None:
     return None
 
 
+def install_plan(repo_spec: str, chosen: list[str], available: list[str]) -> list[tuple[str, str]]:
+    """The rows to create for installing a repository: (addon name, source).
+
+    One row per addon, never one row for a repository holding several. Binding
+    the whole repo works and is almost never meant: every addon in it would be
+    written into AddOns whenever this one row updates, and each would report an
+    update whenever any of them changed. Choosing is what the tick boxes are
+    for, and this is where a choice becomes rows.
+
+    A repository holding ONE addon is bound without naming its folder, even
+    though the folder is known. Naming it switches the row off the
+    repository's releases and onto the last commit touching that folder, so an
+    addon that publishes tagged releases would start reporting commit ids
+    instead of version numbers -- for an install of exactly the same files.
+
+    The row is named after the folder that will land in AddOns, not after the
+    repository: that name is what the client loads, what a rescan will find,
+    and therefore the only name under which the two can agree.
+    """
+    repo, branch, folder = split_repo_spec(repo_spec)
+    base = f"github:{repo}" + (f"@{branch}" if branch else "")
+    # A folder named in the pasted URL is a choice too -- clicking into one
+    # addon of several on github.com and copying the address is the clearest
+    # way anybody states which one they mean.
+    picks = wanted_folders(",".join(chosen)) or wanted_folders(folder)
+    if len(available) <= 1 and len(picks) <= 1:
+        named = picks or available or [repo.rsplit("/", 1)[-1]]
+        return [(named[0].rsplit("/", 1)[-1], base)]
+    return [(pick.rsplit("/", 1)[-1], f"{base}#{pick}") for pick in picks]
+
+
+def rename_entry(install: dict, old: str, new: str) -> bool:
+    """Move a row to the name of the folder that was actually installed.
+
+    An install names its row before it can know what the archive holds: the
+    best guess is the repository's name, and a repository called
+    NotPlater-3.3.5 whose addon is NotPlater makes that guess wrong. Left
+    alone, the manifest then holds a bound row naming a folder that does not
+    exist -- reported as *not installed* -- and the next rescan adds a second,
+    unmanaged row for the folder that does. Two rows, one addon, neither of
+    them right.
+
+    Refuses to overwrite a row holding a decision of somebody's: an unmanaged
+    row is only a note that a folder exists, and this replaces it with the
+    truth, but a bound row is a binding that was set on purpose.
+    """
+    entries = install.setdefault("addons", {})
+    if old == new or old not in entries:
+        return False
+    if entries.get(new, {}).get("source", "unmanaged") != "unmanaged":
+        return False
+    entries[new] = entries.pop(old)
+    return True
+
+
+def settle_names(install: dict, names: list[str]) -> list[tuple[str, str]]:
+    """Rename fresh rows to the folder that actually landed in AddOns.
+
+    An install has to name its row before it can know what the archive holds,
+    and a repository called NotPlater-3.3.5 whose addon is NotPlater makes that
+    guess wrong. Left alone the manifest holds a bound row naming a folder that
+    does not exist, and the next scan adds a second row for the folder that
+    does.
+    """
+    entries = install.get("addons", {})
+    moved = []
+    for name in names:
+        folders = entries.get(name, {}).get("folders") or []
+        if len(folders) == 1 and folders[0] != name and rename_entry(install, name, folders[0]):
+            moved.append((name, folders[0]))
+    return moved
+
+
 def download(url: str) -> bytes:
     """Fetch one archive: off the API's meter where possible, paced where not.
 

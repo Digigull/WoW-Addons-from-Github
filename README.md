@@ -51,7 +51,8 @@ Not sure which build you have? `--version` says, and the window puts it in its t
 ```
 python3 addons.py init ~/Games/Ascension
 python3 addons.py scan
-python3 addons.py set MyAddon github:someone/MyAddon
+python3 addons.py install someone/NewAddon                 # one you do not have yet
+python3 addons.py set MyAddon github:someone/MyAddon       # one you already have
 python3 addons.py update
 ```
 
@@ -99,6 +100,7 @@ Running from a checkout instead needs **Python 3.9 or newer**, and that is the w
 |---|---|
 | `init <path>` | Remember where the client is. Accepts your WoW folder, its `Interface` folder, or `Interface/AddOns` itself. |
 | `scan` | Read every addon already installed and record it, guessing a source from each `.toc` where it can. Drops unmanaged rows whose folder you have deleted; keeps bound ones, flagged *not installed*. |
+| `install <repo>` | Fetch an addon you do **not** have yet and bind it in one step. Takes `owner/repo`, `owner/repo#Folder` or any github.com link; `--folder` (repeatable) picks addons out of a repository that holds several, `--branch` follows a branch instead of releases. |
 | `list` | Every addon, its source, and its installed version. Bound addons first, then the rest, each alphabetically. |
 | `set <Addon> <source>` | Bind one addon to where its updates come from. |
 | `accept` | Take every source that `scan` suggested, in one go. |
@@ -298,6 +300,12 @@ Everything the terminal does, in one window:
 - **The addons you have bound are listed first**, then everything still unmanaged, each
   group alphabetically. On a real install most rows are addons this tool does not manage,
   and a single alphabetical list buries the handful it does among them.
+- **Install addon…** takes a repository — `owner/repo` or any github.com link — and
+  fetches an addon that is not in your AddOns folder at all yet. It reads what the
+  repository holds and, if that is several addons, asks which; each one you tick becomes
+  its own row and its own binding, rather than one row that reinstalls all of them
+  whenever any one of them changes. A repository holding a single addon is bound whole,
+  which keeps it following that repository's releases.
 - **Set source…** opens a dialog over the selected addon: a local folder (with Browse),
   a GitHub repo, an optional branch to track, an optional folder inside the repo, or
   unmanaged. Pasting a github.com link to a folder fills all three in.
@@ -311,8 +319,9 @@ Everything the terminal does, in one window:
   rather than mid-download, which leaves the manifest agreeing with the disk.
 - A repository that cannot be reached marks **that row** red and leaves the rest to
   finish. There is no error dialog to dismiss per failure.
-- Binding an addon that exists as real files says so in the dialog, and names the
-  `<Name>.replaced` folder it would move them to, *before* you click Save.
+- Binding **or installing** over an addon that exists as real files says so in the
+  dialog, and names the `<Name>.replaced` folder it would move them to, *before* you
+  click Save or Install.
 
 ## Things it will not do to your client
 

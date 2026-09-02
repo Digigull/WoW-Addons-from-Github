@@ -16,6 +16,7 @@ from .core import Fail
 EPILOG = """\
     addons.py init ~/Games/Ascension
     addons.py scan
+    addons.py install owner/repo
     addons.py set GnomeWorks local:.
     addons.py set SomeAddon github:owner/repo
     addons.py set OneOfMany github:owner/repo#OneOfMany
@@ -33,11 +34,12 @@ Stdlib only -- no pip install, nothing to keep updated.
 
 HOW IT FITS TOGETHER
 
-  init    remembers where Interface/AddOns is
-  scan    reads every addon already installed there and writes them into the
-          manifest, guessing a source from each .toc where it can
-  set     binds one addon to where its updates should come from
-  update  brings every bound addon up to date
+  init     remembers where Interface/AddOns is
+  scan     reads every addon already installed there and writes them into the
+           manifest, guessing a source from each .toc where it can
+  install  fetches an addon you do NOT have yet, and binds it
+  set      binds one addon you DO have to where its updates should come from
+  update   brings every bound addon up to date
 
 SEVERAL WOW FOLDERS
 
@@ -222,6 +224,74 @@ def cmd_set(args, state: dict) -> None:
     note("Run:  addons.py update " + args.addon)
 
 
+def cmd_install(args, state: dict) -> None:
+    """Install an addon that is not in the AddOns folder at all yet.
+
+    `set` + `update` has always been able to do this, and only if you already
+    knew that a row can be bound before it exists. Naming it is most of the
+    feature: "install this repository" is the thing people arrive wanting, and
+    it should not have to be assembled out of two commands that both read as
+    being about something already installed.
+    """
+    install = selected(args, state)
+    core.addons_dir(install)  # fails now, rather than after the download
+    no_api = args.no_api or core.checks_without_api(install)
+
+    found = core.parse_repo(args.repo)
+    if found is None:
+        account = core.github_account(args.repo)
+        if account:
+            core.die(f"'{account}' is a GitHub account, not a repository -- it may hold\n"
+                     "     many addons. Open the one you want on github.com and paste\n"
+                     f"     that address, or write it as {account}/repo-name.")
+        core.die(f"cannot see a GitHub repository in '{args.repo}'.\n"
+                 "     Expected owner/repo, or a github.com URL.")
+    repo, url_branch, url_folder = found
+    branch = args.branch or url_branch
+    chosen = core.wanted_folders(",".join(args.folder)) or core.wanted_folders(url_folder)
+    spec = repo + (f"@{branch}" if branch else "") + (f"#{','.join(chosen)}" if chosen else "")
+
+    step(f"Reading {repo}")
+    core.begin_run()
+    try:
+        # One request, and only when it can change the answer: a named folder
+        # already says which addon is meant.
+        available = [] if chosen else core.addons_in_repo(spec, no_api=no_api)
+    finally:
+        core.end_run()
+
+    plan = core.install_plan(spec, chosen, available)
+    if not plan:
+        note(f"{repo} holds {len(available)} addons:")
+        for folder in available:
+            note(f"    {folder}")
+        example = available[0] if available else "FolderName"
+        core.die(f"name the one you want:  addons.py install {repo}#{example}\n"
+                 "     (or repeat --folder to install several)")
+
+    for name, source in plan:
+        core.set_source(install, name, source)
+        note(f"{name} -> {core.tilde(source)}")
+    core.save(state)
+
+    # The same run `update` does, rather than a second copy of it that could
+    # come to disagree about backups, pacing or what counts as a failure.
+    try:
+        cmd_update(
+            argparse.Namespace(
+                addons=[name for name, _ in plan], install=args.install,
+                check=False, dry_run=False, force=False, no_api=args.no_api,
+            ),
+            state,
+        )
+    finally:
+        settled = core.settle_names(install, [name for name, _ in plan])
+        if settled:
+            core.save(state)
+        for old, new in settled:
+            note(f"{old} installs as {new}; listed under that name.")
+
+
 def cmd_accept(args, state: dict) -> None:
     """Take every source `scan` suggested, in one go."""
     step("Accepting suggested sources")
@@ -392,6 +462,15 @@ def build_parser(prog: str = "addons.py", epilog: str | None = None) -> argparse
     p.add_argument("--no-api", action="store_true",
                    help="check without the GitHub API: follows branches, not releases")
     p.set_defaults(func=cmd_update)
+
+    p = targeted("install", help="install an addon you do not have yet, from a repository")
+    p.add_argument("repo", help="owner/repo, owner/repo#Folder, or a github.com link")
+    p.add_argument("--folder", action="append", default=[], metavar="NAME",
+                   help="which addon in the repository (repeatable)")
+    p.add_argument("--branch", help="track this branch instead of the latest release")
+    p.add_argument("--no-api", action="store_true",
+                   help="ask git and codeload instead of the GitHub API")
+    p.set_defaults(func=cmd_install)
 
     p = sub.add_parser("where", help="print the manifest and AddOns paths")
     p.set_defaults(func=cmd_where)

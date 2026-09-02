@@ -2559,3 +2559,108 @@ class FindingAnAddonWhateverItsTocIsCalled(unittest.TestCase):
         why = addons.scan_problems(self.root)["Not Working"]
         self.assertIn("OldOne", why)
         self.assertIn("OtherOne", why)
+
+
+class InstallingSomethingNotOnDiskYet(unittest.TestCase):
+    """What "install this repository" turns into: rows, and what they are called.
+
+    Both front ends ask this the same way, so the rules live here rather than
+    in either of them: one row per addon, a repository holding one addon bound
+    whole, and the row named after the folder the client will load.
+    """
+
+    def test_a_repository_that_is_itself_the_addon_is_named_after_the_repo(self):
+        self.assertEqual(addons.install_plan("o/FrostSeek", [], []),
+                         [("FrostSeek", "github:o/FrostSeek")])
+
+    def test_a_repository_holding_one_addon_takes_the_folder_name(self):
+        # The row has to be called what the client will load, not what the
+        # repository is called: a rescan can only agree with it under that name.
+        self.assertEqual(addons.install_plan("o/Bagnon-wotlk", [], ["Bagnon"]),
+                         [("Bagnon", "github:o/Bagnon-wotlk")])
+
+    def test_one_addon_is_bound_whole_rather_than_by_folder(self):
+        """Naming the folder costs the releases, and installs the same files.
+
+        A source naming a folder is versioned by the last commit touching that
+        folder, so an addon that publishes tagged releases would start
+        reporting commit ids instead of version numbers -- for nothing.
+        """
+        plan = addons.install_plan("o/r", [], ["OnlyOne"])
+        self.assertEqual(plan, [("OnlyOne", "github:o/r")])
+
+    def test_each_chosen_addon_becomes_its_own_row(self):
+        plan = addons.install_plan("o/r", ["Alpha", "Gamma"], ["Alpha", "Beta", "Gamma"])
+        self.assertEqual(plan, [("Alpha", "github:o/r#Alpha"),
+                                ("Gamma", "github:o/r#Gamma")])
+
+    def test_a_branch_survives_into_every_row(self):
+        plan = addons.install_plan("o/r@wotlk", ["Alpha", "Beta"], ["Alpha", "Beta"])
+        self.assertEqual([source for _n, source in plan],
+                         ["github:o/r@wotlk#Alpha", "github:o/r@wotlk#Beta"])
+
+    def test_a_folder_named_in_the_spec_counts_as_the_choice(self):
+        # Clicking into one addon on github.com and copying the address is the
+        # clearest statement of which one is meant.
+        plan = addons.install_plan("o/r#src/MyAddon", [], ["src/MyAddon", "src/Other"])
+        self.assertEqual(plan, [("MyAddon", "github:o/r#src/MyAddon")])
+
+    def test_several_addons_and_no_choice_is_no_plan(self):
+        # Installing all of them is a real choice, and not one to make for
+        # somebody: the caller asks instead.
+        self.assertEqual(addons.install_plan("o/r", [], ["Alpha", "Beta"]), [])
+
+
+class NamingARowAfterWhatLanded(unittest.TestCase):
+    """A row is named before the archive is open, so the name is a guess.
+
+    Left wrong, one addon shows up twice: a bound row reading "not installed"
+    beside the unmanaged row the next rescan adds for the folder that is really
+    there.
+    """
+
+    def install(self, addons_map):
+        return {"addons": addons_map}
+
+    def test_a_row_moves_to_the_folder_that_was_installed(self):
+        install = self.install({
+            "NotPlater-3.3.5": {"source": "github:o/NotPlater-3.3.5",
+                                "installed": "v1", "folders": ["NotPlater"]},
+        })
+        self.assertEqual(addons.settle_names(install, ["NotPlater-3.3.5"]),
+                         [("NotPlater-3.3.5", "NotPlater")])
+        self.assertEqual(install["addons"]["NotPlater"]["installed"], "v1")
+        self.assertNotIn("NotPlater-3.3.5", install["addons"])
+
+    def test_a_row_that_was_already_right_is_left_alone(self):
+        install = self.install({
+            "Bagnon": {"source": "github:o/Bagnon", "installed": "v1", "folders": ["Bagnon"]},
+        })
+        self.assertEqual(addons.settle_names(install, ["Bagnon"]), [])
+
+    def test_an_archive_of_several_folders_keeps_its_row(self):
+        # Nothing to rename it to: the row is the repository, not one folder.
+        install = self.install({
+            "Details": {"source": "github:o/Details", "installed": "v1",
+                        "folders": ["Details", "Details_Streamer"]},
+        })
+        self.assertEqual(addons.settle_names(install, ["Details"]), [])
+
+    def test_an_unmanaged_row_for_the_same_folder_is_replaced(self):
+        # The scan's note that a folder exists; the install is now the truth
+        # about it.
+        install = self.install({
+            "repo": {"source": "github:o/repo", "installed": "v1", "folders": ["TheAddon"]},
+            "TheAddon": {"source": "unmanaged", "installed": None, "folders": ["TheAddon"]},
+        })
+        self.assertEqual(addons.settle_names(install, ["repo"]), [("repo", "TheAddon")])
+        self.assertEqual(install["addons"]["TheAddon"]["source"], "github:o/repo")
+
+    def test_a_binding_somebody_set_is_never_overwritten(self):
+        install = self.install({
+            "repo": {"source": "github:o/repo", "installed": "v1", "folders": ["TheAddon"]},
+            "TheAddon": {"source": "local:/home/me/src/TheAddon", "installed": "linked",
+                         "folders": ["TheAddon"]},
+        })
+        self.assertEqual(addons.settle_names(install, ["repo"]), [])
+        self.assertEqual(install["addons"]["TheAddon"]["source"], "local:/home/me/src/TheAddon")

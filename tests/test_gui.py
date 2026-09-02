@@ -38,7 +38,16 @@ if tk is not None:
 
 
 @unittest.skipIf(tk is None, globals().get("WHY", "no Tk"))
-class WindowTests(unittest.TestCase):
+class WindowHarness(unittest.TestCase):
+    """A real window over a scratch AddOns folder. No network, no real manifest.
+
+    Shared rather than copied per test class: the setup that matters is the
+    redirection of CONFIG_DIR, and a copy of it that drifts would write into
+    somebody's actual manifest while the tests looked green.
+    """
+
+    ADDONS: dict = {}
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         base = pathlib.Path(self.tmp.name)
@@ -53,11 +62,7 @@ class WindowTests(unittest.TestCase):
         core.CONFIG_DIR.mkdir()
         core.MANIFEST.write_text(json.dumps({
             "addons_dir": str(self.addons),
-            "addons": {
-                "Bound": {"source": "github:o/r", "mode": "link", "installed": "v1", "folders": ["Bound"]},
-                "Loose": {"source": "unmanaged", "mode": "link", "installed": None,
-                          "folders": ["Loose"], "suggested": "github:someone/Loose"},
-            },
+            "addons": dict(self.ADDONS),
         }))
 
         self.root = tk.Tk()
@@ -87,6 +92,14 @@ class WindowTests(unittest.TestCase):
 
     def status_of(self, name: str) -> str:
         return self.app.tree.set(name, "status")
+
+
+class WindowTests(WindowHarness):
+    ADDONS = {
+        "Bound": {"source": "github:o/r", "mode": "link", "installed": "v1", "folders": ["Bound"]},
+        "Loose": {"source": "unmanaged", "mode": "link", "installed": None,
+                  "folders": ["Loose"], "suggested": "github:someone/Loose"},
+    }
 
     # -- the table -----------------------------------------------------------
 
@@ -837,42 +850,12 @@ class WindowTests(unittest.TestCase):
         dlg.destroy()
 
 
-@unittest.skipIf(tk is None, globals().get("WHY", "no Tk"))
-class RescanSaysWhatItSkipped(unittest.TestCase):
+class RescanSaysWhatItSkipped(WindowHarness):
     """A folder you can see in AddOns and cannot see in the list needs a reason.
 
     Reported against 0.9.0 as "it is not finding PlayerbotManager": the folder
     was there, the scan dropped it, and the window said nothing about it at all.
     """
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        base = pathlib.Path(self.tmp.name)
-        self.addons = base / "Interface" / "AddOns"
-        self.addons.mkdir(parents=True)
-        self._config, self._manifest = core.CONFIG_DIR, core.MANIFEST
-        core.CONFIG_DIR = base / "config"
-        core.MANIFEST = core.CONFIG_DIR / "manifest.json"
-        core.CONFIG_DIR.mkdir()
-        core.MANIFEST.write_text(json.dumps({"addons_dir": str(self.addons), "addons": {}}))
-
-        self.root = tk.Tk()
-        self.app = gui.App(self.root)
-        self.app.refresh()
-        self.pump()
-
-    def tearDown(self):
-        core.CONFIG_DIR, core.MANIFEST = self._config, self._manifest
-        self.app.stop()
-        gc.collect()
-        self.root.destroy()
-        self.tmp.cleanup()
-
-    def pump(self, times: int = 8) -> None:
-        for _ in range(times):
-            self.root.update_idletasks()
-            self.root.update()
-            self.app._drain()
 
     def rescan_reporting(self) -> list:
         shown = []
@@ -911,6 +894,175 @@ class RescanSaysWhatItSkipped(unittest.TestCase):
 
         self.assertTrue(self.rescan_reporting())
         self.assertEqual(self.rescan_reporting(), [], "a kept folder must not nag")
+
+
+
+
+class InstallingSomethingNew(WindowHarness):
+    """The Install button: an addon that is not in AddOns yet, from a link.
+
+    Everything else in the window works on folders that already exist, which
+    left "get me this addon" as the one job you still had to do by hand -- by
+    downloading and unzipping an archive correctly, which is the job this tool
+    exists to do for you.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.opened = []
+
+    def tearDown(self):
+        # Before the root goes: a dialog torn down with the interpreter still
+        # up releases its tk variables and cancels its timers, which is the
+        # whole point of its destroy().
+        for dialog in self.opened:
+            dialog.destroy()
+        super().tearDown()
+
+    def offer(self, folders):
+        def listing(spec, *, no_api=False):
+            return list(folders)
+        real = core.addons_in_repo
+        core.addons_in_repo = listing
+        self.addCleanup(lambda: setattr(core, "addons_in_repo", real))
+
+    def looked_up_dialog(self, repo, folders):
+        self.offer(folders)
+        dlg = gui.InstallDialog(self.root, self.addons, self.app.entries())
+        self.opened.append(dlg)
+        dlg.repo.set(repo)
+        dlg._absorb_url()          # what typing into the box does
+        dlg._begin_lookup()
+        for _ in range(40):
+            self.pump(2)
+            dlg._drain_lookups()
+            if dlg.looked_up or "nothing to choose" in dlg.lookup_status.cget("text"):
+                break
+        said = dlg.lookup_status.cget("text")
+        if said.startswith("could not read"):
+            self.fail(f"the repository lookup failed unexpectedly: {said!r}")
+        return dlg
+
+    # -- what the dialog decides ---------------------------------------------
+
+    def test_a_repo_holding_one_addon_installs_whole_under_the_folder_name(self):
+        # Naming the folder would switch the row off the repo's releases onto
+        # that folder's last commit, for an install of the same files.
+        dlg = self.looked_up_dialog("o/Bagnon-wotlk", ["Bagnon"])
+        self.assertEqual(dlg._plan(), [("Bagnon", "github:o/Bagnon-wotlk")])
+
+    def test_a_repo_that_is_itself_the_addon_is_named_after_the_repo(self):
+        dlg = self.looked_up_dialog("o/FrostSeek", [])
+        self.assertEqual(dlg._plan(), [("FrostSeek", "github:o/FrostSeek")])
+
+    def test_each_ticked_addon_becomes_its_own_row(self):
+        # One row per addon, never one row for the repository: a single row
+        # would install all of them whenever any one of them changed.
+        dlg = self.looked_up_dialog("o/r", ["Alpha", "Beta", "Gamma"])
+        dlg.folder_boxes["Alpha"].set(True)
+        dlg.folder_boxes["Gamma"].set(True)
+        dlg._folders_ticked()
+        self.assertEqual(dlg._plan(), [
+            ("Alpha", "github:o/r#Alpha"),
+            ("Gamma", "github:o/r#Gamma"),
+        ])
+
+    def test_a_repo_of_several_with_nothing_ticked_is_refused(self):
+        dlg = self.looked_up_dialog("o/r", ["Alpha", "Beta"])
+        shown = []
+        real = gui.messagebox.showerror
+        gui.messagebox.showerror = lambda title, message, **k: shown.append(title)
+        try:
+            dlg._install()
+        finally:
+            gui.messagebox.showerror = real
+        self.assertEqual(shown, ["Which addon?"])
+        self.assertIsNone(dlg.result)
+        self.assertTrue(dlg.winfo_exists(), "the dialog must stay open to be answered")
+
+    def test_a_branch_in_the_pasted_link_is_kept(self):
+        dlg = self.looked_up_dialog("https://github.com/o/r/tree/wotlk", [])
+        self.assertTrue(dlg.track.get())
+        self.assertEqual(dlg._plan(), [("r", "github:o/r@wotlk")])
+
+    def test_a_link_into_one_addon_of_several_installs_that_one(self):
+        dlg = self.looked_up_dialog("https://github.com/o/r/tree/main/Beta",
+                                    ["Alpha", "Beta"])
+        self.assertEqual(dlg._plan(), [("Beta", "github:o/r@main#Beta")])
+
+    def test_replacing_a_hand_installed_folder_is_said_in_advance(self):
+        (self.addons / "Bagnon").mkdir()
+        (self.addons / "Bagnon" / "Bagnon.toc").write_text("## Title: mine\n")
+        dlg = self.looked_up_dialog("o/Bagnon", ["Bagnon"])
+        self.assertIn("moved aside", dlg.caution.cget("text"))
+
+    # -- and what the window does with it ------------------------------------
+
+    def install(self, plan, installs):
+        """Press Install, with the dialog and the network both stood in for."""
+        class Fake(tk.Toplevel):
+            def __init__(inner, parent, root, entries, *, no_api=False):
+                super().__init__(parent)
+                inner.result = list(plan)
+                inner.after(1, inner.destroy)
+
+        def update_addon(name, entry, root, **kw):
+            folders = installs.get(name, [name])
+            entry["installed"] = "v1"
+            entry["folders"] = folders
+            return core.Result(name=name, outcome=core.CHANGED, version="v1", folders=folders)
+
+        real_dialog, real_update = gui.InstallDialog, core.update_addon
+        gui.InstallDialog, core.update_addon = Fake, update_addon
+        try:
+            self.app.install_addon()
+            for _ in range(200):
+                self.pump(1)
+                if self.app.worker is None:
+                    return
+            self.fail("the worker never finished")
+        finally:
+            gui.InstallDialog, core.update_addon = real_dialog, real_update
+
+    def test_installing_binds_the_row_and_fetches_it(self):
+        self.install([("Bagnon", "github:o/Bagnon")], {})
+        entry = self.app.entries()["Bagnon"]
+        self.assertEqual(entry["source"], "github:o/Bagnon")
+        self.assertEqual(entry["installed"], "v1")
+        self.assertIn("Bagnon", self.app.tree.get_children())
+
+    def test_the_row_takes_the_name_of_the_folder_that_landed(self):
+        """A row named before the archive was open is a guess, not a fact.
+
+        Left wrong, the addon shows up twice: a bound row reading "not
+        installed" beside the unmanaged row the next rescan adds for the folder
+        that is actually there.
+        """
+        self.install([("NotPlater-3.3.5", "github:o/NotPlater-3.3.5")],
+                     {"NotPlater-3.3.5": ["NotPlater"]})
+        self.assertIn("NotPlater", self.app.entries())
+        self.assertNotIn("NotPlater-3.3.5", self.app.entries())
+        self.assertEqual(self.app.entries()["NotPlater"]["installed"], "v1")
+        self.assertIn("NotPlater", self.app.tree.get_children())
+
+    def test_a_row_that_was_already_right_is_left_alone(self):
+        self.install([("Bagnon", "github:o/Bagnon")], {"Bagnon": ["Bagnon"]})
+        self.assertEqual(list(self.app.entries()), ["Bagnon"])
+
+    def test_the_button_is_off_while_a_run_is_going(self):
+        self.app.worker = _StillRunning()
+        try:
+            self.app._sync_buttons()
+            self.assertEqual(str(self.app.install_button["state"]), "disabled")
+        finally:
+            self.app.worker = None
+        self.app._sync_buttons()
+        self.assertEqual(str(self.app.install_button["state"]), "normal")
+
+
+class _StillRunning:
+    def is_alive(self):
+        return True
 
 
 if __name__ == "__main__":
