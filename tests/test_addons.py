@@ -1120,10 +1120,11 @@ class AnAccountIsNotAnAddon(unittest.TestCase):
 
 
 class OneAddonBuiltForSeveralClients(unittest.TestCase):
-    """Four shapes a "which client?" repository takes, and what each needs.
+    """The shapes a "which client?" repository takes, and what each needs.
 
-    Only one of them needs the user to choose. Getting this wrong is quiet:
-    an addon built for the wrong client is not something the game reports.
+    Two of them cannot be resolved without asking, and both used to be guessed.
+    Getting it wrong is quiet: an addon built for the wrong client is not
+    something the game reports, it just does not work.
     """
 
     def install(self, files, **kw):
@@ -1139,6 +1140,66 @@ class OneAddonBuiltForSeveralClients(unittest.TestCase):
                 "r-1a2b/MyAddon.toc": "a", "r-1a2b/MyAddon_Vanilla.toc": "b",
                 "r-1a2b/MyAddon_Wrath.toc": "c", "r-1a2b/MyAddon_Cata.toc": "d",
             }),
+            ["MyAddon"],
+        )
+
+    def test_a_toc_per_client_in_one_root_is_refused_rather_than_guessed(self):
+        """RichSteini/NotPlater, and the reason this shape is not the one above.
+
+        NotPlater-2.4.3.toc and NotPlater-3.3.5.toc share a root and share
+        every file, but there is no NotPlater.toc between them -- so neither
+        suffix is one a client resolves, and the folder must be named after the
+        one you want. Installing "all of them" would put the same addon in
+        AddOns twice under two names, only one of which is yours.
+
+        The old rule here was "shortest stem", and both stems are the same
+        length: it installed the 2.4.3 build for somebody running 3.3.5, and
+        said nothing.
+        """
+        files = {"r-1a2b/NotPlater-2.4.3.toc": "TBC",
+                 "r-1a2b/NotPlater-3.3.5.toc": "WRATH",
+                 "r-1a2b/NotPlater.lua": "core"}
+        with self.assertRaises(addons.Fail) as caught:
+            self.install(files)
+        message = str(caught.exception)
+        self.assertIn("NotPlater-2.4.3", message)
+        self.assertIn("NotPlater-3.3.5", message)
+        self.assertIn("#", message, "the message must say how to choose")
+
+    def test_naming_the_toc_installs_that_build_under_that_name(self):
+        files = {"r-1a2b/NotPlater-2.4.3.toc": "TBC",
+                 "r-1a2b/NotPlater-3.3.5.toc": "WRATH",
+                 "r-1a2b/NotPlater.lua": "core",
+                 "r-1a2b/libs-3.3.5/Ace/Ace.toc": "lib"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            written = addons.install_zip(mkzip(files), root, False, only="NotPlater-3.3.5.toc")
+            self.assertEqual(written, ["NotPlater-3.3.5"])
+            addon = root / "NotPlater-3.3.5"
+            # The whole root goes in, under the chosen name: the other client's
+            # .toc is harmless there, and the libraries are not optional.
+            self.assertEqual((addon / "NotPlater-3.3.5.toc").read_text(), "WRATH")
+            self.assertTrue((addon / "NotPlater.lua").is_file())
+            self.assertTrue((addon / "libs-3.3.5" / "Ace").is_dir())
+
+    def test_both_builds_can_be_installed_if_that_is_what_was_asked(self):
+        # Two folders, same files, one .toc each. Not something to do by
+        # accident -- which is why it takes two ticks -- and not this tool's
+        # business to refuse when it is asked for on purpose.
+        files = {"r-1a2b/NotPlater-2.4.3.toc": "TBC", "r-1a2b/NotPlater-3.3.5.toc": "WRATH"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            written = addons.install_zip(mkzip(files), root, False,
+                                         only="NotPlater-2.4.3.toc,NotPlater-3.3.5.toc")
+            self.assertEqual(sorted(written), ["NotPlater-2.4.3", "NotPlater-3.3.5"])
+            self.assertEqual((root / "NotPlater-2.4.3" / "NotPlater-2.4.3.toc").read_text(), "TBC")
+            self.assertEqual((root / "NotPlater-3.3.5" / "NotPlater-3.3.5.toc").read_text(), "WRATH")
+
+    def test_a_toc_named_after_its_folder_still_settles_it_outright(self):
+        # A release zip laid out as MyAddon/ holding MyAddon.toc and
+        # MyAddon-old.toc is not a choice: the client loads MyAddon.toc.
+        self.assertEqual(
+            self.install({"MyAddon/MyAddon.toc": "a", "MyAddon/MyAddon-2.4.3.toc": "b"}),
             ["MyAddon"],
         )
 
@@ -1368,6 +1429,38 @@ class OfferingWhatARepositoryHolds(unittest.TestCase):
         # FrostSeek, Minn-Tinkers. There is no choice to make.
         self.serve(["FrostSeek.toc", "FrostSeek_Wrath.toc", "Core.lua"])
         self.assertEqual(addons.addons_in_repo("o/r"), [])
+
+    def test_one_toc_per_client_with_no_base_is_offered_as_the_choice_it_is(self):
+        """RichSteini/NotPlater: NotPlater-2.4.3.toc and NotPlater-3.3.5.toc.
+
+        One addon, one root, and no base .toc between them -- so neither is a
+        flavour suffix any client understands, and the folder in AddOns has to
+        be named after the one you want. That is a choice, and the .toc suffix
+        in the offered name is what says so.
+        """
+        # The real repository, libraries included: it carries
+        # libs-2.4.3/LibSharedMedia-3.0/LibSharedMedia-3.0.toc, which is an
+        # addon by the letter of the rule and is nobody's answer to "which of
+        # these did you want". A .toc at the root means the whole repository is
+        # one addon and everything under it is its own.
+        self.serve(["NotPlater-2.4.3.toc", "NotPlater-3.3.5.toc", "NotPlater.lua",
+                    "libs-2.4.3/LibSharedMedia-3.0/LibSharedMedia-3.0.toc"])
+        self.assertEqual(addons.addons_in_repo("o/r"),
+                         ["NotPlater-2.4.3.toc", "NotPlater-3.3.5.toc"])
+
+    def test_a_flavour_set_is_still_not_a_choice(self):
+        # FrostSeek.toc + FrostSeek_Wrath.toc: the client picks between those
+        # itself, out of one folder named FrostSeek.
+        self.serve(["FrostSeek.toc", "FrostSeek_Wrath.toc", "FrostSeek_Cata.toc"])
+        self.assertEqual(addons.addons_in_repo("o/r"), [])
+
+    def test_the_row_a_person_already_has_pre_ticks_its_own_toc(self):
+        # Their folder is called NotPlater-3.3.5, which is exactly what
+        # NotPlater-3.3.5.toc installs as -- the suffix must not hide that.
+        offered = ["NotPlater-2.4.3.toc", "NotPlater-3.3.5.toc"]
+        self.assertEqual(addons.likely_addon("NotPlater-3.3.5", offered),
+                         "NotPlater-3.3.5.toc")
+        self.assertIsNone(addons.likely_addon("NotPlater", offered))
 
     def test_an_addon_one_level_down_is_offered(self):
         self.serve(["src/MyAddon/MyAddon.toc", "docs/readme.md"])

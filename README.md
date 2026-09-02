@@ -100,7 +100,7 @@ Running from a checkout instead needs **Python 3.9 or newer**, and that is the w
 |---|---|
 | `init <path>` | Remember where the client is. Accepts your WoW folder, its `Interface` folder, or `Interface/AddOns` itself. |
 | `scan` | Read every addon already installed and record it, guessing a source from each `.toc` where it can. Drops unmanaged rows whose folder you have deleted; keeps bound ones, flagged *not installed*. |
-| `install <repo>` | Fetch an addon you do **not** have yet and bind it in one step. Takes `owner/repo`, `owner/repo#Folder` or any github.com link; `--folder` (repeatable) picks addons out of a repository that holds several, `--branch` follows a branch instead of releases. `--reset-settings` also deletes that addon's saved variables (account and every character) once it has installed, keeping a copy of each unless you add `--no-settings-backup`. |
+| `install <repo>` | Fetch an addon you do **not** have yet and bind it in one step. Takes `owner/repo`, `owner/repo#Folder` or any github.com link; `--folder` (repeatable) picks addons out of a repository that holds several — or the `.toc` out of one that ships several, `--folder NotPlater-3.3.5.toc` — and `--branch` follows a branch instead of releases. `--reset-settings` also deletes that addon's saved variables (account and every character) once it has installed, keeping a copy of each unless you add `--no-settings-backup`. |
 | `list` | Every addon, its source, and its installed version. Bound addons first, then the rest, each alphabetically. |
 | `set <Addon> <source>` | Bind one addon to where its updates come from. |
 | `accept` | Take every source that `scan` suggested, in one go. |
@@ -187,6 +187,33 @@ the repo can be bound separately, and each then updates — and reports updates 
 Bind the repository as a whole and the tool says so once, in the run log, rather than
 leaving it to be discovered as strange behaviour later.
 
+### A repository that is one addon with a `.toc` per client
+
+[RichSteini/NotPlater](https://github.com/RichSteini/NotPlater) is one addon in one root
+holding `NotPlater-2.4.3.toc` and `NotPlater-3.3.5.toc` — TBC and Wrath, same files. There
+is no `NotPlater.toc` between them, and 3.3.5 has no notion of flavour `.toc`s at all: it
+loads `<Folder>/<Folder>.toc` and nothing else. So the folder in `AddOns` has to be **named
+after the one you want**, which makes this a question only you can answer — it is which
+client you play.
+
+Both dialogs offer the `.toc` files as tick boxes and **refuse to proceed with none
+ticked**; there is no "install all of them", because all of them would be this one addon
+installed twice over under names only one of which your client loads. Tick both anyway if
+you actually want both folders. The source records the choice:
+
+```
+addons.py install RichSteini/NotPlater --folder NotPlater-3.3.5.toc
+github:RichSteini/NotPlater#NotPlater-3.3.5.toc
+```
+
+That row still follows the repository's own releases — there is no folder to date, the
+whole repository is the addon.
+
+This is **not** the same as `FrostSeek.toc` beside `FrostSeek_Wrath.toc` and five more.
+There a base `.toc` exists that every other extends, which is the convention the client
+itself resolves out of a single folder named `FrostSeek`; splitting those would break all
+of them. Nothing is asked in that case, and nothing should be.
+
 A folder in `AddOns` is an addon when it holds a `.toc` named after itself — the rule the
 game uses, matched the way the game matches it. That match ignores case, so
 `PlayerbotManager/Playerbotmanager.toc` is an addon here exactly as it is in the client,
@@ -214,7 +241,8 @@ repository whose root *is* the addon (`repo-1a2b3c/MyAddon.toc`) all end up corr
 Addons are found wherever they sit in the archive: at the top, under GitHub's wrapper
 directory, laid out as `src/MyAddon/MyAddon.toc` beside a `docs/` folder, or as a repository
 whose root *is* the addon. An addon's own bundled libraries are never mistaken for the addon
-itself.
+itself — including a repository that is the addon and keeps its libraries beside it, where
+everything under the root belongs to the one addon at the root.
 
 ## Working on your own addon
 

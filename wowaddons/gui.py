@@ -133,8 +133,20 @@ class RepoDialog:
         """Which boxes start ticked. Nothing, unless the host knows better."""
         return set()
 
-    def _pick_message(self, count: int) -> str:
-        return f"{count} addons — tick the ones this row updates"
+    def _client_choice(self, folders: list[str]) -> bool:
+        """Is the choice on offer which .toc, rather than which addon?
+
+        A repository that IS the addon and ships one .toc per client offers
+        names, not folders -- and the choice between them is which game you
+        play, which is not a thing this tool can work out.
+        """
+        return bool(folders) and all(core.names_a_toc(folder) for folder in folders)
+
+    def _pick_message(self, folders: list[str]) -> str:
+        if self._client_choice(folders):
+            return (f"one addon, {len(folders)} .toc files — one per client. "
+                    "Tick the one yours uses")
+        return f"{len(folders)} addons — tick the ones this row updates"
 
     def _folders_ticked(self, *_a) -> None:
         """What a tick means to this dialog."""
@@ -298,7 +310,7 @@ class RepoDialog:
                 # installs exactly the same folder, and keeps its releases.
                 self._show_list(f"one addon: {folders[0]} — nothing to choose", [])
             else:
-                self._show_list(self._pick_message(len(folders)), folders)
+                self._show_list(self._pick_message(folders), folders)
         if not pending:
             self._poll_lookups()
 
@@ -651,6 +663,20 @@ class SourceDialog(RepoDialog, tk.Toplevel):
             # A branch in the pasted URL counts as asking to track it.
             branch = typed if (self.track.get() and typed) else (url_branch or "")
             folder = (self.folder.get().strip() or url_folder or "").strip("/")
+            if not folder and self._client_choice(self.looked_up):
+                # Not the same question as below. Every .toc here names the
+                # same files, so "all of them" would install this one addon
+                # two or three times over under names only one of which the
+                # client will load. There is nothing to say OK to.
+                messagebox.showerror(
+                    "Which client?",
+                    f"{repo} is one addon with {len(self.looked_up)} .toc files — one per "
+                    "client version.\n\nThe folder in AddOns has to be named after the one "
+                    "you want, so there is no sensible thing to install until you say "
+                    "which.\n\nTick the .toc your client uses.",
+                    parent=self,
+                )
+                return
             if not folder and len(self.looked_up) > 1:
                 # Saving with nothing ticked is a real choice -- it binds the
                 # whole repository -- but it is far more often an oversight, and
@@ -725,8 +751,11 @@ class InstallDialog(RepoDialog, tk.Toplevel):
         self.grab_set()
         self.repo_entry.focus_set()
 
-    def _pick_message(self, count: int) -> str:
-        return f"{count} addons — tick the ones to install"
+    def _pick_message(self, folders: list[str]) -> str:
+        if self._client_choice(folders):
+            return (f"one addon, {len(folders)} .toc files — one per client. "
+                    "Tick the one yours uses")
+        return f"{len(folders)} addons — tick the ones to install"
 
     def _build(self) -> None:
         pad = {"padx": 8, "pady": 3}
@@ -823,7 +852,11 @@ class InstallDialog(RepoDialog, tk.Toplevel):
         if self.repo is None:
             return
         if len(self.looked_up) > 1 and not self._ticked():
-            self.caution.configure(foreground="grey", text="Tick the addons you want.")
+            self.caution.configure(
+                foreground="grey",
+                text="Tick the .toc your client uses." if self._client_choice(self.looked_up)
+                     else "Tick the addons you want.",
+            )
             return
 
         lines = []
@@ -881,6 +914,16 @@ class InstallDialog(RepoDialog, tk.Toplevel):
             # nothing ticked. Installing all of them is a choice Set source
             # offers deliberately; it is not what an Install button should do
             # by default, and here it can simply be asked for instead.
+            if self._client_choice(self.looked_up):
+                messagebox.showerror(
+                    "Which client?",
+                    f"{self._spec()} is one addon with {len(self.looked_up)} .toc files — "
+                    "one per client version.\n\nThe folder in AddOns has to be named after "
+                    "the one you want, so there is no sensible thing to install until you "
+                    "say which.\n\nTick the .toc your client uses.",
+                    parent=self,
+                )
+                return
             messagebox.showerror(
                 "Which addon?",
                 f"{self._spec()} holds {len(self.looked_up)} addons.\n\n"

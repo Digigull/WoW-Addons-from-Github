@@ -37,6 +37,28 @@ following that repository's releases rather than commit ids. The row is named af
 folder that actually lands in AddOns, because that is the name the client loads and the
 name a rescan will find.
 
+**A repository that is one addon with a `.toc` per client is now a question, not a
+guess.** [NotPlater](https://github.com/RichSteini/NotPlater) is one root holding
+`NotPlater-2.4.3.toc` and `NotPlater-3.3.5.toc` — TBC and Wrath, the same files, with no
+base `.toc` between them. 3.3.5 has no notion of flavour `.toc`s at all: it loads
+`<Folder>/<Folder>.toc` and nothing else, so the folder in AddOns has to be named after the
+one you want. The old rule here was "take the shortest stem", and both stems are the same
+length — it installed the 2.4.3 build for somebody running 3.3.5, and said nothing.
+
+Both dialogs now offer the `.toc` files as tick boxes and **refuse to proceed with none
+ticked**. There is no "install all of them" for this shape, because all of them would be
+one addon installed twice over under names only one of which your client loads — tick both
+only if you want both folders. The choice is recorded as
+`github:RichSteini/NotPlater#NotPlater-3.3.5.toc`, and that row still follows the
+repository's own releases.
+
+`FrostSeek.toc` beside `FrostSeek_Wrath.toc` is deliberately **not** this: there a base
+`.toc` exists that every other extends, which is the convention the client resolves itself
+out of one folder. Nothing is asked in that case. And a repository that is the addon no
+longer offers its own bundled libraries as though they were separate addons — NotPlater
+ships `libs-2.4.3/LibSharedMedia-3.0/`, which was being listed as something you could
+choose to install.
+
 **Installing over an addon you already have asks first**, in a window that keeps two very
 different questions apart. *Make a backup* — ticked — moves the folder that is there now to
 `<Name>.replaced` instead of deleting it, and is not offered at all for a folder this tool

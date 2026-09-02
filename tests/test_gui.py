@@ -340,6 +340,46 @@ class WindowTests(WindowHarness):
         dlg._save()
         self.assertEqual(dlg.result, ("github:o/r#Main,Main_Companion", False))
 
+    def test_a_toc_per_client_repo_offers_the_tocs_and_says_why(self):
+        """RichSteini/NotPlater: one addon, two .toc files, no base between them.
+
+        The folder in AddOns has to be named after the one you want, so this is
+        a choice — and one the tool cannot make, because it is which client you
+        play. Saying "2 addons" would be a lie about what is on offer.
+        """
+        dlg = self.looked_up_dialog("Bound", "o/r",
+                                    ["NotPlater-2.4.3.toc", "NotPlater-3.3.5.toc"])
+        self.assertEqual(sorted(dlg.folder_boxes),
+                         ["NotPlater-2.4.3.toc", "NotPlater-3.3.5.toc"])
+        self.assertIn(".toc files", dlg.lookup_status.cget("text"))
+        dlg.destroy()
+
+    def test_saving_a_toc_choice_with_nothing_ticked_is_refused_outright(self):
+        # Not the "OK installs ALL of them" question: every .toc here names the
+        # same files, so all of them would install one addon twice over under
+        # names only one of which the client loads. There is nothing to say OK to.
+        dlg = self.looked_up_dialog("Bound", "o/r",
+                                    ["NotPlater-2.4.3.toc", "NotPlater-3.3.5.toc"])
+        shown = []
+        real_error, real_ask = gui.messagebox.showerror, gui.messagebox.askokcancel
+        gui.messagebox.showerror = lambda title, message, **k: shown.append(title)
+        gui.messagebox.askokcancel = lambda *a, **k: self.fail("this is not an OK/Cancel question")
+        try:
+            dlg._save()
+        finally:
+            gui.messagebox.showerror, gui.messagebox.askokcancel = real_error, real_ask
+        self.assertEqual(shown, ["Which client?"])
+        self.assertIsNone(dlg.result)
+        dlg.destroy()
+
+    def test_ticking_one_toc_binds_that_build(self):
+        dlg = self.looked_up_dialog("Bound", "o/r",
+                                    ["NotPlater-2.4.3.toc", "NotPlater-3.3.5.toc"])
+        dlg.folder_boxes["NotPlater-3.3.5.toc"].set(True)
+        dlg._folders_ticked()
+        dlg._save()
+        self.assertEqual(dlg.result, ("github:o/r#NotPlater-3.3.5.toc", False))
+
     def test_what_is_already_saved_comes_back_ticked(self):
         entry = {"source": "github:o/r#Beta", "installed": None, "folders": []}
         self.offer(["Alpha", "Beta", "Gamma"])
@@ -1059,6 +1099,31 @@ class InstallingSomethingNew(InstallHarness):
             ("Alpha", "github:o/r#Alpha"),
             ("Gamma", "github:o/r#Gamma"),
         ])
+
+    def test_a_toc_per_client_repo_plans_a_row_named_after_the_toc(self):
+        dlg = self.looked_up_dialog("o/NotPlater",
+                                    ["NotPlater-2.4.3.toc", "NotPlater-3.3.5.toc"])
+        dlg.folder_boxes["NotPlater-3.3.5.toc"].set(True)
+        dlg._folders_ticked()
+        # The row is named after the folder the client will load, and the
+        # source keeps the .toc even though only one is ticked: it is not the
+        # default install, it is one of two names for the same files.
+        self.assertEqual(dlg._plan(),
+                         [("NotPlater-3.3.5", "github:o/NotPlater#NotPlater-3.3.5.toc")])
+
+    def test_installing_a_toc_per_client_repo_needs_a_tick(self):
+        dlg = self.looked_up_dialog("o/NotPlater",
+                                    ["NotPlater-2.4.3.toc", "NotPlater-3.3.5.toc"])
+        self.assertIn("Tick the .toc your client uses", dlg.caution.cget("text"))
+        shown = []
+        real = gui.messagebox.showerror
+        gui.messagebox.showerror = lambda title, message, **k: shown.append(title)
+        try:
+            dlg._install()
+        finally:
+            gui.messagebox.showerror = real
+        self.assertEqual(shown, ["Which client?"])
+        self.assertIsNone(dlg.result)
 
     def test_a_repo_of_several_with_nothing_ticked_is_refused(self):
         dlg = self.looked_up_dialog("o/r", ["Alpha", "Beta"])
