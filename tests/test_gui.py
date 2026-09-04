@@ -448,10 +448,25 @@ class WindowTests(WindowHarness):
         self.assertEqual(dlg.result, ("github:o/r#Deep/Thing", False))
 
     def test_a_repo_that_cannot_be_read_says_so_and_does_not_block_saving(self):
-        dlg = self.looked_up_dialog("Bound", "o/r", [], error="no such repo, or it is private: o/r")
+        dlg = self.looked_up_dialog("Bound", "o/r", [], error="tripped over the cat")
         self.assertIn("could not read", dlg.lookup_status.cget("text"))
         dlg._save()
         self.assertEqual(dlg.result, ("github:o/r", False))
+
+    def test_a_message_that_already_names_the_repo_is_not_prefixed_with_it_again(self):
+        """The private-repo message is the one people actually have to read.
+
+        It names the repository and then says what to do about it. Wrapping
+        that in "could not read o/r: ..." says the name twice and pushes the
+        actionable half further from the eye, in the one dialog where somebody
+        is already stuck.
+        """
+        message = ("cannot see o/r. Either it does not exist, or it is private -- "
+                   "private repositories need a GitHub token (Sign in... in the window, "
+                   "or set GITHUB_TOKEN).")
+        dlg = self.looked_up_dialog("Bound", "o/r", [], error=message)
+        self.assertEqual(dlg.lookup_status.cget("text"), message)
+        self.assertEqual(dlg.lookup_status.cget("text").count("o/r"), 1)
 
     def test_saving_with_nothing_ticked_asks_first(self):
         """Binding the whole repository is a real choice and usually a slip.
@@ -1197,9 +1212,6 @@ class _StillRunning:
         return True
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
 
 class AskingBeforeReplacingWhatIsThere(WindowHarness):
     """The confirm dialog: replace the folder, and optionally wipe the settings.
@@ -1388,3 +1400,227 @@ class WipingSettingsAsPartOfAnInstall(InstallHarness):
                      overwrite={"keep_folder": True, "delete_saved": True,
                                 "backup_saved": False})
         self.assertEqual(self.app._pending_saved, {})
+
+
+class SigningInToGitHub(WindowHarness):
+    """The window's own answer to "it says my repository does not exist".
+
+    Before this there was nowhere in the window to put a token: it could only
+    arrive as an environment variable, which means a terminal, which is not
+    where somebody who launched this from the Start Menu is standing.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # A fake keyring, so no test touches a real one. `keyring_works` says
+        # whether this machine has somewhere better than a file to offer.
+        self.secret = {}
+        self.keyring_works = True
+
+        def secret_set(token):
+            if not self.keyring_works:
+                return False
+            self.secret["token"] = token
+            return True
+
+        for name, stub in (
+            ("secret_get", lambda: self.secret.get("token")),
+            ("secret_set", secret_set),
+            ("secret_clear", lambda: self.secret.pop("token", None)),
+            ("credential_token", lambda: None),
+        ):
+            self.addCleanup(setattr, core, name, getattr(core, name))
+            setattr(core, name, stub)
+
+        os.environ.pop("GITHUB_TOKEN", None)
+        self.addCleanup(lambda: os.environ.pop("GITHUB_TOKEN", None))
+        self.addCleanup(core.forget_cached_token)
+        core.forget_cached_token()
+
+    def dialog(self):
+        dlg = gui.SignInDialog(self.app)
+        self.opened.append(dlg)
+        self.pump()
+        return dlg
+
+    def settled_label(self) -> str:
+        """The window's GitHub label, once the background lookup has landed.
+
+        It is drawn from a worker -- asking the keyring and Git is subprocess
+        work and must not happen on the thread drawing the window -- so it
+        reads "checking…" until the answer arrives.
+        """
+        self.app._sync_github()
+        for _ in range(60):
+            self.pump(2)
+            self.app._drain_github()
+            text = self.app.github_label.cget("text")
+            if text != "checking…":
+                return text
+        self.fail("the GitHub label never settled")
+
+    # -- the label on the main window ---------------------------------------
+
+    def test_the_window_says_when_no_token_is_in_play(self):
+        self.assertIn("not signed in", self.settled_label())
+
+    def test_the_window_says_where_the_token_came_from(self):
+        """Which source is in use is the thing somebody stuck actually needs.
+
+        Signing in here and still being told the repository does not exist
+        means something different depending on whether the token being sent is
+        the one just saved or one Git had all along.
+        """
+        self.secret["token"] = "t"
+        core.forget_cached_token()
+        self.assertIn("keyring", self.settled_label())
+
+        os.environ["GITHUB_TOKEN"] = "t"
+        self.assertIn("GITHUB_TOKEN", self.settled_label())
+
+    # -- the dialog ----------------------------------------------------------
+
+    def test_saving_a_token_signs_you_in(self):
+        dlg = self.dialog()
+        dlg.token.set("github_pat_x")
+        dlg._save()
+        self.pump()
+        self.assertEqual(core.github_token(), "github_pat_x")
+        self.assertIn("keyring", dlg.state_label.cget("text"))
+
+    def test_the_typed_token_is_cleared_once_it_is_saved(self):
+        """A dialog left open should not go on holding it in a widget."""
+        dlg = self.dialog()
+        dlg.token.set("github_pat_x")
+        dlg._save()
+        self.pump()
+        self.assertEqual(dlg.token.get(), "")
+
+    def test_the_box_is_masked_until_asked_otherwise(self):
+        dlg = self.dialog()
+        self.assertEqual(dlg.entry.cget("show"), "•")
+        dlg.reveal.set(True)
+        dlg._sync_reveal()
+        self.assertEqual(dlg.entry.cget("show"), "")
+
+    def test_nothing_typed_means_nothing_to_save_or_test(self):
+        dlg = self.dialog()
+        self.assertEqual(str(dlg.save_button.cget("state")), "disabled")
+        self.assertEqual(str(dlg.test_button.cget("state")), "disabled")
+        dlg.token.set("x")
+        self.pump()
+        self.assertEqual(str(dlg.save_button.cget("state")), "normal")
+
+    def test_signing_out_removes_it(self):
+        dlg = self.dialog()
+        dlg.token.set("github_pat_x")
+        dlg._save()
+        dlg._forget()
+        self.pump()
+        self.assertIsNone(core.github_token())
+        self.assertIn("Not signed in", dlg.state_label.cget("text"))
+
+    def test_sign_out_is_offered_only_when_there_is_something_to_remove(self):
+        dlg = self.dialog()
+        self.assertEqual(str(dlg.forget_button.cget("state")), "disabled")
+        dlg.token.set("github_pat_x")
+        dlg._save()
+        self.pump()
+        self.assertEqual(str(dlg.forget_button.cget("state")), "normal")
+
+    def test_an_environment_token_cannot_be_signed_out_of_here(self):
+        """It lives in the shell that launched us; this window cannot unset it.
+
+        Greyed out rather than offered-and-ineffective: a Sign out that leaves
+        you still signed in is worse than no button.
+        """
+        os.environ["GITHUB_TOKEN"] = "t"
+        dlg = self.dialog()
+        self.assertEqual(str(dlg.forget_button.cget("state")), "disabled")
+        self.assertIn("GITHUB_TOKEN", dlg.state_label.cget("text"))
+
+    def test_no_keyring_says_so_rather_than_claiming_one(self):
+        """"Saved in your keyring" and "saved in a file" are different promises."""
+        self.keyring_works = False
+        dlg = self.dialog()
+        dlg.token.set("github_pat_x")
+        dlg._save()
+        self.pump()
+        self.assertIn("only you can read", dlg.state_label.cget("text"))
+        self.assertEqual(core.github_token(), "github_pat_x")
+
+    def test_typing_does_not_shell_out_once_per_character(self):
+        """`token_source` reaches the keyring and `git credential fill`.
+
+        Wired to the keystroke it was a subprocess per character, on the thread
+        drawing the box -- which on a machine whose credential helper is slow
+        is a text field that stops accepting text.
+        """
+        dlg = self.dialog()
+        looks = []
+        self.addCleanup(setattr, core, "token_source", core.token_source)
+        core.token_source = lambda: (looks.append(1), None)[1]
+        for count, char in enumerate("github_pat_1234567890", 1):
+            dlg.token.set(dlg.token.get() + char)
+            self.pump(1)
+            self.assertEqual(looks, [], f"looked up again after {count} characters")
+
+    def test_a_late_answer_from_an_earlier_ask_does_not_win(self):
+        """The window asks at startup and again when the dialog closes.
+
+        Both answers come back on their own worker, and the startup one --
+        computed before the person signed in -- landing second would redraw the
+        label with the state they had just changed.
+        """
+        self.app._sync_github()
+        stale = self.app._github_asked
+        self.secret["token"] = "t"
+        core.forget_cached_token()
+        self.app._sync_github()
+        # The earlier worker, answering now, out of order.
+        self.app.github.put((stale, None))
+        for _ in range(60):
+            self.pump(2)
+            self.app._drain_github()
+            if self.app.github_label.cget("text") != "checking…":
+                break
+        self.assertIn("keyring", self.app.github_label.cget("text"))
+
+    def test_closing_the_window_cancels_the_token_lookup_timer(self):
+        """A timer left armed prints `invalid command name` as the app exits."""
+        self.app._sync_github()
+        self.assertIsNotNone(self.app._github_after)
+        self.app.stop()
+        self.assertIsNone(self.app._github_after)
+
+    def test_a_bad_token_is_reported_in_the_dialog_not_raised(self):
+        """The Test button's whole job, and it must not take the window with it."""
+        self.addCleanup(setattr, core, "token_identity", core.token_identity)
+        core.token_identity = lambda token: core.die("GitHub does not recognise that token.")
+        dlg = self.dialog()
+        dlg.token.set("nope")
+        dlg._test()
+        for _ in range(40):
+            self.pump(2)
+            dlg._drain_checks()
+            if "recognise" in dlg.result_label.cget("text"):
+                break
+        self.assertIn("recognise", dlg.result_label.cget("text"))
+        self.assertEqual(str(dlg.test_button.cget("state")), "normal")
+
+    def test_a_good_token_is_reported_with_the_account_it_belongs_to(self):
+        self.addCleanup(setattr, core, "token_identity", core.token_identity)
+        core.token_identity = lambda token: "Digigull"
+        dlg = self.dialog()
+        dlg.token.set("github_pat_x")
+        dlg._test()
+        for _ in range(40):
+            self.pump(2)
+            dlg._drain_checks()
+            if "Digigull" in dlg.result_label.cget("text"):
+                break
+        self.assertIn("Digigull", dlg.result_label.cget("text"))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

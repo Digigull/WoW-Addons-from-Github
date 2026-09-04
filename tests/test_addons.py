@@ -70,9 +70,26 @@ def setUpModule():
     _real_git_refs = addons.git_refs
     addons.git_refs = lambda repo: None
 
+    # Nor may any test find a real token. `github_token` now asks the OS
+    # keyring and `git credential fill` when the environment is empty, so on a
+    # developer's own machine an unstubbed suite would shell out -- and, worse,
+    # could pick up their live GitHub token and start sending it. Both stores
+    # are pinned to "nothing saved"; the tests that are about the token put
+    # their own answer in and take it out again.
+    global _real_stored_token, _real_credential_token
+    _real_stored_token = addons.stored_token
+    _real_credential_token = addons.credential_token
+    addons.stored_token = lambda: None
+    addons.credential_token = lambda: None
+    addons.forget_cached_token()
+    os.environ.pop("GITHUB_TOKEN", None)
+
 
 def tearDownModule():
     addons.git_refs = _real_git_refs
+    addons.stored_token = _real_stored_token
+    addons.credential_token = _real_credential_token
+    addons.forget_cached_token()
 
 
 def mkzip(files: dict) -> bytes:
@@ -2022,6 +2039,316 @@ class ArchivesOffTheMeter(unittest.TestCase):
         )
         with self.assertRaises(urllib.error.HTTPError):
             addons.download("https://github.com/o/r/releases/download/v1/A.zip")
+
+
+class TheGitHubToken(unittest.TestCase):
+    """Where the token comes from, and that it only goes where it should.
+
+    A private repository is a 404 to an anonymous caller -- indistinguishable
+    from one that does not exist -- so the token is the whole difference
+    between "cannot see your addon" and "installed it". Three things are worth
+    pinning: the order the sources are asked in, that the saved copy is not
+    world-readable, and that the token is never handed to a host that is not
+    GitHub.
+    """
+
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self.scratch.cleanup)
+        self._config = addons.CONFIG_DIR
+        addons.CONFIG_DIR = pathlib.Path(self.scratch.name)
+        self.addCleanup(lambda: setattr(addons, "CONFIG_DIR", self._config))
+
+        self.secret = {}
+        self.keyring_works = True
+        self.helper_says = None
+        self.helper_calls = []
+
+        # Every name this class replaces, with what it was, captured BEFORE
+        # anything is assigned -- reading them back afterwards would record the
+        # stubs and "restore" them permanently into the rest of the suite.
+        #
+        # `stored_token` and `credential_token` are put back to the real
+        # functions setUpModule took away, because these tests are the ones
+        # that are about them; the stubbing happens one layer down, at the
+        # keyring and the credential helper, so that the code being tested is
+        # the code that ships. Nothing here may reach a real keyring, a real
+        # `git credential fill` or a real `gh`: on a developer's own machine
+        # each is a live token, and one of them would then be sent to GitHub.
+        replacements = {
+            "stored_token": _real_stored_token,
+            "credential_token": self._credential_lookup,
+            "secret_get": lambda: self.secret.get("token"),
+            "secret_set": self._secret_set,
+            "secret_clear": lambda: self.secret.pop("token", None),
+        }
+        for name, stub in replacements.items():
+            self.addCleanup(setattr, addons, name, getattr(addons, name))
+            setattr(addons, name, stub)
+
+        os.environ.pop("GITHUB_TOKEN", None)
+        self.addCleanup(lambda: os.environ.pop("GITHUB_TOKEN", None))
+        self.addCleanup(addons.forget_cached_token)
+        addons.forget_cached_token()
+
+    def _secret_set(self, token):
+        if not self.keyring_works:
+            return False
+        self.secret["token"] = token
+        return True
+
+    def _credential_lookup(self):
+        self.helper_calls.append(1)
+        return self.helper_says
+
+    # -- which source wins ---------------------------------------------------
+
+    def test_the_environment_beats_everything_saved(self):
+        """A one-off `GITHUB_TOKEN=... addons.py update` must not need a sign-out."""
+        self.secret["token"] = "saved"
+        os.environ["GITHUB_TOKEN"] = "from-the-shell"
+        self.assertEqual(addons.github_token(), "from-the-shell")
+
+    def test_the_environment_is_reread_rather_than_remembered(self):
+        os.environ["GITHUB_TOKEN"] = "first"
+        self.assertEqual(addons.github_token(), "first")
+        os.environ["GITHUB_TOKEN"] = "second"
+        self.assertEqual(addons.github_token(), "second")
+
+    def test_an_empty_environment_variable_is_not_a_token(self):
+        # Set-but-blank is how a shell profile that meant to unset it looks.
+        os.environ["GITHUB_TOKEN"] = "   "
+        self.secret["token"] = "saved"
+        self.assertEqual(addons.github_token(), "saved")
+
+    def test_the_keyring_beats_the_credential_helper(self):
+        self.secret["token"] = "saved"
+        self.helper_says = "gits"
+        self.assertEqual(addons.github_token(), "saved")
+
+    def test_git_is_asked_when_nothing_was_saved_here(self):
+        """Somebody with a private addon repo has almost certainly signed in already."""
+        self.helper_says = "gits"
+        self.assertEqual(addons.github_token(), "gits")
+
+    def test_nothing_anywhere_is_not_an_error(self):
+        self.assertIsNone(addons.github_token())
+
+    def test_the_helper_is_shelled_out_to_once_per_run(self):
+        """It is a subprocess, and an update asks for a token per request."""
+        self.helper_says = "gits"
+        for _ in range(5):
+            addons.github_token()
+        self.assertEqual(len(self.helper_calls), 1)
+
+    def test_signing_in_makes_the_stores_be_asked_again(self):
+        self.helper_says = None
+        self.assertIsNone(addons.github_token())
+        addons.save_token("fresh")
+        self.assertEqual(addons.github_token(), "fresh")
+
+    # -- where it is kept ----------------------------------------------------
+
+    def test_the_keyring_is_preferred(self):
+        self.assertEqual(addons.save_token("t"), "keyring")
+        self.assertEqual(self.secret["token"], "t")
+        self.assertFalse(addons.token_path().exists())
+
+    def test_no_keyring_falls_back_to_a_file(self):
+        """A headless Linux box with no keyring daemon is ordinary, not exotic."""
+        self.keyring_works = False
+        self.assertEqual(addons.save_token("t"), "file")
+        self.assertEqual(addons.token_path().read_text().strip(), "t")
+
+    @unittest.skipIf(os.name == "nt", "POSIX permissions")
+    def test_the_file_is_readable_only_by_its_owner(self):
+        self.keyring_works = False
+        addons.save_token("t")
+        self.assertEqual(addons.token_path().stat().st_mode & 0o777, 0o600)
+
+    def test_a_keyring_that_appears_later_does_not_leave_the_file_behind(self):
+        self.keyring_works = False
+        addons.save_token("t")
+        self.assertTrue(addons.token_path().exists())
+        self.keyring_works = True
+        addons.save_token("t")
+        self.assertFalse(addons.token_path().exists())
+
+    def test_signing_out_clears_both_stores(self):
+        self.keyring_works = False
+        addons.save_token("t")
+        self.secret["token"] = "also-here"
+        addons.forget_token()
+        self.assertEqual(self.secret, {})
+        self.assertFalse(addons.token_path().exists())
+        self.assertIsNone(addons.github_token())
+
+    def test_surrounding_whitespace_is_not_part_of_the_token(self):
+        # Copying from GitHub's page picks up a trailing newline surprisingly often.
+        addons.save_token("  t\n")
+        self.assertEqual(self.secret["token"], "t")
+
+    # -- what the window shows ----------------------------------------------
+
+    def test_the_source_is_named_without_handing_back_the_token(self):
+        self.assertIsNone(addons.token_source())
+        self.keyring_works = False
+        addons.save_token("t")
+        self.assertEqual(addons.token_source(), "file")
+        self.keyring_works = True
+        addons.save_token("t")
+        self.assertEqual(addons.token_source(), "keyring")
+        self.helper_says = "gits"
+        addons.forget_token()
+        self.assertEqual(addons.token_source(), "git")
+        os.environ["GITHUB_TOKEN"] = "shell"
+        self.assertEqual(addons.token_source(), "GITHUB_TOKEN")
+
+    # -- what a 404 is allowed to claim --------------------------------------
+
+    def test_an_anonymous_404_says_the_repo_may_be_private(self):
+        """The message people see in the Install dialog, and the fix it names."""
+        message = addons.unreadable_repo("o/r")
+        self.assertIn("o/r", message)
+        self.assertIn("private", message)
+        self.assertIn("token", message)
+
+    def test_an_authenticated_404_does_not_blame_privacy(self):
+        """With a token accepted, "it is private" is the one thing it is not.
+
+        The real cause is a fine-grained token that was never granted this
+        repository, and sending somebody off to sign in again -- which they
+        have already done -- is the worst possible advice at that point.
+        """
+        self.secret["token"] = "t"
+        message = addons.unreadable_repo("o/r")
+        self.assertNotIn("it is private", message)
+        self.assertIn("fine-grained", message)
+
+
+class WhereTheTokenIsSent(unittest.TestCase):
+    """It goes to GitHub, and it stops at GitHub.
+
+    The second half is not pedantry: downloading a private release asset means
+    being redirected to signed storage, and urllib copies every header onto the
+    redirected request. That host rejects a request carrying both its own
+    signature and an Authorization header, so forwarding it turns a correct
+    download into a 400 -- and hands a token to a machine that did not need it.
+    """
+
+    def setUp(self):
+        self.real_throttle = addons.THROTTLE
+        addons.THROTTLE = addons.Throttle(sleep=lambda _s: None, clock=lambda: 0.0)
+        addons.forget_github_state()
+        self.addCleanup(addons.forget_github_state)
+        self.addCleanup(lambda: setattr(addons, "THROTTLE", self.real_throttle))
+
+        self.sent = []
+        def fake(request, timeout=0):
+            self.sent.append(request)
+            return FakeResponse(b"PK\x03\x04", {"x-ratelimit-remaining": "50"})
+        real = addons.urllib.request.urlopen
+        addons.urllib.request.urlopen = fake
+        self.addCleanup(lambda: setattr(addons.urllib.request, "urlopen", real))
+
+        os.environ["GITHUB_TOKEN"] = "sekrit"
+        self.addCleanup(lambda: os.environ.pop("GITHUB_TOKEN", None))
+
+    def authorization(self, index=-1):
+        return self.sent[index].get_header("Authorization")
+
+    def test_codeload_is_authenticated_too(self):
+        """A private repo serves nothing from codeload anonymously.
+
+        Sending it means the free host can answer at all, instead of 404-ing
+        into the REST fallback and spending a call on every single download.
+        """
+        addons.download(addons.archive_url("o/r", "main"))
+        self.assertEqual(self.authorization(), "Bearer sekrit")
+
+    def test_the_rest_api_is_authenticated(self):
+        addons.download("https://api.github.com/repos/o/r/zipball/main")
+        self.assertEqual(self.authorization(), "Bearer sekrit")
+
+    def test_a_host_that_is_not_github_gets_nothing(self):
+        addons.fetch("https://example.invalid/some.zip")
+        self.assertIsNone(self.authorization())
+
+    def test_a_lookalike_hostname_gets_nothing(self):
+        # Matching on the parsed hostname, not on "github.com" appearing in the
+        # string -- which `github.com.evil.example` also does.
+        addons.fetch("https://github.com.evil.example/some.zip")
+        self.assertIsNone(self.authorization())
+
+    def test_an_asset_asked_for_by_id_asks_for_bytes_not_json(self):
+        """Without this the "zip" is a JSON document describing the zip."""
+        addons.download("https://api.github.com/repos/o/r/releases/assets/42")
+        self.assertEqual(self.sent[-1].get_header("Accept"), "application/octet-stream")
+
+    def test_an_ordinary_archive_does_not_ask_for_octet_stream(self):
+        addons.download(addons.archive_url("o/r", "main"))
+        self.assertIsNone(self.sent[-1].get_header("Accept"))
+
+    def test_a_redirect_off_github_drops_the_authorization_header(self):
+        handler = addons.TokenSafeRedirect()
+        request = addons.urllib.request.Request(
+            "https://api.github.com/repos/o/r/releases/assets/42",
+            headers={"Authorization": "Bearer sekrit", "User-Agent": "x"},
+        )
+        following = handler.redirect_request(
+            request, io.BytesIO(b""), 302, "Found", {},
+            "https://objects.githubusercontent.com/signed?sig=abc",
+        )
+        self.assertIsNone(following.get_header("Authorization"))
+        self.assertEqual(following.get_header("User-agent"), "x")
+
+    def test_a_redirect_within_github_keeps_it(self):
+        handler = addons.TokenSafeRedirect()
+        request = addons.urllib.request.Request(
+            "https://api.github.com/repos/o/r/zipball/main",
+            headers={"Authorization": "Bearer sekrit"},
+        )
+        following = handler.redirect_request(
+            request, io.BytesIO(b""), 302, "Found", {},
+            "https://codeload.github.com/o/r/zip/refs/heads/main",
+        )
+        self.assertEqual(following.get_header("Authorization"), "Bearer sekrit")
+
+
+class PrivateReleaseAssets(unittest.TestCase):
+    """A release asset is the one download a token in a header cannot rescue.
+
+    `browser_download_url` points at github.com and is not an authenticated
+    endpoint: for a private repository it is a 404 no matter what is sent with
+    it. The API knows the same asset by id and will serve the bytes. That costs
+    a call, so it is used when there is a token to spend -- which is also
+    exactly when the repository might be private.
+    """
+
+    def setUp(self):
+        os.environ.pop("GITHUB_TOKEN", None)
+        self.addCleanup(lambda: os.environ.pop("GITHUB_TOKEN", None))
+        addons.forget_cached_token()
+        self.addCleanup(addons.forget_cached_token)
+
+    ASSET = {
+        "name": "MyAddon.zip",
+        "browser_download_url": "https://github.com/o/r/releases/download/v1/MyAddon.zip",
+        "url": "https://api.github.com/repos/o/r/releases/assets/42",
+    }
+
+    def test_anonymously_the_free_host_is_used(self):
+        self.assertEqual(addons.asset_url(self.ASSET), self.ASSET["browser_download_url"])
+
+    def test_with_a_token_the_api_is_used_because_it_honours_one(self):
+        os.environ["GITHUB_TOKEN"] = "t"
+        self.assertEqual(addons.asset_url(self.ASSET), self.ASSET["url"])
+
+    def test_an_asset_with_no_api_url_still_downloads(self):
+        """Older cached release payloads have no `url`; they must not crash."""
+        os.environ["GITHUB_TOKEN"] = "t"
+        trimmed = {k: v for k, v in self.ASSET.items() if k != "url"}
+        self.assertEqual(addons.asset_url(trimmed), self.ASSET["browser_download_url"])
 
 
 class ARepositoryWithoutReleases(unittest.TestCase):

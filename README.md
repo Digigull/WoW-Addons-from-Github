@@ -244,6 +244,78 @@ whose root *is* the addon. An addon's own bundled libraries are never mistaken f
 itself — including a repository that is the addon and keeps its libraries beside it, where
 everything under the root belongs to the one addon at the root.
 
+## Private repositories
+
+An addon repository you have not made public is invisible to this tool until you sign in.
+GitHub answers **404** for a private repository — the same answer it gives for one that
+does not exist, because saying anything else would leak which private repositories exist —
+so the window says `cannot see owner/repo` and cannot tell you which it was.
+
+Sign in once and it works like any other source, including `#Folder` bindings, branch
+tracking and release assets.
+
+### In the window
+
+**GitHub: Sign in…**, under the WoW folder. Paste a token, press **Test** to confirm
+GitHub accepts it, then **Save**.
+
+### What kind of token
+
+A **fine-grained personal access token**, limited to the one repository:
+
+1. <https://github.com/settings/personal-access-tokens/new> (the **Open GitHub…** button
+   goes here)
+2. **Repository access** → *Only select repositories* → your addon repository
+3. **Repository permissions** → **Contents: Read-only**
+4. Set an expiry you are happy with
+
+Nothing else is needed, and nothing else should be granted. A **classic** token also works,
+but its `repo` scope grants read *and write* to every private repository you can reach —
+which is a great deal of authority to leave sitting on a gaming machine for the sake of one
+addon. Use a fine-grained one.
+
+The token is a password. This tool never asks for your GitHub username or your GitHub
+password, and there is nowhere to type them.
+
+### Where it is kept
+
+| | |
+|---|---|
+| **Linux** | your keyring, via `secret-tool` (libsecret) |
+| **macOS** | your login keychain, via `security` |
+| **Windows** | encrypted with DPAPI, keyed to your Windows account, in `%APPDATA%\wow-addons\github-token.dpapi` |
+| **no keyring** | `~/.config/wow-addons/github-token`, created `0600` — readable only by you |
+
+The window tells you which of those two happened, because "in your keyring" and "in a file
+only you can read" are different promises. **Sign out** removes it.
+
+### Without signing in at all
+
+Two other sources are used before the window's own, so it may already work:
+
+- **`GITHUB_TOKEN`** in the environment. This wins over everything saved, and is not
+  touched by *Sign out* — it belongs to the shell that launched the app. Good for a one-off
+  `GITHUB_TOKEN=… ./addons.py update`.
+- **What Git already knows.** If Git Credential Manager or `gh auth login` has a token for
+  `github.com`, it is used. Somebody with a private addon repository has usually signed in
+  once already, and being asked to paste a token they have already pasted is a poor
+  greeting.
+
+The window says which of the four is in play, which matters when a repository is *still*
+unreadable after signing in: the fix depends on whether the token being sent is the one you
+just saved or one Git had all along.
+
+### SSH keys are not supported
+
+Deploy keys are the natural per-repository read-only credential, and they only work over
+the git transport. This tool speaks HTTPS with `urllib` and never invokes `git` for a
+remote — that is why it is a single self-contained download with nothing to install. SSH
+would mean requiring `git` on the machine, and a second transport that cannot see releases
+at all ([why](#checking-without-the-api-at-all)).
+
+A fine-grained token scoped to one repository, read-only, has the same reach as a deploy
+key over the transport that is already here.
+
 ## Working on your own addon
 
 If you write addons, the loop you want is not download-a-zip-and-copy-folders. There are
@@ -343,6 +415,10 @@ Everything the terminal does, in one window:
   the saved variables first*, which is itself ticked: those are settings you made, and no
   repository anywhere has a copy. They are deleted **after** the addon installs, so a
   download that fails takes nothing with it.
+- **GitHub: Sign in…**, under the WoW folder, is where a token goes so that your private
+  repositories are visible. The line beside it says whether one is in play and which of
+  the four sources it came from — the saved one, `GITHUB_TOKEN`, or the login Git already
+  had. See [Private repositories](#private-repositories).
 - **Set source…** opens a dialog over the selected addon: a local folder (with Browse),
   a GitHub repo, an optional branch to track, an optional folder inside the repo, or
   unmanaged. Pasting a github.com link to a folder fills all three in.
@@ -483,9 +559,10 @@ Both front ends print how many calls are left after a run, and say when they are
 and why, so a pause never looks like a hang. What was learned is kept in
 `github-cache.json` beside the manifest; deleting it costs one cold run and nothing else.
 
-`GITHUB_TOKEN` is still honoured and still entirely optional — it raises the limit to 5000
-calls an hour. With the above it is rarely the thing standing between you and a finished
-update.
+A token raises the limit to 5000 calls an hour. With the above it is rarely the thing
+standing between you and a finished update — for a **public** repository it is entirely
+optional. For a **private** one it is what makes the repository visible at all; see
+[Private repositories](#private-repositories) for where to put it.
 
 An addon you are writing yourself costs nothing at all — see
 [Working on your own addon](#working-on-your-own-addon).
