@@ -2221,6 +2221,30 @@ class TheGitHubToken(unittest.TestCase):
         self.assertFalse(addons.token_path().exists())
         self.assertIsNone(addons.github_token())
 
+    def test_a_token_is_one_line_however_it_arrives(self):
+        """A two-line token would fold the second line on as another header.
+
+        Python refuses a header value containing a bare newline, but a newline
+        followed by a space or tab is legal folding and is NOT refused. A
+        trailing line left in the token file is a far likelier way to get here
+        than an attacker -- reaching it at all needs write access to the user's
+        own keyring or 0600 file -- but a token is one line by definition.
+        """
+        for arrival in ("keyring", "environment"):
+            with self.subTest(arrival):
+                addons.forget_cached_token()
+                if arrival == "keyring":
+                    os.environ.pop("GITHUB_TOKEN", None)
+                    self.secret["token"] = "github_pat_x\n X-Folded: evil"
+                else:
+                    self.secret.clear()
+                    os.environ["GITHUB_TOKEN"] = "github_pat_x\n X-Folded: evil"
+                self.assertEqual(addons.github_token(), "github_pat_x")
+
+    def test_a_blank_line_before_the_token_is_skipped(self):
+        self.secret["token"] = "\n\n  github_pat_x\n"
+        self.assertEqual(addons.github_token(), "github_pat_x")
+
     def test_surrounding_whitespace_is_not_part_of_the_token(self):
         # Copying from GitHub's page picks up a trailing newline surprisingly often.
         addons.save_token("  t\n")
@@ -2326,6 +2350,21 @@ class WhereTheTokenIsSent(unittest.TestCase):
     def test_an_ordinary_archive_does_not_ask_for_octet_stream(self):
         addons.download(addons.archive_url("o/r", "main"))
         self.assertIsNone(self.sent[-1].get_header("Accept"))
+
+    def test_a_lookalike_hostname_is_not_billed_as_an_api_call_either(self):
+        """Whether a URL is "the API" decides pacing and quota, not just the token.
+
+        Answered by a substring at first, one line above a hostname check doing
+        the same job by a stricter rule -- so a URL that merely mentioned
+        api.github.com was paced against a quota it does not spend, and could
+        be refused outright once that quota ran out.
+        """
+        addons.THROTTLE.observe({"x-ratelimit-remaining": "0",
+                                 "x-ratelimit-reset": str(int(time.time()) + 3600)})
+        self.assertTrue(addons.THROTTLE.spent())
+        # Would `die` on the exhausted quota if this counted as an API call.
+        self.assertEqual(addons.fetch("https://evil.example/x?ref=api.github.com"),
+                         b"PK\x03\x04")
 
     def test_a_redirect_off_github_drops_the_authorization_header(self):
         handler = addons.TokenSafeRedirect()

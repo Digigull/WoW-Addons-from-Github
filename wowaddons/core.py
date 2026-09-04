@@ -874,6 +874,26 @@ next download goes out anonymous, moments after somebody signed in.
 """
 
 
+def one_line(value: str | None) -> str | None:
+    """The first non-empty line of a token, or None. Every token passes through here.
+
+    A token is one line by definition, and this is the last point before it
+    becomes an `Authorization:` header. Python refuses a header value with a
+    bare newline in it -- but a newline followed by a space or tab is legal
+    header folding and is NOT refused, so a two-line token would append
+    whatever came after it to the request as another header.
+
+    Reaching that needs write access to the user's own keyring or 0600 file,
+    by which point the token is already gone, so this is tidiness rather than a
+    hole being closed. It costs one line, and a stray trailing line in that
+    file is a much likelier way to arrive here than an attacker.
+    """
+    for line in (value or "").splitlines():
+        if line.strip():
+            return line.strip()
+    return None
+
+
 def token_path() -> Path:
     """The fallback store: beside the manifest, readable only by its owner.
 
@@ -922,6 +942,21 @@ def _powershell(script: str, feed: str | None = None) -> str | None:
 
 def _dpapi_path() -> Path:
     return CONFIG_DIR / "github-token.dpapi"
+
+
+def secret_store_name() -> str:
+    """What this platform's secret store is called, for a sentence about it.
+
+    Windows has no keyring: the token is sealed with DPAPI against the Windows
+    account. Calling that "your keyring" in the one line somebody reads to find
+    out where their token went is wrong on the platform most likely to be
+    running this.
+    """
+    if on_windows():
+        return "Windows, encrypted against your account"
+    if sys.platform == "darwin":
+        return "your login keychain"
+    return "your system keyring"
 
 
 def secret_get() -> str | None:
@@ -1050,7 +1085,7 @@ def save_token(token: str) -> str:
     which one they got.
     """
     forget_cached_token()
-    token = token.strip()
+    token = one_line(token) or ""
     if secret_set(token):
         # Nothing should be left in the weaker store once the stronger one has
         # it, or signing in on a machine that gains a keyring would leave the
@@ -1153,10 +1188,10 @@ def github_token() -> str | None:
     environment directly, so that "where does the token come from" is answered
     in one place and adding a fourth source later is one edit.
     """
-    from_environment = os.environ.get("GITHUB_TOKEN")
-    if from_environment and from_environment.strip():
-        return from_environment.strip()
-    return resolve_token()[0]
+    from_environment = one_line(os.environ.get("GITHUB_TOKEN"))
+    if from_environment:
+        return from_environment
+    return one_line(resolve_token()[0])
 
 
 def forget_cached_token() -> None:
@@ -1173,7 +1208,7 @@ def token_source() -> str | None:
     Deliberately does not return the token: a status line has no business
     holding one, and this is called to draw a label.
     """
-    if (os.environ.get("GITHUB_TOKEN") or "").strip():
+    if one_line(os.environ.get("GITHUB_TOKEN")):
         return "GITHUB_TOKEN"
     return resolve_token()[1]
 
@@ -1191,7 +1226,7 @@ def token_identity(token: str) -> str:
         headers={
             "User-Agent": USER_AGENT,
             "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token.strip()}",
+            "Authorization": f"Bearer {one_line(token)}",
         },
     )
     try:
@@ -2500,7 +2535,12 @@ GITHUB_HOSTS = ("api.github.com", "codeload.github.com", "github.com")
 
 
 def authenticable(url: str) -> bool:
-    """Whether this host is GitHub, and so may be sent our token."""
+    """Whether this host is GitHub, and so may be sent our token.
+
+    The parsed hostname, never a substring of the URL: `github.com.evil.example`
+    contains "github.com", and so does `https://api.github.com@evil.example/`,
+    where the part before the @ is a username and the host is the other one.
+    """
     return urllib.parse.urlsplit(url).hostname in GITHUB_HOSTS
 
 
@@ -2534,7 +2574,7 @@ urllib.request.install_opener(urllib.request.build_opener(TokenSafeRedirect))
 
 
 def fetch(url: str, accept: str | None = None) -> bytes:
-    through_the_api = "api.github.com" in url
+    through_the_api = urllib.parse.urlsplit(url).hostname == "api.github.com"
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     token = github_token()
     if token and authenticable(url):

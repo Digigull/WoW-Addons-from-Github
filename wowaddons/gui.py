@@ -1127,7 +1127,7 @@ class SignInDialog(tk.Toplevel):
             "GITHUB_TOKEN": "Signed in — using GITHUB_TOKEN from the environment. That "
                             "wins over anything saved here, and is not changed by this "
                             "window.",
-            "keyring": "Signed in — token saved in your system keyring.",
+            "keyring": f"Signed in — token saved in {core.secret_store_name()}.",
             "file": "Signed in — token saved in a file only you can read "
                     f"({core.tilde(str(core.token_path()))}).",
             "git": "Signed in — using the token Git or the GitHub CLI already has for "
@@ -1779,7 +1779,7 @@ class App(ttk.Frame):
     LABELS = {
         None: "not signed in — public repositories only, 60 calls an hour",
         "GITHUB_TOKEN": "signed in (GITHUB_TOKEN)",
-        "keyring": "signed in (saved in your keyring)",
+        "keyring": "signed in (saved in this machine's secret store)",
         "file": "signed in (saved on this machine)",
         "git": "signed in (using Git's saved GitHub login)",
     }

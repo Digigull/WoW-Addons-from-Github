@@ -1473,7 +1473,7 @@ class SigningInToGitHub(WindowHarness):
         """
         self.secret["token"] = "t"
         core.forget_cached_token()
-        self.assertIn("keyring", self.settled_label())
+        self.assertIn("secret store", self.settled_label())
 
         os.environ["GITHUB_TOKEN"] = "t"
         self.assertIn("GITHUB_TOKEN", self.settled_label())
@@ -1486,7 +1486,9 @@ class SigningInToGitHub(WindowHarness):
         dlg._save()
         self.pump()
         self.assertEqual(core.github_token(), "github_pat_x")
-        self.assertIn("keyring", dlg.state_label.cget("text"))
+        # Named rather than spelled: the store is a keyring on Linux, a
+        # keychain on macOS and DPAPI on Windows, and the label says which.
+        self.assertIn(core.secret_store_name(), dlg.state_label.cget("text"))
 
     def test_the_typed_token_is_cleared_once_it_is_saved(self):
         """A dialog left open should not go on holding it in a widget."""
@@ -1606,7 +1608,7 @@ class SigningInToGitHub(WindowHarness):
             self.app._drain_github()
             if self.app.github_label.cget("text") != "checking…":
                 break
-        self.assertIn("keyring", self.app.github_label.cget("text"))
+        self.assertIn("secret store", self.app.github_label.cget("text"))
 
     def test_closing_the_window_cancels_the_token_lookup_timer(self):
         """A timer left armed prints `invalid command name` as the app exits."""
