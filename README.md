@@ -261,13 +261,31 @@ GitHub accepts it, then **Save**.
 
 ### What kind of token
 
-A **fine-grained personal access token**, limited to the one repository:
+A **fine-grained personal access token**, limited to the one repository.
 
-1. <https://github.com/settings/personal-access-tokens/new> (the **Open GitHub…** button
-   goes here)
-2. **Repository access** → *Only select repositories* → your addon repository
-3. **Repository permissions** → **Contents: Read-only**
-4. Set an expiry you are happy with
+**Where the page is.** <https://github.com/settings/personal-access-tokens/new> — the
+**Open GitHub…** button in the dialog opens exactly that, so you need not go looking.
+
+By hand it is genuinely hard to find:
+
+1. Your **avatar**, top right → **Settings**
+2. Left sidebar, **scroll all the way to the bottom** → **Developer settings**
+3. **Personal access tokens** → **Fine-grained tokens**
+4. **Generate new token**
+
+Step 2 is where people give up. *Developer settings* is the last item in a sidebar longer
+than the window, so it is below the fold, and it reads like a section heading rather than a
+link.
+
+**What to put on the form.**
+
+1. **Repository access** → *Only select repositories* → your addon repository
+2. **Repository permissions** → **Contents: Read-only**
+3. Set an expiry you are happy with
+
+**Metadata: Read-only** switches itself on and cannot be switched off. That is mandatory on
+every fine-grained token and is expected. The token is shown **once**, and starts
+`github_pat_`.
 
 Nothing else is needed, and nothing else should be granted. A **classic** token also works,
 but its `repo` scope grants read *and write* to every private repository you can reach —

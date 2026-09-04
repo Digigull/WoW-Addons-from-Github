@@ -1496,6 +1496,28 @@ class SigningInToGitHub(WindowHarness):
         self.pump()
         self.assertEqual(dlg.token.get(), "")
 
+    def test_the_dialog_spells_out_where_the_token_page_is(self):
+        """The button cannot help somebody who will not be sent to a browser.
+
+        And the click path is genuinely hard: Developer settings is the last
+        item in a sidebar longer than the window, so not scrolling far enough
+        is where people give up. Pinned because it is the kind of text that
+        gets trimmed for looking wordy, by which point the dialog is back to
+        naming a page nobody can find.
+        """
+        dlg = self.dialog()
+        shown = " ".join(
+            child.cget("text")
+            for frame in dlg.winfo_children()
+            for kid in frame.winfo_children()
+            for child in ([kid] + list(kid.winfo_children()))
+            if "text" in child.keys()
+        )
+        for step in ("Settings", "Developer settings", "bottom",
+                     "Personal access tokens", "Fine-grained tokens"):
+            self.assertIn(step, shown, f"the dialog no longer mentions {step!r}")
+        self.assertIn("Contents: Read-only", shown)
+
     def test_the_box_is_masked_until_asked_otherwise(self):
         dlg = self.dialog()
         self.assertEqual(dlg.entry.cget("show"), "•")

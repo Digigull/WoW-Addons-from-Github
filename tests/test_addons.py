@@ -2147,6 +2147,44 @@ class TheGitHubToken(unittest.TestCase):
         addons.save_token("fresh")
         self.assertEqual(addons.github_token(), "fresh")
 
+    def test_a_lookup_overtaken_by_a_sign_in_does_not_get_cached(self):
+        """The window resolves the token on its own thread; signing in is on another.
+
+        A lookup that began before the sign-in finishes after it, holding the
+        answer "nobody is signed in". Written to the cache, that is what the
+        next download sends -- nothing -- moments after somebody signed in and
+        was told it worked.
+        """
+        import threading
+
+        looking = threading.Event()
+        may_finish = threading.Event()
+
+        def slow_lookup():
+            # Read FIRST, then block: this stands for a keyring that was asked
+            # before the sign-in and answers after it, which is the only way to
+            # produce a genuinely stale answer. Reading after the wait would
+            # see the new token and prove nothing.
+            answer = self.secret.get("token")
+            looking.set()
+            may_finish.wait(5)
+            return answer
+
+        addons.stored_token = slow_lookup
+        answers = []
+        worker = threading.Thread(target=lambda: answers.append(addons.github_token()))
+        worker.start()
+        self.assertTrue(looking.wait(5), "the lookup never started")
+
+        # Signed in while that lookup is in flight, and only then let it finish.
+        self.secret["token"] = "fresh"
+        addons.forget_cached_token()
+        may_finish.set()
+        worker.join(5)
+
+        self.assertEqual(answers, ["fresh"])
+        self.assertEqual(addons.github_token(), "fresh")
+
     # -- where it is kept ----------------------------------------------------
 
     def test_the_keyring_is_preferred(self):

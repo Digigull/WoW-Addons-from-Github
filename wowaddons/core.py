@@ -26,6 +26,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import tempfile
 import time
 import urllib.error
@@ -860,6 +861,18 @@ _UNASKED = object()
 _token_found: object = _UNASKED
 """The non-environment answer, looked up at most once. _UNASKED until asked."""
 
+_token_lock = threading.Lock()
+_token_generation = 0
+"""Bumped by every invalidation, so a lookup that started before one can tell.
+
+The rest of this module assumes a single worker and needs no locking. This does
+not get that assumption: the window resolves the token off its own thread so
+that a slow keyring cannot freeze the UI, which puts two threads on this cache
+at once. Without the counter, a lookup that began before a sign-in can finish
+after it and write its "nobody is signed in" answer over the top -- and the
+next download goes out anonymous, moments after somebody signed in.
+"""
+
 
 def token_path() -> Path:
     """The fallback store: beside the manifest, readable only by its owner.
@@ -1103,16 +1116,34 @@ def resolve_token() -> tuple[str | None, str | None]:
     character, on the thread drawing the box.
     """
     global _token_found
-    if _token_found is _UNASKED:
-        saved = stored_token()
-        if saved:
-            # `or "file"` covers the one gap between the two calls: a keyring
-            # that answered for `stored_token` and then would not say where.
-            _token_found = (saved, stored_where() or "file")
-        else:
-            inherited = credential_token()
-            _token_found = (inherited, "git") if inherited else (None, None)
-    return _token_found  # type: ignore[return-value]
+    while True:
+        with _token_lock:
+            if _token_found is not _UNASKED:
+                return _token_found  # type: ignore[return-value]
+            began_at = _token_generation
+
+        # Outside the lock: these are subprocesses, and holding a lock across
+        # one would hand a slow keyring the power to block whatever else is
+        # asking -- which is the freeze this was threaded to avoid.
+        found = _look_up_token()
+
+        with _token_lock:
+            if began_at == _token_generation:
+                _token_found = found
+                return found
+        # Signed in or out while we were looking, so `found` describes the
+        # state before that and must not be cached or returned. Ask again.
+
+
+def _look_up_token() -> tuple[str | None, str | None]:
+    """The actual lookup, with no caching: the saved copy, else what Git has."""
+    saved = stored_token()
+    if saved:
+        # `or "file"` covers the one gap between the two calls: a keyring that
+        # answered for `stored_token` and then would not say where.
+        return saved, stored_where() or "file"
+    inherited = credential_token()
+    return (inherited, "git") if inherited else (None, None)
 
 
 def github_token() -> str | None:
@@ -1130,8 +1161,10 @@ def github_token() -> str | None:
 
 def forget_cached_token() -> None:
     """Ask the stores again next time. Called whenever the answer may have moved."""
-    global _token_found
-    _token_found = _UNASKED
+    global _token_found, _token_generation
+    with _token_lock:
+        _token_found = _UNASKED
+        _token_generation += 1
 
 
 def token_source() -> str | None:

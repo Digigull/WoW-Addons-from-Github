@@ -986,6 +986,8 @@ class SignInDialog(tk.Toplevel):
 
     VARIABLES = ("token", "reveal")
     NEW_TOKEN_URL = "https://github.com/settings/personal-access-tokens/new"
+    WRAP_WIDE = 600      # a row with the dialog to itself
+    WRAP_NARROW = 470    # a row sharing its width with the Open GitHub… button
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -1025,12 +1027,13 @@ class SignInDialog(tk.Toplevel):
         body.columnconfigure(0, weight=1)
 
         ttk.Label(
-            body, wraplength=560, justify="left",
+            body, wraplength=self.WRAP_WIDE, justify="left",
             text="A token lets this tool see your private repositories, and raises the "
                  "hourly limit from 60 GitHub calls to 5000.",
         ).grid(row=0, column=0, sticky="w", **pad)
 
-        self.state_label = ttk.Label(body, wraplength=560, justify="left", foreground="grey")
+        self.state_label = ttk.Label(body, wraplength=self.WRAP_WIDE, justify="left",
+                                     foreground="grey")
         self.state_label.grid(row=1, column=0, sticky="w", **pad)
 
         ttk.Separator(body, orient="horizontal").grid(
@@ -1039,14 +1042,34 @@ class SignInDialog(tk.Toplevel):
         steps = ttk.Frame(body)
         steps.grid(row=3, column=0, sticky="ew", padx=10)
         steps.columnconfigure(0, weight=1)
-        ttk.Label(
-            steps, wraplength=470, justify="left",
-            text="On GitHub: Fine-grained token → Only select repositories → pick your addon "
-                 "repository → Repository permissions → Contents: Read-only. Nothing else is "
-                 "needed, and nothing else should be granted.",
-        ).grid(row=0, column=0, sticky="w")
+
+        ttk.Label(steps, text="Getting a token",
+                  font=("TkDefaultFont", 10, "bold")).grid(row=0, column=0, sticky="w")
         ttk.Button(steps, text="Open GitHub…", command=self._open_github).grid(
-            row=0, column=1, sticky="ne", padx=(12, 0))
+            row=0, column=1, rowspan=2, sticky="ne", padx=(12, 0))
+        ttk.Label(steps, wraplength=self.WRAP_NARROW, justify="left",
+                  text="Open GitHub… goes straight to the page that makes one.").grid(
+            row=1, column=0, sticky="w")
+
+        # The click path spelled out, because it is genuinely hard to find and
+        # the button cannot help somebody who would rather not have a program
+        # open their browser. "Right at the bottom" is not padding: Developer
+        # settings is the last item in a sidebar longer than the window, so it
+        # is below the fold and reads as a heading rather than a link, and not
+        # scrolling far enough is where people actually give up.
+        ttk.Label(
+            steps, wraplength=self.WRAP_WIDE, justify="left", foreground="#555555",
+            text="Or by hand: your avatar (top right) → Settings → Developer settings — "
+                 "the last item in the left sidebar, right at the bottom → Personal access "
+                 "tokens → Fine-grained tokens → Generate new token.",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        ttk.Label(
+            steps, wraplength=self.WRAP_WIDE, justify="left",
+            text="On the form: Repository access → Only select repositories → your addon "
+                 "repository. Then Repository permissions → Contents: Read-only. Nothing "
+                 "else is needed, and nothing else should be granted.",
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         field = ttk.Frame(body)
         field.grid(row=4, column=0, sticky="ew", **pad)
@@ -1060,7 +1083,8 @@ class SignInDialog(tk.Toplevel):
                         command=self._sync_reveal).grid(row=0, column=2)
         self.token.trace_add("write", self._typed)
 
-        self.result_label = ttk.Label(body, wraplength=560, justify="left", foreground="grey")
+        self.result_label = ttk.Label(body, wraplength=self.WRAP_WIDE, justify="left",
+                                      foreground="grey")
         self.result_label.grid(row=5, column=0, sticky="w", **pad)
 
         buttons = ttk.Frame(body)
