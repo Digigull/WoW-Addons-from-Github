@@ -319,6 +319,11 @@ Two other sources are used before the window's own, so it may already work:
   once already, and being asked to paste a token they have already pasted is a poor
   greeting.
 
+  Both are asked about **`github.com` specifically**. If you are signed in to a GitHub
+  Enterprise server, that token is *not* picked up and never leaves your network — it
+  would be an internal credential sent somewhere with no use for it. Sign in with a
+  `github.com` token instead.
+
 The window says which of the four is in play, which matters when a repository is *still*
 unreadable after signing in: the fix depends on whether the token being sent is the one you
 just saved or one Git had all along.

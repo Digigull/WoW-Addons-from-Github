@@ -903,7 +903,8 @@ def token_path() -> Path:
     return CONFIG_DIR / "github-token"
 
 
-def _run_quiet(argv: list[str], feed: str | None = None) -> tuple[int, str]:
+def _run_quiet(argv: list[str], feed: str | None = None, *,
+               env: dict | None = None, cwd: str | None = None) -> tuple[int, str]:
     """Run a helper and return (code, stdout). Never raises, never prints.
 
     Every caller below treats any failure as "this store has no answer", which
@@ -917,6 +918,8 @@ def _run_quiet(argv: list[str], feed: str | None = None) -> tuple[int, str]:
             capture_output=True,
             text=True,
             timeout=20,
+            env=env,
+            cwd=cwd,
             # Windows would otherwise flash a console window for each of these,
             # from a GUI that has none of its own.
             **({"creationflags": 0x08000000} if on_windows() else {}),
@@ -1122,6 +1125,13 @@ def credential_token() -> str | None:
             ["git", "credential", "fill"],
             input="protocol=https\nhost=github.com\n\n",
             capture_output=True, text=True, timeout=20, env=environment,
+            # From a neutral directory. `credential.helper` is a shell command
+            # git runs, and it can be set by a REPOSITORY's own config -- so
+            # launching this from inside a checkout somebody else prepared
+            # would let that checkout choose the command. The helper worth
+            # having lives in the global or system config, which is read
+            # wherever this runs from.
+            cwd=tempfile.gettempdir(),
             **({"creationflags": 0x08000000} if on_windows() else {}),
         )
     except Exception:
@@ -1132,7 +1142,17 @@ def credential_token() -> str | None:
             if key == "password" and value.strip():
                 return value.strip()
 
-    code, out = _run_quiet(["gh", "auth", "token"])
+    # --hostname, for the same reason the request above names the host: with
+    # no host `gh` answers for whichever one it is configured for, and on a
+    # machine signed in to a GitHub Enterprise server that is the ENTERPRISE
+    # token. Adopted here it would be attached to requests to github.com --
+    # an internal credential sent across the boundary it exists to respect,
+    # by a tool that never asked for it and cannot use it. GH_HOST is dropped
+    # for the same reason: it would override the flag's intent.
+    without_host = {k: v for k, v in os.environ.items() if k != "GH_HOST"}
+    code, out = _run_quiet(
+        ["gh", "auth", "token", "--hostname", "github.com"], env=without_host
+    )
     if code == 0 and out.strip():
         return out.strip()
     return None

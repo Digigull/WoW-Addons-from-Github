@@ -2185,6 +2185,50 @@ class TheGitHubToken(unittest.TestCase):
         self.assertEqual(answers, ["fresh"])
         self.assertEqual(addons.github_token(), "fresh")
 
+    def test_the_gh_cli_is_asked_about_github_com_and_nothing_else(self):
+        """`gh auth token` with no host answers for whichever host it is set to.
+
+        On a machine signed in to a GitHub Enterprise server that is the
+        ENTERPRISE token, and adopting it here would attach an internal
+        credential to requests to github.com -- across the boundary it exists
+        to respect, by a tool that never asked for it and cannot use it. The
+        `git credential fill` call beside it has always named its host; this
+        one did not.
+        """
+        asked = []
+        self.addCleanup(setattr, addons, "_run_quiet", addons._run_quiet)
+        addons._run_quiet = lambda argv, feed=None, **kw: (asked.append((argv, kw)), (1, ""))[1]
+        os.environ["GH_HOST"] = "github.mycompany.example"
+        self.addCleanup(lambda: os.environ.pop("GH_HOST", None))
+
+        _real_credential_token()
+
+        argv, keywords = next((a, k) for a, k in asked if a and a[0] == "gh")
+        self.assertEqual(argv, ["gh", "auth", "token", "--hostname", "github.com"])
+        # And GH_HOST cannot override the flag's intent from the environment.
+        self.assertNotIn("GH_HOST", keywords["env"])
+
+    def test_git_is_asked_from_a_directory_that_owns_no_repository(self):
+        """`credential.helper` is a shell command, and a repo's config can set it.
+
+        This now runs by itself when the window opens, so the directory the app
+        happened to be launched from must not get to choose what git executes.
+        The helper worth having is in the global config, which is read wherever
+        this runs from.
+        """
+        seen = {}
+        real = addons.subprocess.run
+        def fake(argv, **kw):
+            if argv[:2] == ["git", "credential"]:
+                seen.update(kw)
+                raise OSError("not today")
+            return real(argv, **kw)
+        self.addCleanup(setattr, addons.subprocess, "run", real)
+        addons.subprocess.run = fake
+
+        _real_credential_token()
+        self.assertEqual(seen.get("cwd"), addons.tempfile.gettempdir())
+
     # -- where it is kept ----------------------------------------------------
 
     def test_the_keyring_is_preferred(self):
