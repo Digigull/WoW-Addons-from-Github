@@ -21,6 +21,55 @@ script:
 "WoW Addons from GitHub.exe" update --check
 ```
 
+## New in v1.1.0
+
+**Private repositories.** An addon repository you have not made public was invisible to
+this tool, and the window had nowhere to put the thing that fixes it. GitHub answers 404
+for a private repository — the same answer it gives for one that does not exist, because
+saying anything else would leak which private repositories exist — so the Install dialog
+said "no such repo, or it is private" and offered nothing to do about it. A token could
+only arrive as `GITHUB_TOKEN`, which means a terminal, which is not where somebody who
+launched this from the Start Menu is standing.
+
+**GitHub: Sign in…** now sits under the WoW folder, in the same shape as it: a label
+saying whether a token is in play, and a button. Which *source* the token came from is on
+that label too, because it is the thing you need when a repository is still unreadable
+after signing in — the fix depends on whether what is being sent is the token you just
+saved or one Git had all along.
+
+The dialog asks for a **fine-grained token** limited to the one repository, `Contents:
+Read-only`, and spells out where that page is: *Developer settings* is the last item in a
+sidebar longer than the window, below the fold, and reads like a section heading rather
+than a link, which is where people give up looking. **Test** asks GitHub whose token it is
+before you commit to it — a token that is merely well-formed proves nothing, and a
+fine-grained token that was never granted the repository otherwise looks like success
+until an install fails much later.
+
+Four places are asked, first answer wins: `GITHUB_TOKEN`, your system keyring (libsecret,
+the macOS keychain, or DPAPI against your Windows account), a file only you can read, and
+whatever Git or `gh` already has for `github.com`. That last one means it may simply work
+without your typing anything: somebody with a private addon repository has usually signed
+in once already. No username or password is ever asked for, and there is nowhere to type
+them.
+
+**A private release asset now downloads at all.** `browser_download_url` — the green link
+on a releases page — is not an authenticated endpoint, so no token rescues it for a
+private repository. The API knows the same asset by id and will serve the bytes. Two
+related fixes went with it: the token is no longer forwarded when a download redirects off
+GitHub to signed storage, which that host rejects outright, and codeload is authenticated
+too, so a private download no longer 404s into the REST fallback and spends a call every
+single time.
+
+**A 404 no longer guesses.** Without a token it says the repository may be private and
+names the fix. With one GitHub accepted, "it is private" is the one thing it is not — the
+likely cause is a fine-grained token that was never granted this repository, and being
+sent off to sign in again is the worst advice available at that point.
+
+SSH keys are not supported and the README says why: they only work over the git transport,
+this tool speaks HTTPS and never invokes `git` for a remote, and a deploy key's whole
+appeal — one repository, read-only — is what a fine-grained token already gives over the
+transport that is already here.
+
 ## New in v1.0.0
 
 **Install an addon you do not have yet.** Every button in the window used to work on

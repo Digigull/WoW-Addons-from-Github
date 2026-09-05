@@ -25,6 +25,8 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
+import threading
 import tempfile
 import time
 import urllib.error
@@ -824,6 +826,441 @@ def github_message(exc: urllib.error.HTTPError) -> str:
         return "no detail given"
 
 
+# ── the GitHub token ─────────────────────────────────────────────────────────
+#
+# One token does two jobs, and only the second one is new:
+#
+#   raises the rate limit   60 calls an hour becomes 5000. Optional, and the
+#                           pacing above is what makes it optional.
+#   opens a private repo    without one, a private repository is indistinguish-
+#                           able from a repository that does not exist -- which
+#                           is exactly what GitHub tells an anonymous caller,
+#                           and it is the whole reason this section exists.
+#
+# Three places are asked, in order, and the first answer wins:
+#
+#   GITHUB_TOKEN            the environment. Read fresh every time, never
+#                           stored, and it beats everything below so that a
+#                           one-off `GITHUB_TOKEN=... addons.py update` works
+#                           without disturbing what is saved.
+#   the OS secret store     what the window's sign-in button writes.
+#   git's credential helper what the machine already knows. A developer with a
+#                           private addon repo has almost certainly already
+#                           told Git Credential Manager or `gh auth login`
+#                           about it, and asking them to paste a token they
+#                           have already pasted once is a poor greeting.
+#
+# The last two are looked up once per process and remembered, because both
+# shell out and neither answer changes mid-run.
+
+TOKEN_SERVICE = "wow-addons-from-github"
+TOKEN_ACCOUNT = "github"
+
+_UNASKED = object()
+
+_token_found: object = _UNASKED
+"""The non-environment answer, looked up at most once. _UNASKED until asked."""
+
+_token_lock = threading.Lock()
+_token_generation = 0
+"""Bumped by every invalidation, so a lookup that started before one can tell.
+
+The rest of this module assumes a single worker and needs no locking. This does
+not get that assumption: the window resolves the token off its own thread so
+that a slow keyring cannot freeze the UI, which puts two threads on this cache
+at once. Without the counter, a lookup that began before a sign-in can finish
+after it and write its "nobody is signed in" answer over the top -- and the
+next download goes out anonymous, moments after somebody signed in.
+"""
+
+
+def one_line(value: str | None) -> str | None:
+    """The first non-empty line of a token, or None. Every token passes through here.
+
+    A token is one line by definition, and this is the last point before it
+    becomes an `Authorization:` header. Python refuses a header value with a
+    bare newline in it -- but a newline followed by a space or tab is legal
+    header folding and is NOT refused, so a two-line token would append
+    whatever came after it to the request as another header.
+
+    Reaching that needs write access to the user's own keyring or 0600 file,
+    by which point the token is already gone, so this is tidiness rather than a
+    hole being closed. It costs one line, and a stray trailing line in that
+    file is a much likelier way to arrive here than an attacker.
+    """
+    for line in (value or "").splitlines():
+        if line.strip():
+            return line.strip()
+    return None
+
+
+def token_path() -> Path:
+    """The fallback store: beside the manifest, readable only by its owner.
+
+    Used when no OS secret store answers -- a headless Linux box with no
+    keyring daemon is the ordinary case, not an exotic one.
+    """
+    return CONFIG_DIR / "github-token"
+
+
+def _run_quiet(argv: list[str], feed: str | None = None, *,
+               env: dict | None = None, cwd: str | None = None) -> tuple[int, str]:
+    """Run a helper and return (code, stdout). Never raises, never prints.
+
+    Every caller below treats any failure as "this store has no answer", which
+    is the correct reading of a missing binary, an absent keyring daemon, a
+    locked keychain and a user who cancelled the unlock prompt alike.
+    """
+    try:
+        result = subprocess.run(
+            argv,
+            input=feed,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env=env,
+            cwd=cwd,
+            # Windows would otherwise flash a console window for each of these,
+            # from a GUI that has none of its own.
+            **({"creationflags": 0x08000000} if on_windows() else {}),
+        )
+    except Exception:
+        return 1, ""
+    return result.returncode, result.stdout
+
+
+# -- the OS secret store -----------------------------------------------------
+#
+# Three platforms, three mechanisms, one three-function interface. Each returns
+# None or False to mean "not available here", and every caller falls through to
+# the 0600 file rather than failing.
+
+
+def _powershell(script: str, feed: str | None = None) -> str | None:
+    code, out = _run_quiet(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script], feed
+    )
+    return out.strip() if code == 0 and out.strip() else None
+
+
+def _dpapi_path() -> Path:
+    return CONFIG_DIR / "github-token.dpapi"
+
+
+def secret_store_name() -> str:
+    """What this platform's secret store is called, for a sentence about it.
+
+    Windows has no keyring: the token is sealed with DPAPI against the Windows
+    account. Calling that "your keyring" in the one line somebody reads to find
+    out where their token went is wrong on the platform most likely to be
+    running this.
+    """
+    if on_windows():
+        return "Windows, encrypted against your account"
+    if sys.platform == "darwin":
+        return "your login keychain"
+    return "your system keyring"
+
+
+def secret_get() -> str | None:
+    """The token the OS is holding for us, or None if it is not holding one."""
+    if on_windows():
+        # DPAPI rather than the Credential Manager: ConvertTo-SecureString is
+        # in stock PowerShell, and the credential cmdlets are not -- they need
+        # a module from the gallery, which is not a thing to ask of somebody
+        # who wants to update an addon. The ciphertext is keyed to this Windows
+        # account, so the file below is useless if copied off the machine.
+        blob = _dpapi_path()
+        if not blob.exists():
+            return None
+        return _powershell(
+            "$e = [Console]::In.ReadToEnd().Trim();"
+            "$s = ConvertTo-SecureString $e;"
+            "[Runtime.InteropServices.Marshal]::PtrToStringAuto("
+            "[Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))",
+            _read_quietly(blob),
+        )
+    if sys.platform == "darwin":
+        code, out = _run_quiet(
+            ["security", "find-generic-password",
+             "-s", TOKEN_SERVICE, "-a", TOKEN_ACCOUNT, "-w"]
+        )
+        return out.strip() if code == 0 and out.strip() else None
+    code, out = _run_quiet(
+        ["secret-tool", "lookup", "service", TOKEN_SERVICE, "account", TOKEN_ACCOUNT]
+    )
+    return out.strip() if code == 0 and out.strip() else None
+
+
+def secret_set(token: str) -> bool:
+    """Hand the token to the OS. False if this machine has nowhere to put it."""
+    if on_windows():
+        sealed = _powershell(
+            "$p = [Console]::In.ReadToEnd().Trim();"
+            "ConvertTo-SecureString $p -AsPlainText -Force | ConvertFrom-SecureString",
+            token,
+        )
+        if not sealed:
+            return False
+        return _write_privately(_dpapi_path(), sealed)
+    if sys.platform == "darwin":
+        # -U so that signing in twice replaces the entry rather than failing on
+        # the second attempt. The token is on the command line here because
+        # `security` offers no way to feed it in; macOS shows another user's
+        # argv only to root, and the process lives for milliseconds.
+        code, _ = _run_quiet(
+            ["security", "add-generic-password", "-U",
+             "-s", TOKEN_SERVICE, "-a", TOKEN_ACCOUNT,
+             "-l", "WoW Addons from GitHub", "-w", token]
+        )
+        return code == 0
+    # secret-tool takes the secret on stdin, which is the one of the three that
+    # never appears in a process listing.
+    code, _ = _run_quiet(
+        ["secret-tool", "store", "--label=WoW Addons from GitHub",
+         "service", TOKEN_SERVICE, "account", TOKEN_ACCOUNT],
+        token,
+    )
+    return code == 0
+
+
+def secret_clear() -> None:
+    """Forget it. Best effort: signing out must not fail because a store did."""
+    if on_windows():
+        _dpapi_path().unlink(missing_ok=True)
+        return
+    if sys.platform == "darwin":
+        _run_quiet(["security", "delete-generic-password",
+                    "-s", TOKEN_SERVICE, "-a", TOKEN_ACCOUNT])
+        return
+    _run_quiet(["secret-tool", "clear",
+                "service", TOKEN_SERVICE, "account", TOKEN_ACCOUNT])
+
+
+# -- the 0600 file, for when there is no secret store ------------------------
+
+
+def _read_quietly(path: Path) -> str | None:
+    try:
+        return path.read_text().strip() or None
+    except Exception:
+        return None
+
+
+def _write_privately(path: Path, text: str) -> bool:
+    """Write owner-only, and be owner-only from the moment the file exists.
+
+    Creating it and chmod-ing afterwards leaves a window in which the token is
+    world-readable. Opening with mode 0600 has no such window; on Windows the
+    mode is ignored, which is why the payload there is DPAPI ciphertext rather
+    than the token.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(handle, "w") as out:
+            out.write(text + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def stored_token() -> str | None:
+    """What sign-in saved, wherever it managed to save it."""
+    return secret_get() or _read_quietly(token_path())
+
+
+def stored_where() -> str | None:
+    """Which of the two saved it, for the window to say so. None if neither did."""
+    if secret_get():
+        return "keyring"
+    if _read_quietly(token_path()):
+        return "file"
+    return None
+
+
+def save_token(token: str) -> str:
+    """Keep this token for next time. Returns where it went, for the caller to say.
+
+    The plain file is not a silent consolation prize -- the window tells the
+    person which of the two happened, because "in your keyring" and "in a file
+    only you can read" are different promises and they are entitled to know
+    which one they got.
+    """
+    forget_cached_token()
+    token = one_line(token) or ""
+    if secret_set(token):
+        # Nothing should be left in the weaker store once the stronger one has
+        # it, or signing in on a machine that gains a keyring would leave the
+        # old copy behind for ever.
+        token_path().unlink(missing_ok=True)
+        return "keyring"
+    if _write_privately(token_path(), token):
+        return "file"
+    die(f"could not save the token: neither the system keyring nor {tilde(str(token_path()))} would take it")
+
+
+def forget_token() -> None:
+    """Sign out: remove it from both stores."""
+    forget_cached_token()
+    secret_clear()
+    token_path().unlink(missing_ok=True)
+
+
+# -- what the machine already knows ------------------------------------------
+
+
+def credential_token() -> str | None:
+    """A token Git or the GitHub CLI is already holding for github.com.
+
+    Read-only and non-interactive on purpose. `git credential fill` will
+    happily open a browser or a prompt if no helper can answer, which from a
+    window that has not asked for anything would be a mystery; GIT_TERMINAL_
+    PROMPT=0 turns that into a plain failure, and a plain failure here just
+    means "nothing saved", which is the truth.
+    """
+    environment = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")
+    try:
+        result = subprocess.run(
+            ["git", "credential", "fill"],
+            input="protocol=https\nhost=github.com\n\n",
+            capture_output=True, text=True, timeout=20, env=environment,
+            # From a neutral directory. `credential.helper` is a shell command
+            # git runs, and it can be set by a REPOSITORY's own config -- so
+            # launching this from inside a checkout somebody else prepared
+            # would let that checkout choose the command. The helper worth
+            # having lives in the global or system config, which is read
+            # wherever this runs from.
+            cwd=tempfile.gettempdir(),
+            **({"creationflags": 0x08000000} if on_windows() else {}),
+        )
+    except Exception:
+        result = None
+    if result is not None and result.returncode == 0:
+        for line in result.stdout.splitlines():
+            key, _, value = line.partition("=")
+            if key == "password" and value.strip():
+                return value.strip()
+
+    # --hostname, for the same reason the request above names the host: with
+    # no host `gh` answers for whichever one it is configured for, and on a
+    # machine signed in to a GitHub Enterprise server that is the ENTERPRISE
+    # token. Adopted here it would be attached to requests to github.com --
+    # an internal credential sent across the boundary it exists to respect,
+    # by a tool that never asked for it and cannot use it. GH_HOST is dropped
+    # for the same reason: it would override the flag's intent.
+    without_host = {k: v for k, v in os.environ.items() if k != "GH_HOST"}
+    code, out = _run_quiet(
+        ["gh", "auth", "token", "--hostname", "github.com"], env=without_host
+    )
+    if code == 0 and out.strip():
+        return out.strip()
+    return None
+
+
+# -- what everything above is for --------------------------------------------
+
+
+def resolve_token() -> tuple[str | None, str | None]:
+    """(token, where it came from) for the saved and inherited sources.
+
+    Cached, and deliberately not cheap to call the first time: two of the three
+    answers come from a subprocess. Both callers below went through their own
+    copy of this at first, which meant the window asked `git credential fill`
+    the same question on every keystroke in the token box -- a subprocess per
+    character, on the thread drawing the box.
+    """
+    global _token_found
+    while True:
+        with _token_lock:
+            if _token_found is not _UNASKED:
+                return _token_found  # type: ignore[return-value]
+            began_at = _token_generation
+
+        # Outside the lock: these are subprocesses, and holding a lock across
+        # one would hand a slow keyring the power to block whatever else is
+        # asking -- which is the freeze this was threaded to avoid.
+        found = _look_up_token()
+
+        with _token_lock:
+            if began_at == _token_generation:
+                _token_found = found
+                return found
+        # Signed in or out while we were looking, so `found` describes the
+        # state before that and must not be cached or returned. Ask again.
+
+
+def _look_up_token() -> tuple[str | None, str | None]:
+    """The actual lookup, with no caching: the saved copy, else what Git has."""
+    saved = stored_token()
+    if saved:
+        # `or "file"` covers the one gap between the two calls: a keyring that
+        # answered for `stored_token` and then would not say where.
+        return saved, stored_where() or "file"
+    inherited = credential_token()
+    return (inherited, "git") if inherited else (None, None)
+
+
+def github_token() -> str | None:
+    """The token to send, or None to go anonymous.
+
+    Every request in this module goes through here rather than reading the
+    environment directly, so that "where does the token come from" is answered
+    in one place and adding a fourth source later is one edit.
+    """
+    from_environment = one_line(os.environ.get("GITHUB_TOKEN"))
+    if from_environment:
+        return from_environment
+    return one_line(resolve_token()[0])
+
+
+def forget_cached_token() -> None:
+    """Ask the stores again next time. Called whenever the answer may have moved."""
+    global _token_found, _token_generation
+    with _token_lock:
+        _token_found = _UNASKED
+        _token_generation += 1
+
+
+def token_source() -> str | None:
+    """Which of the sources answered, for the window to show. None if none did.
+
+    Deliberately does not return the token: a status line has no business
+    holding one, and this is called to draw a label.
+    """
+    if one_line(os.environ.get("GITHUB_TOKEN")):
+        return "GITHUB_TOKEN"
+    return resolve_token()[1]
+
+
+def token_identity(token: str) -> str:
+    """Whose token is this? Raises Fail with GitHub's own words if it is not valid.
+
+    The point of the Test button: a token that is merely well-formed proves
+    nothing, and the failure people actually hit -- a fine-grained token that
+    was never granted this repository -- looks exactly like success until an
+    install fails much later.
+    """
+    request = urllib.request.Request(
+        "https://api.github.com/user",
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {one_line(token)}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode()).get("login") or "(unnamed)"
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            die("GitHub does not recognise that token. Check it was copied whole, and has not expired.")
+        die(f"GitHub refused the token ({exc.code}): {github_message(exc)}")
+    except urllib.error.URLError as exc:
+        die(f"could not reach GitHub: {exc.reason}")
+
+
+
 # -- pacing GitHub -----------------------------------------------------------
 #
 # GitHub allows 60 API calls an hour without a token and 5000 with one, and
@@ -1177,11 +1614,12 @@ def http_json(url: str) -> dict | None:
         request = urllib.request.Request(
             url, headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"}
         )
-        token = os.environ.get("GITHUB_TOKEN")
+        token = github_token()
         if token:
-            # Entirely optional. Unauthenticated is 60 requests/hour, which a
-            # personal addon list can still reach on a big update; set this if
-            # you do.
+            # Optional for a public repository -- unauthenticated is 60
+            # requests/hour, which a personal addon list can still reach on a
+            # big update. Required for a private one, which is invisible
+            # without it. See `github_token` for where it comes from.
             request.add_header("Authorization", f"Bearer {token}")
         if conditional:
             request.add_header("If-None-Match", known["etag"])
@@ -1382,7 +1820,7 @@ def git_refs(repo: str) -> dict | None:
         # reasonably treat it differently from a browser.
         headers={"User-Agent": "git/2.40 (wow-addons-sync)"},
     )
-    token = os.environ.get("GITHUB_TOKEN")
+    token = github_token()
     if token:
         # Basic, not Bearer: the git transport authenticates the way git does,
         # which is what makes a private repository work here at all.
@@ -1475,8 +1913,31 @@ def default_branch(repo: str) -> str:
         return found["head"]
     info = http_json(f"https://api.github.com/repos/{repo}")
     if not info:
-        die(f"no such repo, or it is private: {repo}")
+        die(unreadable_repo(repo))
     return info.get("default_branch", "master")
+
+
+def unreadable_repo(repo: str) -> str:
+    """What to say when GitHub answers 404 for a repository.
+
+    GitHub does not distinguish "no such repository" from "you may not see this
+    one" -- telling an anonymous caller which would leak the existence of every
+    private repo on the site. So both arrive here as the same 404, and the
+    message has to cover both without guessing.
+
+    What it CAN do is tell them apart on the one axis that matters: with no
+    token, "private" is a live possibility and the fix is to sign in; with a
+    token that GitHub accepted, the repository is either gone or outside what
+    that token was granted -- and a fine-grained token that simply was not
+    given this repository is the likeliest way to arrive here twice.
+    """
+    if github_token():
+        return (f"cannot see {repo}. Either it does not exist, or the GitHub token in use "
+                "was not granted access to it -- a fine-grained token has to list the "
+                "repository explicitly.")
+    return (f"cannot see {repo}. Either it does not exist, or it is private -- "
+            "private repositories need a GitHub token (Sign in… in the window, "
+            "or set GITHUB_TOKEN).")
 
 
 def latest_folder_commit(repo: str, branch: str, folder: str) -> str:
@@ -1525,6 +1986,26 @@ def archive_url(repo: str, ref: str, *, tag: bool = False) -> str:
     """
     kind = "tags" if tag else "heads"
     return f"https://codeload.github.com/{repo}/zip/refs/{kind}/{urllib.parse.quote(ref)}"
+
+
+def asset_url(asset: dict) -> str:
+    """Where to fetch a release asset from: the free host, or the API.
+
+    `browser_download_url` is the green link on the releases page. It is served
+    from github.com, costs no quota, and is the right answer -- for a PUBLIC
+    repository. For a private one it is a 404 to anybody without a session,
+    and no token in a header changes that: it is not an authenticated endpoint.
+
+    The API knows the same asset by an id, will serve the bytes for an
+    `Accept: application/octet-stream`, and honours a token. That costs one
+    call, which is why it is not simply always used. Having a token at all is
+    the signal: it means either a private repository, where this is the only
+    path that works, or a public one with 5000 calls an hour to spend, where
+    one of them is not worth a branch that only breaks in the private case.
+    """
+    if github_token() and asset.get("url"):
+        return asset["url"]
+    return asset["browser_download_url"]
 
 
 def rest_archive_url(url: str) -> str | None:
@@ -1630,7 +2111,7 @@ def latest_github(repo_spec: str) -> tuple[str, str]:
         # its wrapper directory stripped, which install_zip handles.
         for asset in release.get("assets", []):
             if asset["name"].lower().endswith(".zip"):
-                return release["tag_name"], asset["browser_download_url"]
+                return release["tag_name"], asset_url(asset)
         return release["tag_name"], archive_url(repo, release["tag_name"], tag=True)
 
     ref = default_branch(repo)
@@ -2053,8 +2534,11 @@ def download(url: str) -> bytes:
     at full speed. A release asset served from github.com is the same. Only a
     REST zipball is spent out of the hourly budget, and only that is paced.
     """
+    # A release asset asked for by id: say we want the bytes, not the JSON
+    # describing them.
+    accept = "application/octet-stream" if "/releases/assets/" in url else None
     try:
-        return fetch(url)
+        return fetch(url, accept)
     except (urllib.error.HTTPError, urllib.error.URLError):
         # codeload declining is not the end of the road: the REST API can serve
         # the same ref, for the price of a call. Silent on purpose -- which
@@ -2065,12 +2549,65 @@ def download(url: str) -> bytes:
         return fetch(fallback)
 
 
-def fetch(url: str) -> bytes:
-    through_the_api = "api.github.com" in url
+# Where an Authorization header is ours to send. Everywhere else it is either
+# useless or actively harmful -- see `TokenSafeRedirect`.
+GITHUB_HOSTS = ("api.github.com", "codeload.github.com", "github.com")
+
+
+def authenticable(url: str) -> bool:
+    """Whether this host is GitHub, and so may be sent our token.
+
+    The parsed hostname, never a substring of the URL: `github.com.evil.example`
+    contains "github.com", and so does `https://api.github.com@evil.example/`,
+    where the part before the @ is a username and the host is the other one.
+    """
+    return urllib.parse.urlsplit(url).hostname in GITHUB_HOSTS
+
+
+class TokenSafeRedirect(urllib.request.HTTPRedirectHandler):
+    """Drop the Authorization header when a redirect leaves GitHub.
+
+    Downloading a private release asset means asking the API for it and being
+    sent on to a signed URL on objects.githubusercontent.com. urllib copies
+    every header onto the redirected request, and that storage host rejects a
+    request carrying both its own signature and an Authorization header --
+    "only one auth mechanism allowed", a 400 on what is otherwise a correct
+    download. Stripping it is also the safer default in its own right: a token
+    should not be handed to a host that did not need it.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        following = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if following is not None and not authenticable(newurl):
+            # Header names are capitalised by urllib on the way in, so remove
+            # the form it actually stored rather than the one we added.
+            for name in ("Authorization", "authorization"):
+                following.headers.pop(name, None)
+        return following
+
+
+# Installed globally rather than kept as an opener of our own, so that every
+# request in this module -- the API, the git ref advertisement, downloads --
+# gets the same treatment from the same plain `urlopen` call, and so that the
+# one thing the tests replace is still the one thing every path goes through.
+urllib.request.install_opener(urllib.request.build_opener(TokenSafeRedirect))
+
+
+def fetch(url: str, accept: str | None = None) -> bytes:
+    through_the_api = urllib.parse.urlsplit(url).hostname == "api.github.com"
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    token = os.environ.get("GITHUB_TOKEN")
-    if token and through_the_api:
+    token = github_token()
+    if token and authenticable(url):
+        # codeload and github.com are included deliberately: a private
+        # repository serves neither anonymously, and sending the token means
+        # the free host can answer instead of falling through to the REST API
+        # and spending a call. If a host declines the header, `download`
+        # already falls back, so the worst case is what happened before.
         request.add_header("Authorization", f"Bearer {token}")
+    if accept is not None:
+        # A release asset URL on the API returns JSON *about* the asset unless
+        # this says otherwise. Without it the "zip" is a metadata document.
+        request.add_header("Accept", accept)
     if through_the_api:
         if THROTTLE.spent():
             die(rate_limit_message(THROTTLE.reset_at))

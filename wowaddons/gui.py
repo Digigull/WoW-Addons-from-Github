@@ -99,6 +99,11 @@ class _Worker(threading.Thread):
 # ── the half both repository dialogs share ───────────────────────────────────
 
 
+def repo_named(spec: str, message: str) -> bool:
+    """Does this message already say which repository it is about?"""
+    return spec in message or spec.split("@")[0] in message
+
+
 class RepoDialog:
     """What Set source and Install have in common: a repository box, and the
     question "what addons does this repository hold?"
@@ -295,7 +300,12 @@ class RepoDialog:
             pending = True
             self.available = list(folders)
             if error:
-                self._show_list(f"could not read {spec}: {error}", [])
+                # The engine's message usually names the repository itself --
+                # "cannot see o/r. Either it does not exist, or ...". Prefixing
+                # that with "could not read o/r:" says the name twice and
+                # pushes the half that tells you what to do off the end.
+                self._show_list(error if repo_named(spec, error)
+                                else f"could not read {spec}: {error}", [])
             elif not folders:
                 # The repository root is the addon -- FrostSeek, Minn-Tinkers.
                 # There is nothing to choose, so say so and offer no choice.
@@ -474,7 +484,8 @@ class SourceDialog(RepoDialog, tk.Toplevel):
         self.addon_list = ttk.LabelFrame(body, text="Addons in this repository")
         self.addon_list.grid(row=10, column=0, columnspan=3, sticky="ew", **pad)
         self.addon_list.grid_remove()
-        self.lookup_status = ttk.Label(self.addon_list, text="", foreground="grey")
+        self.lookup_status = ttk.Label(self.addon_list, text="", foreground="grey",
+                                       wraplength=620, justify="left")
         self.lookup_status.grid(row=0, column=0, sticky="w", padx=6, pady=(2, 4))
         self.addon_boxes = ttk.Frame(self.addon_list)
         self.addon_boxes.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 4))
@@ -787,7 +798,8 @@ class InstallDialog(RepoDialog, tk.Toplevel):
         self.addon_list = ttk.LabelFrame(body, text="Addons in this repository")
         self.addon_list.grid(row=3, column=0, columnspan=3, sticky="ew", **pad)
         self.addon_list.grid_remove()
-        self.lookup_status = ttk.Label(self.addon_list, text="", foreground="grey")
+        self.lookup_status = ttk.Label(self.addon_list, text="", foreground="grey",
+                                       wraplength=620, justify="left")
         self.lookup_status.grid(row=0, column=0, sticky="w", padx=6, pady=(2, 4))
         self.addon_boxes = ttk.Frame(self.addon_list)
         self.addon_boxes.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 4))
@@ -953,6 +965,290 @@ class InstallDialog(RepoDialog, tk.Toplevel):
 
 
 # ── the overwrite confirmation ───────────────────────────────────────────────
+
+
+class SignInDialog(tk.Toplevel):
+    """Where a GitHub token gets in, so that a private repository is visible.
+
+    Without a token GitHub answers 404 for a private repository -- the same
+    answer it gives for one that does not exist, because saying anything else
+    would leak which private repositories exist. So "could not read" was the
+    whole of the story, from a window with nowhere to put the thing that fixes
+    it. This is that place.
+
+    A fine-grained token rather than a classic one, and the wording says so
+    twice, because the difference is the entire security argument: a classic
+    token with `repo` can read and WRITE every private repository the person
+    can reach, while a fine-grained one can be limited to the single addon
+    repository, read-only, with an expiry date. Both work here. Only one of
+    them is a reasonable thing to leave saved on a gaming machine.
+    """
+
+    VARIABLES = ("token", "reveal")
+    NEW_TOKEN_URL = "https://github.com/settings/personal-access-tokens/new"
+    WRAP_WIDE = 600      # a row with the dialog to itself
+    WRAP_NARROW = 470    # a row sharing its width with the Open GitHub… button
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("GitHub sign-in")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.saved = False
+        self.checks: queue.Queue = queue.Queue()
+        self._poll_after = None
+
+        self.token = tk.StringVar()
+        self.reveal = tk.BooleanVar(value=False)
+        self.source: str | None = None
+
+        self._build()
+        self._refresh_source()
+
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.bind("<Escape>", lambda _e: self._close())
+        self._centre(parent)
+        self.wait_visibility()
+        self.grab_set()
+        self.entry.focus_set()
+
+    def _centre(self, parent) -> None:
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    # -- layout --------------------------------------------------------------
+
+    def _build(self) -> None:
+        pad = {"padx": 10, "pady": 3}
+        body = ttk.Frame(self, padding=12)
+        body.grid(sticky="nsew")
+        body.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            body, wraplength=self.WRAP_WIDE, justify="left",
+            text="A token lets this tool see your private repositories, and raises the "
+                 "hourly limit from 60 GitHub calls to 5000.",
+        ).grid(row=0, column=0, sticky="w", **pad)
+
+        self.state_label = ttk.Label(body, wraplength=self.WRAP_WIDE, justify="left",
+                                     foreground="grey")
+        self.state_label.grid(row=1, column=0, sticky="w", **pad)
+
+        ttk.Separator(body, orient="horizontal").grid(
+            row=2, column=0, sticky="ew", padx=10, pady=(10, 6))
+
+        steps = ttk.Frame(body)
+        steps.grid(row=3, column=0, sticky="ew", padx=10)
+        steps.columnconfigure(0, weight=1)
+
+        ttk.Label(steps, text="Getting a token",
+                  font=("TkDefaultFont", 10, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Button(steps, text="Open GitHub…", command=self._open_github).grid(
+            row=0, column=1, rowspan=2, sticky="ne", padx=(12, 0))
+        ttk.Label(steps, wraplength=self.WRAP_NARROW, justify="left",
+                  text="Open GitHub… goes straight to the page that makes one.").grid(
+            row=1, column=0, sticky="w")
+
+        # The click path spelled out, because it is genuinely hard to find and
+        # the button cannot help somebody who would rather not have a program
+        # open their browser. "Right at the bottom" is not padding: Developer
+        # settings is the last item in a sidebar longer than the window, so it
+        # is below the fold and reads as a heading rather than a link, and not
+        # scrolling far enough is where people actually give up.
+        ttk.Label(
+            steps, wraplength=self.WRAP_WIDE, justify="left", foreground="#555555",
+            text="Or by hand: your avatar (top right) → Settings → Developer settings — "
+                 "the last item in the left sidebar, right at the bottom → Personal access "
+                 "tokens → Fine-grained tokens → Generate new token.",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        ttk.Label(
+            steps, wraplength=self.WRAP_WIDE, justify="left",
+            text="On the form: Repository access → Only select repositories → your addon "
+                 "repository. Then Repository permissions → Contents: Read-only. Nothing "
+                 "else is needed, and nothing else should be granted.",
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        field = ttk.Frame(body)
+        field.grid(row=4, column=0, sticky="ew", **pad)
+        field.columnconfigure(1, weight=1)
+        ttk.Label(field, text="Token:").grid(row=0, column=0, sticky="w")
+        # Masked by default: this dialog gets opened in front of other people,
+        # and a token is a password however it was generated.
+        self.entry = ttk.Entry(field, textvariable=self.token, show="•", width=52)
+        self.entry.grid(row=0, column=1, sticky="ew", padx=8)
+        ttk.Checkbutton(field, text="Show", variable=self.reveal,
+                        command=self._sync_reveal).grid(row=0, column=2)
+        self.token.trace_add("write", self._typed)
+
+        self.result_label = ttk.Label(body, wraplength=self.WRAP_WIDE, justify="left",
+                                      foreground="grey")
+        self.result_label.grid(row=5, column=0, sticky="w", **pad)
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=6, column=0, sticky="e", pady=(12, 0))
+        self.forget_button = ttk.Button(buttons, text="Sign out", command=self._forget)
+        self.forget_button.grid(row=0, column=0, padx=4)
+        self.test_button = ttk.Button(buttons, text="Test", command=self._test)
+        self.test_button.grid(row=0, column=1, padx=4)
+        ttk.Button(buttons, text="Close", command=self._close).grid(row=0, column=2, padx=4)
+        self.save_button = ttk.Button(buttons, text="Save", command=self._save)
+        self.save_button.grid(row=0, column=3, padx=4)
+
+    # -- state ---------------------------------------------------------------
+
+    def _sync_reveal(self) -> None:
+        self.entry.configure(show="" if self.reveal.get() else "•")
+
+    def _typed(self, *_a) -> None:
+        self.result_label.configure(text="", foreground="grey")
+        self._sync()
+
+    def _refresh_source(self) -> None:
+        """Ask the engine where the token is coming from, and redraw.
+
+        Called when that answer can have changed -- at open, after a save,
+        after a sign-out -- and not on every keystroke: it reaches the keyring
+        and `git credential fill`, so per-character it would be a subprocess
+        per character on the thread drawing the box. The engine caches it, so
+        only the first of these costs anything.
+        """
+        self.source = core.token_source()
+        self._sync()
+
+    def _sync(self) -> None:
+        """Redraw the two things that depend on what is saved and what is typed."""
+        source = self.source
+        self.state_label.configure(text={
+            None: "Not signed in. Private repositories are invisible and you have "
+                  "60 GitHub calls an hour.",
+            "GITHUB_TOKEN": "Signed in — using GITHUB_TOKEN from the environment. That "
+                            "wins over anything saved here, and is not changed by this "
+                            "window.",
+            "keyring": f"Signed in — token saved in {core.secret_store_name()}.",
+            "file": "Signed in — token saved in a file only you can read "
+                    f"({core.tilde(str(core.token_path()))}).",
+            "git": "Signed in — using the token Git or the GitHub CLI already has for "
+                   "github.com. Nothing was saved by this tool.",
+        }[source])
+
+        typed = bool(self.token.get().strip())
+        for button in (self.test_button, self.save_button):
+            button.configure(state="normal" if typed else "disabled")
+        # Sign out clears what this tool saved. It cannot unset an environment
+        # variable in a parent shell, and must not pretend it can.
+        removable = source in ("keyring", "file")
+        self.forget_button.configure(state="normal" if removable else "disabled")
+
+    def _say(self, message: str, *, bad: bool = False) -> None:
+        self.result_label.configure(text=message, foreground="#b00020" if bad else "#0a5ea8")
+
+    # -- actions -------------------------------------------------------------
+
+    def _open_github(self) -> None:
+        import webbrowser
+
+        webbrowser.open(self.NEW_TOKEN_URL)
+        self._say("Opened GitHub in your browser. Copy the token it gives you back here — "
+                  "GitHub shows it once.")
+
+    def _test(self) -> None:
+        """Ask GitHub whose token this is, off the UI thread.
+
+        Worth a button of its own: a token that is merely well-formed proves
+        nothing, and the failure people actually hit -- a fine-grained token
+        that was never granted the repository -- otherwise stays hidden until
+        an install fails for what looks like an unrelated reason.
+        """
+        token = self.token.get().strip()
+        if not token:
+            return
+        self.test_button.configure(state="disabled")
+        self._say("Asking GitHub…")
+
+        def ask() -> None:
+            try:
+                self.checks.put((core.token_identity(token), None))
+            except Exception as exc:  # noqa: BLE001 - shown in the dialog
+                self.checks.put((None, str(exc)))
+
+        threading.Thread(target=ask, daemon=True).start()
+        self._poll_checks()
+
+    def _poll_checks(self) -> None:
+        if self._poll_after is not None:
+            self.after_cancel(self._poll_after)
+        self._poll_after = self.after(100, self._drain_checks)
+
+    def _drain_checks(self) -> None:
+        self._poll_after = None
+        if not self.winfo_exists():
+            return
+        try:
+            login, error = self.checks.get_nowait()
+        except queue.Empty:
+            self._poll_checks()
+            return
+        self.test_button.configure(state="normal")
+        if error:
+            self._say(error, bad=True)
+        else:
+            self._say(f"Works — GitHub recognises this as {login}. Save it to keep it.")
+
+    def _save(self) -> None:
+        token = self.token.get().strip()
+        if not token:
+            return
+        try:
+            where = core.save_token(token)
+        except Fail as exc:
+            self._say(str(exc), bad=True)
+            return
+        self.saved = True
+        self.token.set("")
+        self._refresh_source()
+        self._say("Saved in your system keyring." if where == "keyring"
+                  else f"Saved in {core.tilde(str(core.token_path()))}, readable only by you — "
+                       "this machine has no keyring for it.")
+
+    def _forget(self) -> None:
+        core.forget_token()
+        self.saved = True
+        self.token.set("")
+        self._refresh_source()
+        self._say("Signed out. The saved token has been removed.")
+
+    def destroy(self) -> None:
+        """Let go of the tk variables here, not in the close handler.
+
+        Same hazard as `RepoDialog.destroy`, and it has to be answered in the
+        same place. A tkinter Variable calls into the interpreter when it is
+        garbage collected; left to the collector that happens on whatever
+        thread happened to be allocating, and this dialog has a worker of its
+        own for the Test button. Collected there, Tcl raises "main thread is
+        not in main loop", and on Windows it escalates to aborting the whole
+        process with "Tcl_AsyncDelete: async handler deleted by the wrong
+        thread".
+
+        Doing it in `_close` instead covered the button and the window's X and
+        nothing else -- `destroy()` called directly, which is how a parent
+        tears its children down, went through Toplevel's and released nothing.
+        """
+        if self._poll_after is not None:
+            self.after_cancel(self._poll_after)
+            self._poll_after = None
+
+        held = [getattr(self, name, None) for name in self.VARIABLES]
+        for name in self.VARIABLES:
+            setattr(self, name, None)
+        super().destroy()
+        held.clear()  # __del__ runs now, on this thread, with Tcl still up
+
+    def _close(self) -> None:
+        self.grab_release()
+        self.destroy()
 
 
 class OverwriteDialog(tk.Toplevel):
@@ -1142,6 +1438,7 @@ class App(ttk.Frame):
         master.rowconfigure(0, weight=1)
 
         self._build()
+        self._sync_github()
         self._poll = None
         self._reschedule()
         # A first run with no WoW folder set opens straight into the picker
@@ -1175,7 +1472,8 @@ class App(ttk.Frame):
         """
         self._cancel_after(self._poll)
         self._cancel_after(self._first)
-        self._poll = self._first = None
+        self._cancel_after(self._github_after)
+        self._poll = self._first = self._github_after = None
 
     # -- layout --------------------------------------------------------------
 
@@ -1204,6 +1502,19 @@ class App(ttk.Frame):
         self.folder_label = ttk.Label(top, text="(not set)", foreground="grey")
         self.folder_label.grid(row=1, column=1, sticky="w", padx=8)
         ttk.Button(top, text="Add…", command=self.choose_folder).grid(row=1, column=2)
+
+        # Its own row under the WoW folder, in the same shape -- label, state,
+        # button -- because it is the same kind of thing: a setting that has to
+        # be right before anything else in the window can work, and which is
+        # otherwise invisible until something fails for a reason that does not
+        # name it.
+        ttk.Label(top, text="GitHub:").grid(row=2, column=0, sticky="w")
+        self.github: queue.Queue = queue.Queue()
+        self._github_after = None
+        self._github_asked = 0
+        self.github_label = ttk.Label(top, text="checking…", foreground="grey")
+        self.github_label.grid(row=2, column=1, sticky="w", padx=8)
+        ttk.Button(top, text="Sign in…", command=self.sign_in).grid(row=2, column=2)
 
         table = ttk.Frame(self)
         table.grid(row=1, column=0, sticky="nsew")
@@ -1469,6 +1780,89 @@ class App(ttk.Frame):
         self.say(f"Reading {target}…")
         self.rescan()
         self.say(f"{name}: {core.tilde(str(target))}")
+
+    def sign_in(self) -> None:
+        """Open the token dialog, and redraw once it closes.
+
+        The label is the only thing that has to change here. What a token
+        actually affects -- which repositories are visible -- is not known
+        until something is asked of GitHub, and re-checking every addon because
+        somebody opened this dialog would be an expensive surprise.
+        """
+        dialog = SignInDialog(self)
+        self.wait_window(dialog)
+        self._sync_github()
+        if getattr(dialog, "saved", False):
+            self.say("GitHub sign-in changed. Check for updates to use it.")
+
+    LABELS = {
+        None: "not signed in — public repositories only, 60 calls an hour",
+        "GITHUB_TOKEN": "signed in (GITHUB_TOKEN)",
+        "keyring": "signed in (saved in this machine's secret store)",
+        "file": "signed in (saved on this machine)",
+        "git": "signed in (using Git's saved GitHub login)",
+    }
+
+    def _sync_github(self) -> None:
+        """Say whether a token is in play, and where it came from.
+
+        Where it came from matters: somebody who signed in here and is still
+        being told a repository does not exist needs to know whether the token
+        being sent is the one they just saved or one Git had all along.
+
+        Off the UI thread, because working that out means asking the system
+        keyring and `git credential fill`, and both are subprocesses. On the
+        main thread the first one would run before the window had drawn -- a
+        startup that appears to hang for as long as somebody's credential
+        helper takes to think about it. The answer is cached in the engine, so
+        this is slow once and instant afterwards.
+        """
+        # Back to "checking…" first: this is called again after the sign-in
+        # dialog closes, and until the worker answers, the label on screen is
+        # the state from before that dialog -- which is exactly the state the
+        # person has just changed.
+        self.github_label.configure(text="checking…", foreground="grey")
+
+        # Numbered, because the answer to the previous ask may still be in
+        # flight -- the window asks once at startup and again when the sign-in
+        # dialog closes, and the startup answer landing second would redraw the
+        # label with the state from before the person signed in. Same reason
+        # the repository lookups carry the spec they were asked about.
+        self._github_asked += 1
+        asking = self._github_asked
+
+        def look() -> None:
+            try:
+                self.github.put((asking, core.token_source()))
+            except Exception:  # noqa: BLE001 - a label is not worth a crash
+                self.github.put((asking, None))
+
+        threading.Thread(target=look, daemon=True).start()
+        self._poll_github()
+
+    def _poll_github(self) -> None:
+        if self._github_after is not None:
+            self.after_cancel(self._github_after)
+        self._github_after = self.after(80, self._drain_github)
+
+    def _drain_github(self) -> None:
+        self._github_after = None
+        source = None
+        answered = False
+        while True:
+            try:
+                asked, found = self.github.get_nowait()
+            except queue.Empty:
+                break
+            if asked == self._github_asked:
+                source, answered = found, True
+        if not answered:
+            self._poll_github()
+            return
+        self.github_label.configure(
+            text=self.LABELS[source],
+            foreground="grey" if source is None else "#0a5ea8",
+        )
 
     def rescan(self) -> None:
         root = self.root_dir()
