@@ -20,6 +20,7 @@ import os
 import pathlib
 import sys
 import tempfile
+import threading
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
@@ -35,6 +36,37 @@ except Exception as exc:  # no Tk, or no $DISPLAY
 
 if tk is not None:
     from wowaddons import core, gui
+
+
+def setUpModule():
+    """No test in this file may look for a real GitHub token.
+
+    Every window resolves the token source when it opens, to draw the GitHub
+    label -- so without this, each of a hundred tests reaches the system
+    keyring and `git credential fill` on a worker thread. On Windows CI that is
+    a PowerShell process apiece, and on a developer's own machine it can find
+    their live token, which the suite would then be free to send somewhere.
+
+    Pinned to "nothing saved". The tests that are *about* the token restore the
+    real lookups and stub one layer lower, at the keyring itself.
+    """
+    if tk is None:
+        return
+    global _real_stored_token, _real_credential_token
+    _real_stored_token = core.stored_token
+    _real_credential_token = core.credential_token
+    core.stored_token = lambda: None
+    core.credential_token = lambda: None
+    core.forget_cached_token()
+    os.environ.pop("GITHUB_TOKEN", None)
+
+
+def tearDownModule():
+    if tk is None:
+        return
+    core.stored_token = _real_stored_token
+    core.credential_token = _real_credential_token
+    core.forget_cached_token()
 
 
 @unittest.skipIf(tk is None, globals().get("WHY", "no Tk"))
@@ -1424,6 +1456,10 @@ class SigningInToGitHub(WindowHarness):
             return True
 
         for name, stub in (
+            # setUpModule pinned `stored_token` to None for the rest of the
+            # file; these tests are about it, so it goes back to the real one
+            # and the stubbing happens at the keyring below it.
+            ("stored_token", _real_stored_token),
             ("secret_get", lambda: self.secret.get("token")),
             ("secret_set", secret_set),
             ("secret_clear", lambda: self.secret.pop("token", None)),
@@ -1519,6 +1555,49 @@ class SigningInToGitHub(WindowHarness):
                      "Personal access tokens", "Fine-grained tokens"):
             self.assertIn(step, shown, f"the dialog no longer mentions {step!r}")
         self.assertIn("Contents: Read-only", shown)
+
+    def test_closing_the_sign_in_dialog_releases_its_tk_variables(self):
+        """Same hazard as the other dialogs, and it needed the same answer.
+
+        Written first with the release in `_close`, which covered the Close
+        button and the window's X and nothing else: `destroy()` called
+        directly -- how a parent tears its children down, and what the harness
+        does -- went through Toplevel's and released nothing. Windows CI
+        aborted the whole run with Tcl_AsyncDelete, exactly as the older test
+        beside this one warned it would.
+        """
+        dlg = gui.SignInDialog(self.app)
+        self.pump()
+        variables = [getattr(dlg, name) for name in dlg.VARIABLES]
+        self.assertTrue(all(v is not None for v in variables), "nothing to release?")
+
+        dlg.destroy()
+        for name in dlg.VARIABLES:
+            self.assertIsNone(getattr(dlg, name), f"{name} outlived the dialog")
+
+        # Sweep on this thread first, so the collect below cannot finalise a
+        # stray variable left by an earlier test and blame it on this one.
+        gc.collect()
+        failures = []
+
+        def collect():
+            try:
+                del variables[:]
+                gc.collect()
+            except Exception as exc:  # pragma: no cover - the thing being ruled out
+                failures.append(exc)
+
+        thread = threading.Thread(target=collect)
+        thread.start()
+        thread.join()
+        self.assertEqual(failures, [])
+
+    def test_the_dialog_survives_being_destroyed_twice(self):
+        """The harness closes every dialog it opened; Close may have run already."""
+        dlg = gui.SignInDialog(self.app)
+        self.pump()
+        dlg._close()
+        dlg.destroy()
 
     def test_the_box_is_masked_until_asked_otherwise(self):
         dlg = self.dialog()

@@ -1220,16 +1220,35 @@ class SignInDialog(tk.Toplevel):
         self._refresh_source()
         self._say("Signed out. The saved token has been removed.")
 
-    def _close(self) -> None:
+    def destroy(self) -> None:
+        """Let go of the tk variables here, not in the close handler.
+
+        Same hazard as `RepoDialog.destroy`, and it has to be answered in the
+        same place. A tkinter Variable calls into the interpreter when it is
+        garbage collected; left to the collector that happens on whatever
+        thread happened to be allocating, and this dialog has a worker of its
+        own for the Test button. Collected there, Tcl raises "main thread is
+        not in main loop", and on Windows it escalates to aborting the whole
+        process with "Tcl_AsyncDelete: async handler deleted by the wrong
+        thread".
+
+        Doing it in `_close` instead covered the button and the window's X and
+        nothing else -- `destroy()` called directly, which is how a parent
+        tears its children down, went through Toplevel's and released nothing.
+        """
         if self._poll_after is not None:
             self.after_cancel(self._poll_after)
             self._poll_after = None
+
         held = [getattr(self, name, None) for name in self.VARIABLES]
         for name in self.VARIABLES:
             setattr(self, name, None)
-        self.grab_release()
         super().destroy()
-        del held
+        held.clear()  # __del__ runs now, on this thread, with Tcl still up
+
+    def _close(self) -> None:
+        self.grab_release()
+        self.destroy()
 
 
 class OverwriteDialog(tk.Toplevel):
