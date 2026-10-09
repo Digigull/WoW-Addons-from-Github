@@ -3056,7 +3056,10 @@ def read_on_disk(path: Path) -> OnDisk:
 
     Fails with the reason when there are none, so a dialog can say why.
     """
-    path = path.expanduser()
+    # Resolved, as resolve_source does, so a source planned here is the same
+    # text `set` would write. On Windows a temp path can be a short 8.3 name
+    # (C:\Users\RUNNER~1\...) that resolve() spells out.
+    path = path.expanduser().resolve()
     if path.is_file():
         if not is_zip_name(path.name) and not zipfile.is_zipfile(path):
             die(f"{path.name} is not a zip or a folder")

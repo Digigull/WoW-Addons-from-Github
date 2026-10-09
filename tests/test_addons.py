@@ -17,6 +17,8 @@ whose failure would be silent:
     you off to wait an hour for nothing
 """
 
+from __future__ import annotations
+
 import datetime
 import io
 import json
