@@ -415,6 +415,10 @@ def read_toc(toc: Path) -> dict:
     return fields
 
 
+# What follows <Folder> in <Folder>_<Flavour>.toc or <Folder>-<Flavour>.toc.
+FLAVOUR_SUFFIX = re.compile(r"^[_-][A-Za-z0-9]+\.toc$", re.I)
+
+
 def find_toc(folder: Path) -> Path | None:
     """The .toc the game would load for this folder, or None if there is none.
 
@@ -429,13 +433,24 @@ def find_toc(folder: Path) -> Path | None:
     if exact.is_file():
         return exact
     wanted = f"{folder.name.lower()}.toc"
+    flavoured = []
     try:
         for child in folder.iterdir():
             if child.name.lower() == wanted and child.is_file():
                 return child
+            stem, rest = child.name[:len(folder.name)], child.name[len(folder.name):]
+            if stem.lower() == folder.name.lower() and FLAVOUR_SUFFIX.match(rest) \
+                    and child.is_file():
+                flavoured.append(child)
     except OSError:
         pass
-    return None
+    # No base .toc, only one per client: QuestieDB/QuestieDB_Forever.toc beside
+    # _Vanilla, _Wrath and four more. A modern client loads the one carrying
+    # its own suffix, so this IS an addon -- and the scan used to call it
+    # broken and advise renaming the folder after one of them, which would
+    # have broken it for real. 3.3.5 does not read suffixes; there, a folder
+    # like this does not load whatever this says.
+    return min(flavoured, key=lambda toc: toc.name.lower()) if flavoured else None
 
 
 def guess_source(fields: dict) -> str | None:

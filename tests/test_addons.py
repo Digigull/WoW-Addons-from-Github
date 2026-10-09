@@ -3544,3 +3544,40 @@ class SeveralAddonsOutOfOneFolder(unittest.TestCase):
     def test_the_destination_named_is_the_first_pick(self):
         entry = {"source": f"local:{self.unpacked}#Questie,QuestieDB"}
         self.assertEqual(addons.install_destination(entry, "X", self.root), self.root / "Questie")
+
+
+class AFolderWithOnlyPerClientTocs(unittest.TestCase):
+    """QuestieDB ships QuestieDB_Forever.toc, _Vanilla, _Wrath... and no QuestieDB.toc.
+
+    A modern client loads the one with its own suffix. The scan called the
+    folder broken and advised renaming it after one of them -- which would
+    have broken it -- and an archive holding it installed nothing at all.
+    """
+
+    def folder(self, root, name, tocs):
+        (root / name).mkdir()
+        for toc in tocs:
+            (root / name / toc).write_text("## Title: x\n")
+        return root / name
+
+    def test_it_is_an_addon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            found = self.folder(pathlib.Path(tmp), "QuestieDB",
+                                ["QuestieDB_Vanilla.toc", "QuestieDB_Forever.toc"])
+            self.assertEqual(addons.find_toc(found).name, "QuestieDB_Forever.toc")
+            self.assertIn("QuestieDB", addons.scan_installed(pathlib.Path(tmp)))
+            self.assertEqual(addons.scan_problems(pathlib.Path(tmp)), {})
+
+    def test_a_longer_name_is_not_a_suffix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            found = self.folder(pathlib.Path(tmp), "Questie", ["QuestieDB_Vanilla.toc"])
+            self.assertIsNone(addons.find_toc(found))
+
+    def test_a_zip_holding_one_installs_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            landed = addons.install_zip(mkzip({
+                "Questie/Questie.toc": "x",
+                "QuestieDB/QuestieDB_Forever.toc": "x",
+                "QuestieDB/QuestieDB_Vanilla.toc": "x",
+            }), pathlib.Path(tmp), dry_run=False)
+            self.assertEqual(sorted(landed), ["Questie", "QuestieDB"])
