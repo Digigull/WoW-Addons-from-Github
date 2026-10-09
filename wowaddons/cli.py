@@ -17,6 +17,7 @@ EPILOG = """\
     addons.py init ~/Games/Ascension
     addons.py scan
     addons.py install owner/repo
+    addons.py install ~/Downloads/Questie-v11.0.0.zip
     addons.py set GnomeWorks local:.
     addons.py set SomeAddon github:owner/repo
     addons.py set OneOfMany github:owner/repo#OneOfMany
@@ -63,6 +64,11 @@ Sources:
                       `git pull` the entire update: nothing to re-copy, and the
                       client can never be running something other than what is
                       checked out. `--copy` if you would rather have real files.
+  local:<path>#A,B    several addons out of one folder -- an addon and the
+                      companion folder it ships with -- linked as one row
+  zip:<file.zip>      a zip you downloaded yourself, from a site this tool does
+                      not fetch from. Unpacked into AddOns, companion folders
+                      and all; installing a newer download is the update.
   github:owner/repo   latest GitHub release, preferring an attached .zip and
                       falling back to the source archive
   github:owner/repo@branch   that branch's current head instead of a release
@@ -215,7 +221,11 @@ def cmd_set(args, state: dict) -> None:
     step(f"{args.addon} -> {core.tilde(entry['source'])}")
     # The folder's own name is what lands in AddOns, not the name you typed --
     # the client matches folder to .toc, so renaming on the way in would break it.
-    if local_path is not None and local_path.name != args.addon:
+    picks = core.split_local_spec(entry["source"].split(":", 1)[1])[1] \
+        if entry["source"].startswith(("local:", "zip:")) else None
+    if picks:
+        note(f"installs {picks.replace(',', ', ')} from there, as one row.")
+    elif local_path is not None and local_path.name != args.addon:
         warn(f"that folder is named {local_path.name}, so it installs as that, not as {args.addon}.")
     if local_path is not None and entry["mode"] == "link":
         note("linked, so `git pull` in that folder is the whole update.")
@@ -236,6 +246,11 @@ def cmd_install(args, state: dict) -> None:
     install = selected(args, state)
     root = core.addons_dir(install)  # fails now, rather than after the download
     no_api = args.no_api or core.checks_without_api(install)
+
+    on_disk = Path(core.split_local_spec(args.repo)[0]).expanduser()
+    if on_disk.exists() or core.is_zip_name(on_disk.name):
+        install_from_disk(args, state, install, root)
+        return
 
     found = core.parse_repo(args.repo)
     if found is None:
@@ -273,14 +288,46 @@ def cmd_install(args, state: dict) -> None:
         core.set_source(install, name, source)
         note(f"{name} -> {core.tilde(source)}")
     core.save(state)
+    run_install(args, state, install, root, plan)
 
+
+def install_from_disk(args, state: dict, install: dict, root: Path) -> None:
+    """`install` given a zip you downloaded, or a folder you unpacked.
+
+    Everything in it by default -- a download is the addon AND whatever
+    companion folders it ships with, and leaving one behind is the mistake
+    this exists to stop. --folder narrows it, as it does for a repository.
+    """
+    path_text, url_folder = core.split_local_spec(args.repo)
+    found = core.read_on_disk(Path(path_text))
+    step(f"Reading {found.path.name}")
+    chosen = core.wanted_folders(",".join(args.folder)) or core.wanted_folders(url_folder)
+    if not chosen and found.client_choice:
+        note(f"one addon with {len(found.picks)} .toc files, one per client:")
+        for pick in found.picks:
+            note(f"    {pick}")
+        core.die(f"name the one your client uses:  --folder {found.picks[0]}")
+    plan = core.disk_install_plan(found, chosen or found.picks)
+    name, source = plan
+    # A folder you unpacked is copied, not linked: the download folder is
+    # somewhere people tidy, and a link into it would vanish with it.
+    copy = found.kind == "local" and not args.link
+    core.set_source(install, name, source, copy=copy)
+    note(f"{name} -> {core.tilde(source)}")
+    if len(chosen or found.picks) > 1:
+        note(f"installs {', '.join(chosen or found.picks)} together, as one row")
+    core.save(state)
+    run_install(args, state, install, root, [plan], force=True)
+
+
+def run_install(args, state: dict, install: dict, root: Path, plan, *, force: bool = False) -> None:
     # The same run `update` does, rather than a second copy of it that could
     # come to disagree about backups, pacing or what counts as a failure.
     try:
         cmd_update(
             argparse.Namespace(
                 addons=[name for name, _ in plan], install=args.install,
-                check=False, dry_run=False, force=False, no_api=args.no_api,
+                check=False, dry_run=False, force=force, no_api=args.no_api,
             ),
             state,
         )
@@ -468,7 +515,8 @@ def build_parser(prog: str = "addons.py", epilog: str | None = None) -> argparse
 
     p = targeted("set", help="bind one addon to a source")
     p.add_argument("addon")
-    p.add_argument("source", help="local:/path | github:owner/repo | github:owner/repo@branch | unmanaged")
+    p.add_argument("source", help="local:/path | local:/path#A,B | zip:/path.zip | "
+                                  "github:owner/repo | github:owner/repo@branch | unmanaged")
     p.add_argument("--copy", action="store_true", help="copy real files instead of symlinking (local: only)")
     # A folder this tool installed is replaced without a copy either way; these
     # only decide what happens to files it did not put there.
@@ -490,10 +538,13 @@ def build_parser(prog: str = "addons.py", epilog: str | None = None) -> argparse
                    help="check without the GitHub API: follows branches, not releases")
     p.set_defaults(func=cmd_update)
 
-    p = targeted("install", help="install an addon you do not have yet, from a repository")
-    p.add_argument("repo", help="owner/repo, owner/repo#Folder, or a github.com link")
+    p = targeted("install", help="install an addon you do not have yet, from a repository or a zip")
+    p.add_argument("repo", help="owner/repo, owner/repo#Folder, a github.com link, "
+                                "or a .zip / folder on this disk")
     p.add_argument("--folder", action="append", default=[], metavar="NAME",
-                   help="which addon in the repository (repeatable)")
+                   help="which addon in the repository or zip (repeatable)")
+    p.add_argument("--link", action="store_true",
+                   help="for a folder on disk: link to it instead of copying it")
     p.add_argument("--branch", help="track this branch instead of the latest release")
     p.add_argument("--reset-settings", action="store_true",
                    help="afterwards, delete this addon's saved variables in WTF "

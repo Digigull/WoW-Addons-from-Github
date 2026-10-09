@@ -3329,3 +3329,218 @@ class TheSettingsInTheWtfFolder(unittest.TestCase):
         self.assertEqual(deleted, [])
         self.assertEqual(len(problems), 1)
         self.assertIn("Bagnon.lua", problems[0])
+
+
+class AZipYouDownloadedYourself(unittest.TestCase):
+    """A zip from a site this tool does not fetch from, installed from disk.
+
+    CurseForge serves its downloads through its own page, which is how its
+    authors get paid, so this tool does not go round it. Downloading there and
+    handing the zip over still beats unzipping by hand -- and Questie is why
+    "the whole zip" matters: it ships as the addon AND a companion folder, and
+    installing only the folder named after the row left it broken.
+    """
+
+    QUESTIE = {
+        "Questie/Questie.toc": "## Title: Questie\n## Version: 11.0.0\n",
+        "Questie/Questie.lua": "-- addon",
+        "QuestieDB/QuestieDB.toc": "## Title: Questie DB\n## Dependencies: Questie\n",
+        "QuestieDB/db.lua": "-- data",
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = pathlib.Path(self.tmp.name)
+        self.root = self.base / "AddOns"
+        self.root.mkdir()
+        self.downloads = self.base / "Downloads"
+        self.downloads.mkdir()
+        self.state = addons.migrate(addons.blank_install())
+        self.install = addons.current(self.state)
+        self.install["addons_dir"] = str(self.root)
+
+    def download(self, name: str, files: dict | None = None) -> pathlib.Path:
+        path = self.downloads / name
+        path.write_bytes(mkzip(files or self.QUESTIE))
+        return path
+
+    def bind(self, path: pathlib.Path) -> tuple[str, dict]:
+        found = addons.read_on_disk(path)
+        name, source = addons.disk_install_plan(found, found.picks)
+        entry, _ = addons.set_source(self.install, name, source)
+        return name, entry
+
+    def test_the_whole_zip_is_one_row_named_after_the_addon(self):
+        name, entry = self.bind(self.download("Questie-v11.0.0.zip"))
+        # Named after the folder the other one depends on, not the zip.
+        self.assertEqual(name, "Questie")
+        result = addons.update_addon(name, entry, self.root)
+        self.assertEqual(result.outcome, addons.CHANGED, result.detail)
+        self.assertEqual(sorted(result.folders), ["Questie", "QuestieDB"])
+        for folder in ("Questie", "QuestieDB"):
+            self.assertTrue((self.root / folder / f"{folder}.toc").is_file())
+
+    def test_the_same_zip_again_is_up_to_date_and_a_newer_one_is_not(self):
+        name, entry = self.bind(self.download("Questie-v11.0.0.zip"))
+        addons.update_addon(name, entry, self.root)
+        self.assertEqual(addons.update_addon(name, entry, self.root).outcome, addons.UP_TO_DATE)
+
+        newer = dict(self.QUESTIE, **{"QuestieDB/db.lua": "-- newer data"})
+        name, entry = self.bind(self.download("Questie-v11.1.0.zip", newer))
+        result = addons.update_addon(name, entry, self.root)
+        self.assertEqual(result.outcome, addons.CHANGED)
+        self.assertEqual((self.root / "QuestieDB" / "db.lua").read_text(), "-- newer data")
+        # Replaced, not moved aside: this tool put the old one there.
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["Questie", "QuestieDB"])
+
+    def test_a_zip_tidied_away_after_installing_is_not_a_failure(self):
+        path = self.download("Questie-v11.0.0.zip")
+        name, entry = self.bind(path)
+        addons.update_addon(name, entry, self.root)
+        path.unlink()
+        result = addons.update_addon(name, entry, self.root)
+        self.assertEqual(result.outcome, addons.UP_TO_DATE)
+        self.assertIn("gone", result.detail)
+
+    def test_a_zip_that_was_never_installed_and_is_gone_is(self):
+        path = self.download("Questie-v11.0.0.zip")
+        name, entry = self.bind(path)
+        path.unlink()
+        self.assertEqual(addons.update_addon(name, entry, self.root).outcome, addons.FAILED)
+
+    def test_hand_installed_folders_are_kept_the_first_time(self):
+        for folder in ("Questie", "QuestieDB"):
+            (self.root / folder).mkdir()
+            (self.root / folder / f"{folder}.toc").write_text("old")
+        addons.rescan(self.install, self.root)
+        name, entry = self.bind(self.download("Questie-v11.0.0.zip"))
+        addons.update_addon(name, entry, self.root)
+        self.assertTrue((self.root / "Questie.replaced").is_dir())
+        self.assertTrue((self.root / "QuestieDB.replaced").is_dir(),
+                        "the companion is somebody's files too")
+
+    def test_a_rescan_lists_the_companion_under_its_addon_not_beside_it(self):
+        (self.root / "QuestieDB").mkdir()
+        (self.root / "QuestieDB" / "QuestieDB.toc").write_text("old")
+        addons.rescan(self.install, self.root)
+        self.assertIn("QuestieDB", self.install["addons"])
+        name, entry = self.bind(self.download("Questie-v11.0.0.zip"))
+        addons.update_addon(name, entry, self.root)
+        addons.rescan(self.install, self.root)
+        self.assertEqual(sorted(self.install["addons"]), ["Questie"])
+
+    def test_a_companion_bound_on_purpose_keeps_its_own_row(self):
+        name, entry = self.bind(self.download("Questie-v11.0.0.zip"))
+        addons.update_addon(name, entry, self.root)
+        addons.set_source(self.install, "QuestieDB", "github:someone/QuestieDB")
+        addons.rescan(self.install, self.root)
+        self.assertIn("QuestieDB", self.install["addons"])
+
+    def test_naming_folders_takes_only_those(self):
+        path = self.download("Questie-v11.0.0.zip")
+        entry, _ = addons.set_source(self.install, "Questie", f"zip:{path}#Questie")
+        result = addons.update_addon("Questie", entry, self.root)
+        self.assertEqual(result.folders, ["Questie"])
+
+    def test_a_folder_the_zip_does_not_hold_is_refused_when_set(self):
+        path = self.download("Questie-v11.0.0.zip")
+        with self.assertRaises(addons.Fail):
+            addons.set_source(self.install, "Questie", f"zip:{path}#Nope")
+
+    def test_a_bare_path_and_local_both_mean_the_zip(self):
+        path = self.download("Questie-v11.0.0.zip")
+        for typed in (str(path), f"local:{path}"):
+            entry, _ = addons.set_source(self.install, "Questie", typed)
+            self.assertEqual(entry["source"], f"zip:{path.resolve()}")
+
+    def test_a_zip_holding_one_addon_names_no_folder(self):
+        path = self.download("Bagnon-10.zip", {"Bagnon/Bagnon.toc": "x"})
+        name, entry = self.bind(path)
+        self.assertEqual((name, entry["source"]), ("Bagnon", f"zip:{path.resolve()}"))
+
+    def test_a_toc_per_client_is_still_a_question(self):
+        path = self.download("NotPlater.zip", {
+            "NotPlater/NotPlater-2.4.3.toc": "a", "NotPlater/NotPlater-3.3.5.toc": "b",
+        })
+        found = addons.read_on_disk(path)
+        self.assertTrue(found.client_choice)
+        name, source = addons.disk_install_plan(found, ["NotPlater-3.3.5.toc"])
+        self.assertEqual(name, "NotPlater-3.3.5")
+        self.assertTrue(source.endswith("#NotPlater-3.3.5.toc"))
+
+    def test_peeking_writes_only_the_tocs(self):
+        tree = addons.peek_zip(self.download("Questie-v11.0.0.zip"))
+        self.assertTrue((tree / "Questie" / "Questie.toc").is_file())
+        self.assertFalse((tree / "QuestieDB" / "db.lua").exists())
+
+    def test_peeking_refuses_path_traversal_too(self):
+        with self.assertRaises(addons.Fail):
+            addons.peek_zip(self.download("evil.zip", {"../evil/A/A.toc": "x"}))
+
+
+class SeveralAddonsOutOfOneFolder(unittest.TestCase):
+    """The same companion problem, for a zip somebody already unpacked.
+
+    `local:~/Downloads/Questie` used to find Questie/Questie.toc inside and bind
+    to that alone, leaving the companion folder out of AddOns.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = pathlib.Path(self.tmp.name)
+        self.root = base / "AddOns"
+        self.root.mkdir()
+        self.unpacked = base / "Downloads" / "Questie-v11.0.0"
+        for folder, toc in (("Questie", "## Title: Q\n"),
+                            ("QuestieDB", "## Title: QDB\n## RequiredDeps: Questie\n")):
+            (self.unpacked / folder).mkdir(parents=True)
+            (self.unpacked / folder / f"{folder}.toc").write_text(toc)
+        self.state = addons.migrate(addons.blank_install())
+        self.install = addons.current(self.state)
+        self.install["addons_dir"] = str(self.root)
+
+    def test_naming_both_links_both(self):
+        entry, _ = addons.set_source(
+            self.install, "Questie", f"local:{self.unpacked}#Questie,QuestieDB")
+        result = addons.update_addon("Questie", entry, self.root)
+        self.assertEqual(result.outcome, addons.CHANGED, result.detail)
+        self.assertEqual(result.folders, ["Questie", "QuestieDB"])
+        self.assertTrue(addons.is_link(self.root / "QuestieDB"))
+
+    def test_copying_copies_both(self):
+        entry, _ = addons.set_source(
+            self.install, "Questie", f"local:{self.unpacked}#Questie,QuestieDB", copy=True)
+        result = addons.update_addon("Questie", entry, self.root)
+        self.assertEqual(result.detail.split()[0], "copied")
+        self.assertFalse(addons.is_link(self.root / "QuestieDB"))
+        self.assertTrue((self.root / "QuestieDB" / "QuestieDB.toc").is_file())
+
+    def test_installing_the_folder_offers_every_addon_in_it(self):
+        found = addons.read_on_disk(self.unpacked)
+        self.assertEqual(found.picks, ["Questie", "QuestieDB"])
+        name, source = addons.disk_install_plan(found, found.picks)
+        self.assertEqual(name, "Questie")
+        self.assertTrue(source.endswith("#Questie,QuestieDB"))
+
+    def test_the_old_shorthand_still_means_one_addon(self):
+        # `local:<checkout root>` finding <addon>/<addon>.toc is documented for
+        # a repository of several addons you are working on. Unchanged.
+        entry, local = addons.set_source(self.install, "Questie", f"local:{self.unpacked}")
+        self.assertEqual(entry["source"], f"local:{self.unpacked.resolve() / 'Questie'}")
+
+    def test_a_folder_that_is_the_addon_installs_whole(self):
+        found = addons.read_on_disk(self.unpacked / "Questie")
+        self.assertEqual(addons.disk_install_plan(found, found.picks),
+                         ("Questie", f"local:{(self.unpacked / 'Questie').resolve()}"))
+
+    def test_a_hash_in_a_real_folder_name_is_not_a_pick(self):
+        odd = self.unpacked.parent / "C#Addons"
+        odd.mkdir()
+        self.assertEqual(addons.split_local_spec(str(odd)), (str(odd), None))
+        self.assertEqual(addons.split_local_spec(f"{odd}#A,B"), (str(odd), "A,B"))
+
+    def test_the_destination_named_is_the_first_pick(self):
+        entry = {"source": f"local:{self.unpacked}#Questie,QuestieDB"}
+        self.assertEqual(addons.install_destination(entry, "X", self.root), self.root / "Questie")

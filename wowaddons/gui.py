@@ -364,7 +364,8 @@ class SourceDialog(RepoDialog, tk.Toplevel):
 
     # Every tk variable this dialog owns. Named once, so destroy() cannot drift
     # out of step with __init__.
-    VARIABLES = ("choice", "local", "repo", "branch", "track", "copy", "backup", "folder")
+    VARIABLES = ("choice", "local", "repo", "branch", "track", "copy", "backup", "folder",
+                 "local_folder")
 
     def __init__(self, parent, addon: str, entry: dict, root: Path, *, no_api: bool = False):
         super().__init__(parent)
@@ -392,10 +393,16 @@ class SourceDialog(RepoDialog, tk.Toplevel):
         # of truth: _save reads only that, so a typed folder and a ticked one
         # cannot disagree, and a repository too large to list is still usable.
         self.folder = tk.StringVar()
+        # The same, for the addons ticked out of a zip or a folder on disk. Kept
+        # apart so switching the radio does not carry one choice into the other.
+        self.local_folder = tk.StringVar()
+        self.disk: core.OnDisk | None = None
 
-        if source.startswith("local:"):
+        if source.startswith(("local:", "zip:")):
             self.choice.set("local")
-            self.local.set(source[len("local:"):])
+            path, picks = core.split_local_spec(source.split(":", 1)[1])
+            self.local.set(path)
+            self.local_folder.set(picks or "")
         elif source.startswith("github:"):
             self.choice.set("github")
             repo, branch, folder = core.split_repo_spec(source[len("github:"):])
@@ -429,7 +436,7 @@ class SourceDialog(RepoDialog, tk.Toplevel):
         body = ttk.Frame(self, padding=12)
         body.grid(sticky="nsew")
 
-        ttk.Radiobutton(body, text="Local folder", value="local", variable=self.choice,
+        ttk.Radiobutton(body, text="Folder or zip", value="local", variable=self.choice,
                         command=self._sync).grid(row=0, column=0, sticky="w", **pad)
         self.local_entry = ttk.Entry(body, textvariable=self.local, width=44)
         self.local_entry.grid(row=0, column=1, sticky="ew", **pad)
@@ -441,9 +448,13 @@ class SourceDialog(RepoDialog, tk.Toplevel):
         # outlives the dialog and Tcl tears it down from whatever thread the
         # garbage collector happened to be on, which aborts the process with
         # "Tcl_AsyncDelete: async handler deleted by the wrong thread".
-        self.local_entry.bind("<KeyRelease>", self._show_caution)
-        self.browse = ttk.Button(body, text="Browse…", command=self._browse)
-        self.browse.grid(row=0, column=2, **pad)
+        self.local_entry.bind("<KeyRelease>", self._local_typed)
+        browse = ttk.Frame(body)
+        browse.grid(row=0, column=2, sticky="w", **pad)
+        self.browse = ttk.Button(browse, text="Folder…", command=self._browse)
+        self.browse.grid(row=0, column=0)
+        self.browse_zip = ttk.Button(browse, text="Zip…", command=self._browse_zip)
+        self.browse_zip.grid(row=0, column=1, padx=(4, 0))
         self.copy_box = ttk.Checkbutton(body, text="copy files instead of linking", variable=self.copy)
         self.copy_box.grid(row=1, column=1, sticky="w", **pad)
 
@@ -510,6 +521,8 @@ class SourceDialog(RepoDialog, tk.Toplevel):
             # Already bound: show what the repository holds without waiting for
             # a keystroke, so the ticks can be read against what is saved.
             self.after(50, self._begin_lookup)
+        if self.choice.get() == "local" and self.local.get().strip():
+            self._lookup_after = self.after(50, self._read_local)
 
         self.caution = ttk.Label(body, text="", foreground="#a05000", wraplength=480, justify="left")
         self.caution.grid(row=7, column=0, columnspan=3, sticky="w", **pad)
@@ -527,6 +540,8 @@ class SourceDialog(RepoDialog, tk.Toplevel):
     def _preticked(self, folders: list[str]) -> set[str]:
         """What is saved, else one confident guess -- and no guess at all rather
         than a wrong one, which would arrive ticked and be accepted unread."""
+        if self.choice.get() == "local":
+            return self._preticked_on_disk(folders)
         already = core.wanted_folders(self.folder.get())
         if already:
             return set(already)
@@ -537,8 +552,76 @@ class SourceDialog(RepoDialog, tk.Toplevel):
         """Ticked boxes are written into the folder box, which _save reads."""
         if self.folder is None:
             return
-        self.folder.set(",".join(f for f, v in self.folder_boxes.items() if v.get()))
+        ticked = ",".join(f for f, v in self.folder_boxes.items() if v.get())
+        (self.local_folder if self.choice.get() == "local" else self.folder).set(ticked)
         self._show_caution()
+
+    # -- a zip or folder on this disk -----------------------------------------
+
+    def _preticked_on_disk(self, folders: list[str]) -> set[str]:
+        """What is saved; else, for a download, everything in it; else this
+        addon and the folders that declare they need it -- its companions."""
+        already = core.wanted_folders(self.local_folder.get())
+        if already:
+            return set(already)
+        if self.disk is None or self.disk.client_choice:
+            return set()
+        if self.disk.kind == "zip":
+            return set(folders)
+        guess = core.likely_addon(self.addon, folders)
+        if guess is None:
+            return set()
+        return {guess} | {pick for pick in folders
+                          if guess in self.disk.requires.get(pick, ())}
+
+    def _local_typed(self, *_a) -> None:
+        self._show_caution()
+        # Every prefix of a path being typed is a folder too. Wait for the
+        # typing to stop before looking inside one.
+        self._stop_lookups()
+        self._lookup_after = self.after(400, self._read_local)
+
+    def _read_local(self) -> None:
+        """Offer the addons in the zip or folder named, when there is a choice."""
+        self._lookup_after = None
+        if self.local is None or self.choice.get() != "local":
+            return
+        path = Path(core.split_local_spec(self.local.get().strip().strip('"'))[0]).expanduser()
+        before = self.disk.path if self.disk is not None else None
+        try:
+            self.disk = core.read_on_disk(path) if str(path) not in ("", ".") else None
+        except Fail:
+            self.disk = None
+        if self.disk is not None and before is not None and self.disk.path != before:
+            # Another download: what was ticked in the last one means nothing here.
+            self.local_folder.set("")
+        self.copy_box.configure(
+            state="disabled" if self.disk is not None and self.disk.kind == "zip" else "normal")
+        if self.disk is None or len(self.disk.picks) < 2:
+            self._hide_list()
+            self._show_caution()
+            return
+        what = "zip" if self.disk.kind == "zip" else "folder"
+        self.addon_list.configure(text=f"Addons in this {what}")
+        message = (self._pick_message(self.disk.picks) if self.disk.client_choice else
+                   f"{len(self.disk.picks)} addons — tick the ones this row installs; "
+                   "they update together")
+        self._show_list(message, self.disk.picks)
+        self._show_caution()
+
+    def _local_source(self) -> str:
+        """The source the Folder-or-zip half of the dialog describes."""
+        typed = self.local.get().strip().strip('"') if self.local is not None else ""
+        if not typed:
+            return "unmanaged"
+        path, typed_picks = core.split_local_spec(typed)
+        picks = core.wanted_folders(self.local_folder.get() or typed_picks)
+        is_zip = core.is_zip_name(path)
+        if is_zip and self.disk is not None and \
+                sorted(picks, key=str.lower) == sorted(self.disk.picks, key=str.lower) and \
+                not self.disk.client_choice:
+            picks = []  # every addon in the zip: name none, so a newer zip still fits
+        return f"{'zip' if is_zip else 'local'}:{path}" + (f"#{','.join(picks)}" if picks else "")
 
     def _sync(self, *_a) -> None:
         """Grey out whatever the current choice does not use."""
@@ -549,7 +632,21 @@ class SourceDialog(RepoDialog, tk.Toplevel):
         github = "normal" if choice == "github" else "disabled"
         self.local_entry.configure(state=local)
         self.browse.configure(state=local)
-        self.copy_box.configure(state=local)
+        self.browse_zip.configure(state=local)
+        # Nothing to link in a zip: it is always unpacked.
+        zipped = self.disk is not None and self.disk.kind == "zip"
+        self.copy_box.configure(state="disabled" if zipped else local)
+        if choice != getattr(self, "_listing_for", choice):
+            # The list underneath belongs to whichever source is chosen.
+            self._stop_lookups()
+            self._show_list("", [])
+            self._hide_list()
+            if choice == "local":
+                self._read_local()
+            elif choice == "github" and self.repo.get().strip():
+                self.addon_list.configure(text="Addons in this repository")
+                self._begin_lookup()
+        self._listing_for = choice
         self.repo_entry.configure(state=github)
         self.track_box.configure(state=github)
         self.branch_entry.configure(state="normal" if choice == "github" and self.track.get() else "disabled")
@@ -560,8 +657,7 @@ class SourceDialog(RepoDialog, tk.Toplevel):
         """The entry this dialog would save, for asking core what it would do."""
         choice = self.choice.get() if self.choice is not None else "unmanaged"
         if choice == "local":
-            path = self.local.get().strip()
-            source = f"local:{path}" if path else "unmanaged"
+            source = self._local_source()
         elif choice == "github":
             # Only the scheme matters, except for the folder: for a repo of
             # several addons the folder is what lands in AddOns, and naming the
@@ -627,7 +723,16 @@ class SourceDialog(RepoDialog, tk.Toplevel):
         chosen = filedialog.askdirectory(title=f"Folder holding {self.addon}", parent=self)
         if chosen:
             self.local.set(chosen)
-            self._show_caution()
+            self._read_local()
+
+    def _browse_zip(self) -> None:
+        chosen = filedialog.askopenfilename(
+            title=f"A zip of {self.addon} you downloaded", parent=self,
+            filetypes=[("Zip archives", "*.zip"), ("All files", "*")],
+        )
+        if chosen:
+            self.local.set(chosen)
+            self._read_local()
 
     def _save(self) -> None:
         choice = self.choice.get()
@@ -635,11 +740,20 @@ class SourceDialog(RepoDialog, tk.Toplevel):
         if choice == "unmanaged":
             self.result = ("unmanaged", False)
         elif choice == "local":
-            path = self.local.get().strip()
-            if not path:
-                messagebox.showerror("No folder", "Pick the folder the addon lives in.", parent=self)
+            if not self.local.get().strip():
+                messagebox.showerror("No folder", "Pick the folder or zip the addon is in.",
+                                     parent=self)
                 return
-            self.result = (f"local:{path}", self.copy.get())
+            source = self._local_source()
+            if self.disk is not None and self.disk.client_choice and "#" not in source:
+                messagebox.showerror(
+                    "Which client?",
+                    f"{self.disk.path.name} is one addon with {len(self.disk.picks)} .toc "
+                    "files — one per client version.\n\nTick the .toc your client uses.",
+                    parent=self,
+                )
+                return
+            self.result = (source, self.copy.get() and not source.startswith("zip:"))
         else:
             # Whatever they pasted: owner/repo, the page URL, the clone URL, the
             # SSH one, or a link to a branch. Telling somebody who just pasted a
@@ -741,6 +855,12 @@ class InstallDialog(RepoDialog, tk.Toplevel):
         self.addons_root = root
         self.known = entries
         self.result: list[tuple[str, str]] | None = None
+        # A zip or folder on this disk, once one has been named: what it holds.
+        # None while the box holds a repository, or nothing yet.
+        self.disk: core.OnDisk | None = None
+        # A folder you unpacked is copied, not linked: Downloads is somewhere
+        # people tidy, and a link into it would vanish with it.
+        self.copy_files = False
         self._init_lookup(no_api=no_api)
         self.transient(parent)
         self.resizable(False, False)
@@ -779,8 +899,14 @@ class InstallDialog(RepoDialog, tk.Toplevel):
         self.repo_entry.bind("<KeyRelease>", self._absorb_url)
         self.repo_hint = ttk.Label(body, text="", foreground="grey")
         self.repo_hint.grid(row=0, column=2, sticky="w", **pad)
-        ttk.Label(body, text="owner/repo, or a github.com link", foreground="grey").grid(
-            row=1, column=1, sticky="w", **pad)
+        hint = ttk.Frame(body)
+        hint.grid(row=1, column=1, columnspan=2, sticky="w", **pad)
+        ttk.Label(hint, text="owner/repo, a github.com link, or one you downloaded:",
+                  foreground="grey").grid(row=0, column=0, sticky="w")
+        ttk.Button(hint, text="Zip…", command=self._browse_zip).grid(
+            row=0, column=1, padx=(6, 0))
+        ttk.Button(hint, text="Folder…", command=self._browse_folder).grid(
+            row=0, column=2, padx=(4, 0))
 
         track = ttk.Frame(body)
         track.grid(row=2, column=1, sticky="w", **pad)
@@ -817,6 +943,96 @@ class InstallDialog(RepoDialog, tk.Toplevel):
     def _folders_ticked(self, *_a) -> None:
         self._sync()
 
+    # -- a zip or folder on this disk -----------------------------------------
+
+    def _browse_zip(self) -> None:
+        chosen = filedialog.askopenfilename(
+            title="A zip you downloaded", parent=self,
+            filetypes=[("Zip archives", "*.zip"), ("All files", "*")],
+        )
+        if chosen:
+            self.repo.set(chosen)
+            self._read_disk()
+
+    def _browse_folder(self) -> None:
+        chosen = filedialog.askdirectory(title="A folder holding an addon", parent=self)
+        if chosen:
+            self.repo.set(chosen)
+            self._read_disk()
+
+    def _absorb_url(self, *_a) -> None:
+        """A path to something on this disk is read a moment after typing
+        stops; anything else is a repository, and asked about the usual way."""
+        if self.repo is None:
+            return
+        if self._on_disk(self.repo.get()) is None:
+            if self.disk is not None:
+                # The zip's tick boxes go with it, or they would be read as
+                # picks out of whatever repository is typed next.
+                self.disk = None
+                self._show_list("", [])
+                self._hide_list()
+                self.addon_list.configure(text="Addons in this repository")
+            super()._absorb_url()
+            return
+        # Every prefix of a path being typed is a folder too, and reading one
+        # looks through what is inside it. Wait for the typing to stop.
+        self._stop_lookups()
+        self._lookup_after = self.after(400, self._read_disk)
+
+    def _read_disk(self) -> None:
+        """Read the zip or folder the box names, now, and offer what it holds."""
+        self._lookup_after = None
+        found = self._on_disk(self.repo.get()) if self.repo is not None else None
+        if found is None:
+            return
+        self._stop_lookups()
+        self.lookup_for = ""
+        path, picks = found
+        try:
+            self.disk = core.read_on_disk(path)
+        except Fail as exc:
+            self.disk = None
+            self.repo_hint.configure(text="")
+            self._show_list(str(exc), [])
+            return
+        self.copy_files = self.disk.kind == "local"
+        self.repo_hint.configure(text=f"→ {self.disk.path.name}")
+        self.available = list(self.disk.picks)
+        self._picks_from_path = picks
+        what = "zip" if self.disk.kind == "zip" else "folder"
+        self.addon_list.configure(text=f"Addons in this {what}")
+        if len(self.disk.picks) == 1:
+            self._show_list(f"one addon: {core.addon_name_for(self.disk.picks[0])}", [])
+        elif self.disk.client_choice:
+            self._show_list(self._pick_message(self.disk.picks), self.disk.picks)
+        else:
+            # Ticked, all of them: a download is the addon AND whatever it
+            # ships beside it, and the companion left behind is the mistake.
+            self._show_list(f"{len(self.disk.picks)} addons, installed together as one "
+                            "row — untick any you do not want", self.disk.picks)
+
+    @staticmethod
+    def _on_disk(text: str) -> tuple[Path, str | None] | None:
+        """(path, picks) when the box names a zip or folder here, else None."""
+        text = text.strip().strip('"')
+        if not text:
+            return None
+        path_text, picks = core.split_local_spec(text)
+        path = Path(path_text).expanduser()
+        try:
+            if path.is_dir() or (path.is_file() and core.is_zip_name(path.name)):
+                return path, picks
+        except OSError:
+            pass
+        return None
+
+    def _preticked(self, folders: list[str]) -> set[str]:
+        if self.disk is None or self.disk.client_choice:
+            return set()
+        named = core.wanted_folders(getattr(self, "_picks_from_path", None))
+        return set(named) if named else set(folders)
+
     def _show_list(self, message: str, folders: list[str]) -> None:
         # What the repository turns out to hold changes what Install would do,
         # so the caution has to be re-read against the answer -- including the
@@ -834,6 +1050,8 @@ class InstallDialog(RepoDialog, tk.Toplevel):
 
     def _spec(self) -> str | None:
         """The repository this dialog is pointed at, or None if it is not one yet."""
+        if self.disk is not None:
+            return str(self.disk.path)
         found = core.parse_repo(self.repo.get()) if self.repo is not None else None
         if found is None:
             return None
@@ -849,6 +1067,10 @@ class InstallDialog(RepoDialog, tk.Toplevel):
 
     def _plan(self) -> list[tuple[str, str]]:
         """The rows Install would create. Empty while there is nothing to act on."""
+        if self.disk is not None:
+            chosen = self._ticked() if len(self.disk.picks) > 1 else list(self.disk.picks)
+            plan = core.disk_install_plan(self.disk, chosen)
+            return [plan] if plan else []
         spec = self._spec()
         if spec is None:
             return []
@@ -879,24 +1101,51 @@ class InstallDialog(RepoDialog, tk.Toplevel):
                 lines.append(f"{name} is already bound to {core.tilde(bound)}; installing "
                              f"re-binds it to this repository.")
             entry["source"] = source
-            doomed = core.displaced_folder(entry, name, self.addons_root)
-            if doomed is None or (entry.get("installed") and doomed.name in (entry.get("folders") or [])):
-                continue
-            if core.should_backup_folder(entry, doomed.name):
-                lines.append(f"⚠  {doomed.name} is real files in your AddOns folder right now, "
-                             f"and this tool did not put them there. They will be moved aside "
-                             f"to {core.backup_name(doomed).name} — once.")
-            else:
-                lines.append(f"⚠  {doomed.name} is real files this tool did not install, and "
-                             f"the backup is switched off — they will be DELETED, not kept.")
+            for doomed in self._doomed(entry, name):
+                if core.should_backup_folder(entry, doomed.name):
+                    lines.append(f"⚠  {doomed.name} is real files in your AddOns folder right "
+                                 f"now, and this tool did not put them there. They will be "
+                                 f"moved aside to {core.backup_name(doomed).name} — once.")
+                else:
+                    lines.append(f"⚠  {doomed.name} is real files this tool did not install, "
+                                 f"and the backup is switched off — they will be DELETED, "
+                                 f"not kept.")
         self.caution.configure(
             foreground="#a05000" if any(line.startswith("⚠") for line in lines) else "#666666",
             text="\n".join(lines),
         )
 
+    def _doomed(self, entry: dict, name: str) -> list[Path]:
+        """Real folders this install would replace that this tool did not write.
+
+        Every folder of a download, not only the one the row is named after:
+        the companion a hand-install left in AddOns is somebody's files too.
+        """
+        if self.disk is not None:
+            chosen = self._ticked() if len(self.disk.picks) > 1 else self.disk.picks
+            folders = [self.addons_root / core.addon_name_for(pick) for pick in chosen]
+        else:
+            folders = [core.displaced_folder(entry, name, self.addons_root)]
+        mine = entry.get("folders") or [] if entry.get("installed") else []
+        return [folder for folder in folders
+                if folder is not None and folder.exists() and not core.is_link(folder)
+                and folder.name not in mine]
+
     # -- the buttons ---------------------------------------------------------
 
     def _install(self) -> None:
+        if self._on_disk(self.repo.get()) is not None and (
+                self.disk is None or self._lookup_after is not None):
+            self._read_disk()  # Install pressed before the pause after typing
+        if self.disk is not None and not self._plan():
+            messagebox.showerror(
+                "Which client?" if self.disk.client_choice else "Which addon?",
+                f"{self.disk.path.name} holds {len(self.disk.picks)} "
+                + (".toc files, one per client.\n\nTick the one your client uses."
+                   if self.disk.client_choice else "addons.\n\nTick the ones to install."),
+                parent=self,
+            )
+            return
         if self._spec() is None:
             account = core.github_account(self.repo.get())
             if account:
@@ -915,7 +1164,8 @@ class InstallDialog(RepoDialog, tk.Toplevel):
                 "Paste a github.com link, or write it as owner/repo.\n\n"
                 "Both of these work:\n"
                 "    tullamods/Bagnon\n"
-                "    https://github.com/tullamods/Bagnon",
+                "    https://github.com/tullamods/Bagnon\n\n"
+                "Or press Zip… for an addon you downloaded yourself.",
                 parent=self,
             )
             return
@@ -950,7 +1200,8 @@ class InstallDialog(RepoDialog, tk.Toplevel):
         if rebinding and not messagebox.askokcancel(
             "Already bound",
             f"{', '.join(rebinding)} already has a source set.\n\n"
-            "OK re-binds it to this repository and installs from there.\n"
+            "OK re-binds it to " + ("this download" if self.disk is not None
+                                    else "this repository") + " and installs from there.\n"
             "Cancel leaves it as it is.",
             parent=self, default=messagebox.CANCEL, icon=messagebox.WARNING,
         ):
@@ -1965,8 +2216,10 @@ class App(ttk.Frame):
             decision = self._confirm_overwrite(name, source, root)
             if decision is None:
                 continue  # this one was declined; anything else ticked still goes
-            if self.guard(lambda n=name, s=source, d=decision:
-                          core.set_source(self.install(), n, s, backup=d["keep_folder"])) is None:
+            copy = getattr(dialog, "copy_files", False)
+            if self.guard(lambda n=name, s=source, d=decision, c=copy:
+                          core.set_source(self.install(), n, s, copy=c,
+                                          backup=d["keep_folder"])) is None:
                 return
             if decision["delete_saved"]:
                 # Acted on after the install, not now: a download that fails

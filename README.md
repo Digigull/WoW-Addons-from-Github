@@ -100,7 +100,7 @@ Running from a checkout instead needs **Python 3.9 or newer**, and that is the w
 |---|---|
 | `init <path>` | Remember where the client is. Accepts your WoW folder, its `Interface` folder, or `Interface/AddOns` itself. |
 | `scan` | Read every addon already installed and record it, guessing a source from each `.toc` where it can. Drops unmanaged rows whose folder you have deleted; keeps bound ones, flagged *not installed*. |
-| `install <repo>` | Fetch an addon you do **not** have yet and bind it in one step. Takes `owner/repo`, `owner/repo#Folder` or any github.com link; `--folder` (repeatable) picks addons out of a repository that holds several — or the `.toc` out of one that ships several, `--folder NotPlater-3.3.5.toc` — and `--branch` follows a branch instead of releases. `--reset-settings` also deletes that addon's saved variables (account and every character) once it has installed, keeping a copy of each unless you add `--no-settings-backup`. |
+| `install <repo>` | Fetch an addon you do **not** have yet and bind it in one step. Takes `owner/repo`, `owner/repo#Folder`, any github.com link, or a `.zip` / folder on your disk ([An addon you downloaded yourself](#an-addon-you-downloaded-yourself)); `--folder` (repeatable) picks addons out of a repository that holds several — or the `.toc` out of one that ships several, `--folder NotPlater-3.3.5.toc` — and `--branch` follows a branch instead of releases. `--reset-settings` also deletes that addon's saved variables (account and every character) once it has installed, keeping a copy of each unless you add `--no-settings-backup`. |
 | `list` | Every addon, its source, and its installed version. Bound addons first, then the rest, each alphabetically. |
 | `set <Addon> <source>` | Bind one addon to where its updates come from. |
 | `accept` | Take every source that `scan` suggested, in one go. |
@@ -145,6 +145,8 @@ the first time the tool reads it. Nothing is rewritten until something saves.
 | Source | Behaviour |
 |---|---|
 | `local:<path>` | A folder on disk. Installed as a **symlink** by default, so `git pull` in that checkout *is* the update — nothing to reinstall, and the client cannot be running something other than what is checked out. `--copy` for real files instead. |
+| `local:<path>#A,B` | **Several addons out of one folder** — an addon and the companion folder it ships with. Linked (or copied) together, as one row. |
+| `zip:<file.zip>` | **A zip you downloaded yourself.** Unpacked into AddOns, companion folders and all. Pointing the row at a newer download is the update. `#A,B` takes only those folders. |
 | `github:owner/repo` | Latest release, preferring an attached `.zip` and falling back to the source archive. |
 | `github:owner/repo@branch` | That branch's current head, for an addon that does not cut releases. |
 | `github:owner/repo#Folder` | **One addon out of a repository that holds several.** Only that folder is installed, and its version is the last commit that touched *it*. Combines with a branch: `github:owner/repo@main#Folder`. |
@@ -243,6 +245,40 @@ directory, laid out as `src/MyAddon/MyAddon.toc` beside a `docs/` folder, or as 
 whose root *is* the addon. An addon's own bundled libraries are never mistaken for the addon
 itself — including a repository that is the addon and keeps its libraries beside it, where
 everything under the root belongs to the one addon at the root.
+
+## An addon you downloaded yourself
+
+Some addons are only published on sites this tool does not fetch from — CurseForge serves
+its downloads through its own page, which is how the people who write them get paid, so
+this tool does not go round it. Download the zip there as usual, then hand it over:
+
+```
+addons.py install ~/Downloads/Questie-v11.0.0.zip
+```
+
+In the window it is **Install addon…**, then **Zip…** (or paste the path). That beats
+unzipping by hand, because unzipping by hand is where addons break:
+
+- **Every folder in the zip is installed, as one row.** Questie ships as the addon *and* a
+  companion folder; install only the folder named after the addon and it does not work.
+  The window lists what the zip holds, all ticked — untick any you do not want. The row is
+  named after the addon the others depend on.
+- **The folder lands at the right depth**, whatever shape the zip is — the same rules as a
+  GitHub archive.
+- **Files you installed by hand are moved aside once**, as `<Name>.replaced`, including
+  the companion — the same rule as every other install.
+
+To update, download the newer zip and install that one: the row is re-pointed at it and
+replaced. The version shown is the zip's name plus a short digest of its bytes, so the same
+zip twice is *up to date* and a different one is not. Deleting the zip afterwards is fine —
+**Update all** says the row was installed from a zip that is gone, rather than failing.
+
+A folder you already unpacked works the same way (**Folder…**), and is **copied** rather
+than linked, because a link into Downloads vanishes when Downloads is tidied. `--link`
+links it instead.
+
+A companion folder is never listed as a row of its own once the row that installed it
+exists — binding it to something else separately would break both.
 
 ## Private repositories
 
@@ -428,7 +464,9 @@ Everything the terminal does, in one window:
   repository holds and, if that is several addons, asks which; each one you tick becomes
   its own row and its own binding, rather than one row that reinstalls all of them
   whenever any one of them changes. A repository holding a single addon is bound whole,
-  which keeps it following that repository's releases.
+  which keeps it following that repository's releases. It also takes a **zip you
+  downloaded** or a folder you unpacked — **Zip…** / **Folder…** — see
+  [An addon you downloaded yourself](#an-addon-you-downloaded-yourself).
 - **Installing over an addon you already have asks first**, in a window that
   keeps two very different questions apart. *Make a backup* — ticked — moves the folder
   that is there now to `<Name>.replaced` instead of deleting it. Below a rule, under a red
@@ -442,9 +480,12 @@ Everything the terminal does, in one window:
   repositories are visible. The line beside it says whether one is in play and which of
   the four sources it came from — the saved one, `GITHUB_TOKEN`, or the login Git already
   had. See [Private repositories](#private-repositories).
-- **Set source…** opens a dialog over the selected addon: a local folder (with Browse),
-  a GitHub repo, an optional branch to track, an optional folder inside the repo, or
-  unmanaged. Pasting a github.com link to a folder fills all three in.
+- **Set source…** opens a dialog over the selected addon: a folder or a zip on your disk
+  (with **Folder…** and **Zip…**), a GitHub repo, an optional branch to track, an optional
+  folder inside the repo, or unmanaged. Pasting a github.com link to a folder fills all
+  three in. A zip or folder holding several addons lists them as tick boxes — this addon
+  and the ones that declare they need it start ticked — and the ticked ones install
+  together.
 - **Accept suggestion** takes what an addon's `.toc` suggested — for the rows you pick,
   on a click you make. It is shown in the Status column and never applied on its own,
   for the same reason `accept` is a separate command in the terminal.

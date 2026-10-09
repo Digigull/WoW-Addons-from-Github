@@ -17,7 +17,9 @@ is one addon out of many and the rest must still go.
 
 from __future__ import annotations
 
+import atexit
 import datetime
+import hashlib
 import io
 import json
 import os
@@ -563,8 +565,22 @@ def rescan(state: dict, root: Path) -> tuple[int, int, int]:
     installed = scan_installed(root)
     entries = state.setdefault("addons", {})
 
+    # A folder another row installed is part of that row -- the companion
+    # an addon ships beside itself -- and listing it again on its own, as
+    # unmanaged, invites binding it to something else and breaking both.
+    claimed = {
+        folder
+        for owner, entry in entries.items()
+        if entry.get("source", "unmanaged") != "unmanaged" and entry.get("installed")
+        for folder in entry.get("folders") or []
+        if folder != owner
+    }
+
     guessed = 0
     for name, facts in installed.items():
+        if name in claimed and entries.get(name, {}).get("source", "unmanaged") == "unmanaged":
+            entries.pop(name, None)
+            continue
         entry = entries.setdefault(name, new_entry(name))
         entry["title"] = facts["title"]
         entry["toc_version"] = facts["version"]
@@ -700,21 +716,28 @@ def parse_source(source: str) -> tuple[str, str]:
     source = source.strip()
     if source == "unmanaged":
         return "unmanaged", ""
-    # A pasted URL has its own colon, so this has to come before the split.
-    if not source.startswith(("local:", "github:")) and looks_like_a_repo(source):
-        return "github", source
+    if not source.startswith(("local:", "github:", "zip:")):
+        # A downloaded zip, dropped in as a bare path. Before the split below,
+        # because a Windows path has a colon of its own: `C:\Users\...`.
+        if is_zip_name(split_local_spec(source)[0]) and \
+                Path(split_local_spec(source)[0]).expanduser().is_file():
+            return "zip", source
+        # A pasted URL has its own colon too.
+        if looks_like_a_repo(source):
+            return "github", source
     if ":" not in source:
         die(
             f"cannot read source '{source}'. Expected one of:\n"
             "     local:/path/to/folder\n"
+            "     zip:/path/to/download.zip\n"
             "     github:owner/repo\n"
             "     github:owner/repo@branch\n"
             "     https://github.com/owner/repo\n"
             "     unmanaged"
         )
     kind, rest = source.split(":", 1)
-    if kind not in ("local", "github"):
-        die(f"unknown source type '{kind}' (expected local, github or unmanaged)")
+    if kind not in ("local", "github", "zip"):
+        die(f"unknown source type '{kind}' (expected local, zip, github or unmanaged)")
     return kind, rest
 
 
@@ -760,10 +783,28 @@ def resolve_source(addon: str, source: str) -> tuple[str, str, Path | None]:
         if folder:
             normalised += f"#{folder}"
         return normalised, kind, None
-    if kind != "local":
+    if kind not in ("local", "zip"):
         return source, kind, None
 
-    local_path = Path(rest).expanduser().resolve()
+    path_text, folder = split_local_spec(rest)
+    local_path = Path(path_text).expanduser().resolve()
+    if kind == "zip" or (local_path.is_file() and is_zip_name(local_path.name)):
+        # `local:` pointed at a zip means the zip: there is nothing to link.
+        if not local_path.is_file():
+            die(f"no such file: {local_path}")
+        if not zipfile.is_zipfile(local_path):
+            die(f"{local_path.name} is not a zip file")
+        if folder:
+            addon_folders(peek_zip(local_path), folder)  # fails now, not mid-update
+        return f"zip:{local_path}" + (f"#{folder}" if folder else ""), "zip", None
+    if folder:
+        # Several addons out of one folder: an unpacked download holding an
+        # addon and its companion. The folder itself is not an addon, so it
+        # is the picks that get checked, not the folder's own .toc.
+        if not local_path.is_dir():
+            die(f"no such folder: {local_path}")
+        addon_folders(local_path, folder)
+        return f"local:{local_path}#{folder}", kind, local_path
     if local_path.is_dir() and find_toc(local_path) is None:
         candidate = local_path / addon
         if find_toc(candidate) is not None:
@@ -2825,6 +2866,14 @@ def descend_to(tree: Path, folder: str) -> Path:
     for candidate in candidates:
         if candidate.is_dir():
             return candidate
+    # The name a pick was offered under is the name it installs as, which is
+    # not always a path from the top: src/MyAddon is offered as MyAddon.
+    try:
+        for found, name in addon_dirs_in(tree):
+            if name.lower() == folder.lower():
+                return found
+    except Fail:
+        pass
     die(f"the archive has no folder '{folder}' -- was it renamed or moved?")
 
 
@@ -2842,6 +2891,273 @@ def descend_to_toc(tree: Path, toc: str) -> Path:
                for child in candidate.iterdir()):
             return candidate
     die(f"the archive has no '{toc}' at its root -- was it renamed or moved?")
+
+
+def unpack(blob: bytes, into: Path, *, only_tocs: bool = False) -> None:
+    """Extract an addon archive, refusing any path that climbs out of `into`.
+
+    `only_tocs` writes every directory but only the .toc files, which is all
+    `addon_dirs_in` reads -- enough to say what a 20 MB download holds without
+    writing 20 MB to find out.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+            # Refuse path traversal rather than trusting the archive; this
+            # unpacks whatever a third party published.
+            names = archive.namelist()
+            for name in names:
+                resolved = (into / name).resolve()
+                if not str(resolved).startswith(str(into.resolve())):
+                    die(f"archive contains an unsafe path: {name}")
+            if not only_tocs:
+                archive.extractall(into)
+                return
+            for name in names:
+                if name.endswith("/"):
+                    (into / name).mkdir(parents=True, exist_ok=True)
+                    continue
+                # Zips need not list their directories; a file implies them.
+                (into / name).parent.mkdir(parents=True, exist_ok=True)
+                if name.lower().endswith(".toc"):
+                    (into / name).write_bytes(archive.read(name))
+    except zipfile.BadZipFile:
+        die("that file is not a zip -- check the source is an addon release")
+
+
+def addon_folders(tree: Path, only: str | list[str] | None) -> list[tuple[Path, str]]:
+    """The (folder, name-to-install-as) pairs to take out of an unpacked tree.
+
+    Shared by every source that installs from a tree of files -- a GitHub
+    archive, a zip downloaded by hand, a folder unpacked by hand -- so all
+    three agree about which addons they hold and what each is called.
+    """
+    chosen = wanted_folders(only) if isinstance(only, str) else list(only or [])
+    if chosen:
+        folders = []
+        for name in chosen:
+            if names_a_toc(name):
+                # Not a folder in the archive: a name for the whole of it.
+                folders.append((descend_to_toc(tree, name), addon_name_for(name)))
+                continue
+            found = addon_dirs_in(descend_to(tree, name))
+            if not found:
+                die(f"no addon folder (a directory holding its own .toc) found in '{name}'")
+            folders.extend(found)
+        return folders
+
+    folders = addon_dirs_in(tree)
+    if not folders:
+        die("no addon folder (a directory holding its own .toc) found in the archive")
+    alternatives = {name for _tree, name in folders}
+    if len({found for found, _name in folders}) == 1 and len(alternatives) > 1:
+        # One set of files, several names it could be installed under:
+        # a repository that is the addon and ships a .toc per client.
+        # Installing all of them would put the same addon in AddOns
+        # two or three times over, under names only one of which the
+        # person meant -- so this is a question, not a default.
+        names = ", ".join(sorted(alternatives))
+        die(f"this repository holds one addon with {len(alternatives)} .toc files "
+            f"({names}) -- one per client version.\n"
+            f"     Name the one you want: #{sorted(alternatives)[0]}.toc")
+    return folders
+
+
+# ── addons already on this disk: a downloaded zip, or an unpacked folder ─────
+#
+# Some addons are only published somewhere this tool should not fetch from on
+# your behalf -- CurseForge serves its downloads through its own page, which is
+# how its authors get paid. Downloading the zip there and handing it to this
+# tool still beats unzipping by hand, because the hand-unzip is where addons go
+# wrong: the folder one level too deep, or the companion folder left behind.
+#
+# A companion folder is the other half of the problem. Questie ships as more
+# than one addon folder -- the addon, and the data it reads -- and installing
+# only the one named after the row left the addon broken. One row may name
+# several folders of a zip or a folder (`#Questie,Companion`), the way it
+# already could of a repository, and they install and update as a unit.
+
+
+def is_zip_name(text: str) -> bool:
+    return text.strip().lower().endswith(".zip")
+
+
+def split_local_spec(rest: str) -> tuple[str, str | None]:
+    """'/downloads/Questie#Questie,Companion' -> ('/downloads/Questie', 'Questie,Companion').
+
+    Split at the LAST '#', and only when what follows it names folders rather
+    than a path -- a folder on disk may contain a '#' itself, and a path that
+    exists as written is taken as written.
+    """
+    if "#" not in rest or Path(rest).expanduser().exists():
+        return rest, None
+    path, folder = rest.rsplit("#", 1)
+    if "/" in folder.strip("/") or "\\" in folder:
+        return rest, None
+    return path, folder.strip().strip("/") or None
+
+
+def peek_zip(path: Path) -> Path:
+    """A throwaway tree holding a zip's directories and .toc files, and nothing else.
+
+    Lives as long as the process: callers ask about it once, synchronously,
+    and a dialog may ask again as somebody edits the path.
+    """
+    tree = Path(tempfile.mkdtemp(prefix="wowaddons-peek-"))
+    _peeked.append(tree)
+    unpack(path.read_bytes(), tree, only_tocs=True)
+    return tree
+
+
+_peeked: list[Path] = []
+
+
+def _forget_peeks() -> None:
+    for tree in _peeked:
+        shutil.rmtree(tree, ignore_errors=True)
+
+
+atexit.register(_forget_peeks)
+
+
+@dataclass
+class OnDisk:
+    """What a zip or folder on this disk holds, read before installing it."""
+
+    kind: str                     # "zip" or "local"
+    path: Path
+    picks: list[str]              # folder names, or .toc names for a toc-per-client addon
+    requires: dict[str, set[str]] = field(default_factory=dict)
+
+    @property
+    def client_choice(self) -> bool:
+        return bool(self.picks) and all(names_a_toc(pick) for pick in self.picks)
+
+
+TOC_DEPENDENCY = re.compile(r"^(dependencies|requireddeps|dep\w*)$")
+
+
+def read_on_disk(path: Path) -> OnDisk:
+    """List the addons in a downloaded zip or an unpacked folder.
+
+    Fails with the reason when there are none, so a dialog can say why.
+    """
+    path = path.expanduser()
+    if path.is_file():
+        if not is_zip_name(path.name) and not zipfile.is_zipfile(path):
+            die(f"{path.name} is not a zip or a folder")
+        kind, tree = "zip", peek_zip(path)
+    elif path.is_dir():
+        kind, tree = "local", path
+        if find_toc(path) is not None:
+            # The folder IS the addon. It installs whole, under its own name.
+            return OnDisk(kind, path, [path.name], {})
+    else:
+        die(f"no such file or folder: {path}")
+
+    found = addon_dirs_in(tree)
+    if not found:
+        die(f"no addon in {path.name} -- no folder in it holds its own .toc")
+    alternatives = {name for _f, name in found}
+    if len({folder for folder, _n in found}) == 1 and len(alternatives) > 1:
+        picks = [f"{name}.toc" for _f, name in found]
+    else:
+        picks = [name for _f, name in found]
+
+    names = {addon_name_for(pick).lower(): pick for pick in picks}
+    requires: dict[str, set[str]] = {}
+    for (folder, name), pick in zip(found, picks):
+        toc = find_toc(folder) if folder.name == name else folder / f"{name}.toc"
+        if toc is None or not toc.is_file():
+            continue
+        needed = set()
+        for key, value in read_toc(toc).items():
+            if TOC_DEPENDENCY.match(key):
+                needed.update(names[dep.strip().lower()] for dep in value.split(",")
+                              if dep.strip().lower() in names)
+        needed.discard(pick)
+        requires[pick] = needed
+    return OnDisk(kind, path.resolve(), picks, requires)
+
+
+def main_addon(chosen: list[str], requires: dict[str, set[str]]) -> str:
+    """Which of several folders installed together the row should be named after.
+
+    The one the others need: a companion declares the addon it belongs to as a
+    dependency. Failing that, the one the others are named after (DBM-Core is
+    not, but Questie is a prefix of its own companions), and failing that the
+    shortest name, which is the same idea with less evidence.
+    """
+    def weight(pick: str) -> tuple:
+        others = [other for other in chosen if other != pick]
+        return (
+            sum(pick in requires.get(other, ()) for other in others),
+            sum(addon_name_for(other).lower().startswith(addon_name_for(pick).lower())
+                for other in others),
+            -len(pick),
+        )
+    return addon_name_for(max(sorted(chosen, key=str.lower), key=weight))
+
+
+def disk_install_plan(found: OnDisk, chosen: list[str]) -> tuple[str, str] | None:
+    """The one row that installs these picks from a zip or folder: (name, source).
+
+    ONE row, unlike a repository, where each addon is its own row on its own
+    history. Everything in a download arrives together and is replaced
+    together by the next download, so an addon and its companion are one
+    thing to update -- splitting them would ask for the same zip twice.
+
+    None when nothing is chosen. A source naming every addon in the tree names
+    none of them, so the next download of the same addon keeps working even
+    if it gains a folder.
+    """
+    if not chosen:
+        return None
+    base = f"{found.kind}:{found.path}"
+    if found.kind == "local" and found.picks == [found.path.name] and \
+            find_toc(found.path) is not None:
+        return found.path.name, base
+    every = sorted(chosen, key=str.lower) == sorted(found.picks, key=str.lower)
+    named = not every or any(names_a_toc(pick) for pick in chosen)
+    # A folder is linked, not copied: each pick has to be named for it to
+    # know what to link.
+    named = named or found.kind == "local"
+    return main_addon(chosen, found.requires), base + (f"#{','.join(chosen)}" if named else "")
+
+
+def zip_version(path: Path, blob: bytes) -> str:
+    """What a zip installed: its name, and a digest that changes with its bytes.
+
+    The name alone would call a re-downloaded zip with the same name up to
+    date; the digest alone tells a person nothing in the table.
+    """
+    return f"{path.stem} · {hashlib.sha256(blob).hexdigest()[:7]}"
+
+
+def install_local_tree(
+    tree: Path, folder: str, target: Path, mode: str, dry_run: bool, *,
+    backup: bool = True, entry: dict | None = None, report=None,
+) -> list[str]:
+    """Link (or copy) several named addons out of one folder into AddOns."""
+    report = report or _nothing
+    if not tree.is_dir():
+        die(f"no such folder: {tree}")
+    written = []
+    for found, name in addon_folders(tree, folder):
+        if "/" in name or name in ("", ".", ".."):
+            die(f"unusable addon folder name: {name!r}")
+        destination = target / name
+        if not dry_run:
+            if is_link(destination):
+                remove_link(destination)
+            elif destination.exists():
+                keep = backup and (entry is None or should_backup_folder(entry, name))
+                displace(destination, backup=keep, report=report)
+            if mode == "copy":
+                shutil.copytree(found, destination)
+            else:
+                make_link(found.resolve(), destination)
+        written.append(name)
+    return written
 
 
 def install_zip(
@@ -2879,46 +3195,9 @@ def install_zip(
     report = report or _nothing
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
-        try:
-            with zipfile.ZipFile(io.BytesIO(blob)) as archive:
-                # Refuse path traversal rather than trusting the archive; this
-                # unpacks whatever a third-party repo published.
-                for name in archive.namelist():
-                    resolved = (tmpdir / name).resolve()
-                    if not str(resolved).startswith(str(tmpdir.resolve())):
-                        die(f"archive contains an unsafe path: {name}")
-                archive.extractall(tmpdir)
-        except zipfile.BadZipFile:
-            die("downloaded file is not a zip -- check the source is an addon release")
+        unpack(blob, tmpdir)
 
-        chosen = wanted_folders(only) if isinstance(only, str) else list(only or [])
-        if chosen:
-            folders = []
-            for name in chosen:
-                if names_a_toc(name):
-                    # Not a folder in the archive: a name for the whole of it.
-                    folders.append((descend_to_toc(tmpdir, name), addon_name_for(name)))
-                    continue
-                found = addon_dirs_in(descend_to(tmpdir, name))
-                if not found:
-                    die(f"no addon folder (a directory holding its own .toc) found in '{name}'")
-                folders.extend(found)
-        else:
-            folders = addon_dirs_in(tmpdir)
-            if not folders:
-                die("no addon folder (a directory holding its own .toc) found in the archive")
-            alternatives = {name for tree, name in folders}
-            if len({tree for tree, _name in folders}) == 1 and len(alternatives) > 1:
-                # One set of files, several names it could be installed under:
-                # a repository that is the addon and ships a .toc per client.
-                # Installing all of them would put the same addon in AddOns
-                # two or three times over, under names only one of which the
-                # person meant -- so this is a question, not a default.
-                names = ", ".join(sorted(alternatives))
-                die(f"this repository holds one addon with {len(alternatives)} .toc files "
-                    f"({names}) -- one per client version.\n"
-                    f"     Name the one you want: #{sorted(alternatives)[0]}.toc")
-
+        folders = addon_folders(tmpdir, only)
         written = []
         for folder, name in folders:
             if "/" in name or name in ("", ".", ".."):
@@ -3077,8 +3356,14 @@ def install_destination(entry: dict, addon: str, root: Path) -> Path | None:
     the best guess.
     """
     source = entry.get("source", "unmanaged")
-    if source.startswith("local:"):
-        return root / Path(source[len("local:"):]).name
+    if source.startswith(("local:", "zip:")):
+        path, folder = split_local_spec(source.split(":", 1)[1])
+        picks = wanted_folders(folder)
+        if picks:
+            return root / addon_name_for(picks[0])
+        if source.startswith("zip:"):
+            return root / addon  # a zip's contents are named for the row
+        return root / Path(path).name
     if source.startswith("github:"):
         _repo, _branch, folder = split_repo_spec(source[len("github:"):])
         return root / (addon_name_for(folder) if folder else addon)
@@ -3161,16 +3446,26 @@ def update_addon(
 
     try:
         kind, rest = parse_source(source)
+        if kind == "zip":
+            return update_from_zip(name, entry, root, rest, result, report,
+                                   force=force, dry_run=dry_run, check=check, progress=progress)
         if kind == "local":
             # Nothing to fetch: a link is already live, and a copy is refreshed
             # straight from disk.
             mode = entry.get("mode", "link")
             progress("installing", rest)
-            result.folders = install_local(
-                Path(rest), root, mode, dry_run, backup=should_backup(entry), report=report
-            )
+            tree, folder = split_local_spec(rest)
+            if folder:
+                result.folders = install_local_tree(
+                    Path(tree), folder, root, mode, dry_run,
+                    backup=entry.get("backup", True), entry=entry, report=report,
+                )
+            else:
+                result.folders = install_local(
+                    Path(rest), root, mode, dry_run, backup=should_backup(entry), report=report
+                )
             result.version = "linked" if mode == "link" else "copied"
-            result.detail = (f"would {mode} from {rest}" if dry_run else f"{mode}ed from {rest}")
+            result.detail = (f"would {mode} from {rest}" if dry_run else f"{result.version} from {rest}")
             if not dry_run:
                 entry["folders"] = result.folders
                 entry["installed"] = result.version
@@ -3223,6 +3518,51 @@ def update_addon(
             previous=result.previous,
             notes=result.notes,
         )
+
+
+def update_from_zip(
+    name: str, entry: dict, root: Path, rest: str, result: Result, report, *,
+    force: bool, dry_run: bool, check: bool, progress,
+) -> Result:
+    """`update_addon` for a zip on this disk. Raises; the caller catches.
+
+    The version is the zip's own name and digest, so re-pointing the row at a
+    newer download is what makes it out of date -- and pointing it at the same
+    file again, unchanged, is not an update at all.
+    """
+    path_text, folder = split_local_spec(rest)
+    path = Path(path_text)
+    progress("checking", path.name)
+    if not path.is_file():
+        if entry.get("installed") and not force:
+            # The usual state of a zip source, not a failure: the download was
+            # installed and then tidied away. A red row on every Update all
+            # for it would teach people to ignore red rows.
+            return Result(
+                name=name, outcome=UP_TO_DATE, version=entry["installed"],
+                detail=f"installed from {path.name}, which is gone now -- "
+                       "install a newer download to update",
+            )
+        die(f"no such zip: {path}")
+    blob = path.read_bytes()
+    version = zip_version(path, blob)
+    result.version = version
+    if entry.get("installed") == version and not force:
+        return Result(name=name, outcome=UP_TO_DATE, detail=f"up to date ({version})", version=version)
+
+    result.detail = f"{result.previous or 'not installed'} -> {version}"
+    if check:
+        return result
+    progress("installing", path.name)
+    result.folders = install_zip(
+        blob, root, dry_run,
+        backup=entry.get("backup", True), entry=entry, only=folder, report=report,
+    )
+    if not dry_run:
+        entry["folders"] = result.folders
+        entry["installed"] = version
+        entry.pop("missing", None)
+    return result
 
 
 # ── locating a WoW install ───────────────────────────────────────────────────

@@ -1239,6 +1239,148 @@ class InstallingSomethingNew(InstallHarness):
         self.assertEqual(str(self.app.install_button["state"]), "normal")
 
 
+class InstallingADownload(InstallHarness):
+    """Install, given a zip somebody downloaded or a folder they unpacked.
+
+    CurseForge is the reason: it serves downloads through its own page, so
+    this tool does not fetch from it, and the zip is handed over instead.
+    Questie is why the whole zip matters -- the addon ships with a companion
+    folder, and the hand-install that leaves it behind is the mistake.
+    """
+
+    QUESTIE = {
+        "Questie/Questie.toc": "## Title: Questie\n",
+        "QuestieDB/QuestieDB.toc": "## Title: Questie DB\n## Dependencies: Questie\n",
+        "QuestieDB/db.lua": "-- data",
+    }
+
+    def downloaded(self, files=None, name="Questie-v11.0.0.zip"):
+        import io
+        import zipfile
+        downloads = self.addons.parent.parent / "Downloads"
+        downloads.mkdir(exist_ok=True)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as archive:
+            for path, body in (files or self.QUESTIE).items():
+                archive.writestr(path, body)
+        (downloads / name).write_bytes(buf.getvalue())
+        return downloads / name
+
+    def pointed_at(self, path):
+        dlg = gui.InstallDialog(self.root, self.addons, self.app.entries())
+        self.opened.append(dlg)
+        dlg.repo.set(str(path))
+        dlg._read_disk()  # what Zip… does, and what typing does a moment later
+        self.pump(2)
+        return dlg
+
+    def test_a_zip_is_one_row_with_every_folder_ticked(self):
+        zipped = self.downloaded()
+        dlg = self.pointed_at(zipped)
+        self.assertEqual(sorted(dlg.folder_boxes), ["Questie", "QuestieDB"])
+        self.assertTrue(all(box.get() for box in dlg.folder_boxes.values()))
+        self.assertEqual(dlg._plan(), [("Questie", f"zip:{zipped.resolve()}")])
+        self.assertFalse(dlg.copy_files)
+
+    def test_unticking_the_companion_names_what_is_left(self):
+        zipped = self.downloaded()
+        dlg = self.pointed_at(zipped)
+        dlg.folder_boxes["QuestieDB"].set(False)
+        dlg._folders_ticked()
+        self.assertEqual(dlg._plan(), [("Questie", f"zip:{zipped.resolve()}#Questie")])
+
+    def test_an_unpacked_folder_is_copied_not_linked(self):
+        unpacked = self.addons.parent.parent / "Downloads" / "Questie"
+        for folder, body in (("Questie", "## Title: Q\n"),
+                             ("QuestieDB", "## Dependencies: Questie\n")):
+            (unpacked / folder).mkdir(parents=True)
+            (unpacked / folder / f"{folder}.toc").write_text(body)
+        dlg = self.pointed_at(unpacked)
+        self.assertTrue(dlg.copy_files, "a link into Downloads vanishes when it is tidied")
+        self.assertEqual(dlg._plan(),
+                         [("Questie", f"local:{unpacked.resolve()}#Questie,QuestieDB")])
+
+    def test_a_hand_installed_companion_is_named_before_it_is_moved(self):
+        (self.addons / "QuestieDB").mkdir()
+        (self.addons / "QuestieDB" / "QuestieDB.toc").write_text("mine")
+        dlg = self.pointed_at(self.downloaded())
+        self.assertIn("QuestieDB.replaced", dlg.caution.cget("text"))
+
+    def test_a_path_that_holds_no_addon_says_so(self):
+        empty = self.addons.parent.parent / "Downloads" / "nothing"
+        empty.mkdir(parents=True)
+        dlg = self.pointed_at(empty)
+        self.assertIn("no addon", dlg.lookup_status.cget("text"))
+        self.assertEqual(dlg._plan(), [])
+
+    def test_typing_a_repository_after_a_path_goes_back_to_github(self):
+        dlg = self.pointed_at(self.downloaded())
+        self.offer(["Bagnon"])
+        dlg.repo.set("o/Bagnon")
+        dlg._absorb_url()
+        self.assertIsNone(dlg.disk)
+        self.assertEqual(dlg._plan(), [("Bagnon", "github:o/Bagnon")])
+
+    def test_install_pressed_straight_after_typing_still_reads_the_zip(self):
+        zipped = self.downloaded()
+        dlg = gui.InstallDialog(self.root, self.addons, self.app.entries())
+        self.opened.append(dlg)
+        dlg.repo.set(str(zipped))
+        dlg._absorb_url()          # typing: the read is still pending
+        dlg._install()
+        self.assertEqual(dlg.result, [("Questie", f"zip:{zipped.resolve()}")])
+
+
+class SettingASourceToADownload(WindowHarness):
+    """Set source, pointed at a zip or at a folder holding several addons."""
+
+    ADDONS = {"Questie": {"source": "unmanaged", "mode": "link", "installed": None,
+                          "folders": ["Questie"]}}
+
+    def setUp(self):
+        super().setUp()
+        self.unpacked = self.addons.parent.parent / "Downloads" / "Questie"
+        for folder, body in (("Questie", "## Title: Q\n"),
+                             ("QuestieDB", "## RequiredDeps: Questie\n"),
+                             ("Unrelated", "## Title: U\n")):
+            (self.unpacked / folder).mkdir(parents=True)
+            (self.unpacked / folder / f"{folder}.toc").write_text(body)
+
+    def dialog(self):
+        dlg = gui.SourceDialog(self.root, "Questie", self.app.entries()["Questie"], self.addons)
+        self.opened.append(dlg)
+        return dlg
+
+    def test_a_folder_offers_its_addons_with_this_one_and_its_companion_ticked(self):
+        dlg = self.dialog()
+        dlg.choice.set("local")
+        dlg._sync()
+        dlg.local.set(str(self.unpacked))
+        dlg._read_local()
+        ticked = sorted(f for f, box in dlg.folder_boxes.items() if box.get())
+        self.assertEqual(ticked, ["Questie", "QuestieDB"])
+        dlg._save()
+        self.assertEqual(dlg.result, (f"local:{self.unpacked}#Questie,QuestieDB", False))
+
+    def test_a_zip_bound_row_reads_back(self):
+        import io
+        import zipfile
+        zipped = self.unpacked.parent / "Questie.zip"
+        with zipfile.ZipFile(zipped, "w") as archive:
+            archive.writestr("Questie/Questie.toc", "x")
+            archive.writestr("QuestieDB/QuestieDB.toc", "## Dependencies: Questie\n")
+        core.set_source(self.app.install(), "Questie", f"zip:{zipped}")
+        dlg = self.dialog()
+        self.pump(4)
+        dlg._read_local()
+        self.assertEqual(dlg.choice.get(), "local")
+        self.assertEqual(dlg.local.get(), str(zipped.resolve()))
+        self.assertTrue(all(box.get() for box in dlg.folder_boxes.values()))
+        self.assertEqual(str(dlg.copy_box["state"]), "disabled")
+        dlg._save()
+        self.assertEqual(dlg.result, (f"zip:{zipped.resolve()}", False))
+
+
 class _StillRunning:
     def is_alive(self):
         return True
