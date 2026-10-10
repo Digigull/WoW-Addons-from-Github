@@ -21,6 +21,34 @@ script:
 "WoW Addons from GitHub.exe" update --check
 ```
 
+## New in v1.2.0
+
+**Install a zip you downloaded yourself.** Some addons are only published on sites this
+tool does not fetch from. CurseForge serves its downloads through its own page, which is
+how the people who write the addons get paid, so this tool does not go round it. Download
+the zip there as usual and hand it over: **Install addon…**, then **Zip…**, or in the
+terminal `addons.py install ~/Downloads/Questie-v11.0.0.zip`. To update, download the newer
+zip and install that one; the row is re-pointed at it and replaced. The version shown is
+the zip's name plus a short digest of its bytes, so the same zip twice is *up to date* and
+a different one is not, and deleting the zip afterwards is fine.
+
+**An addon that ships with a companion folder installs whole.** Questie arrives as
+`Questie` *and* `QuestieDB` in one zip, and installing only the folder named after the
+addon left it broken. Every addon folder in the zip is now installed, as one row named
+after the addon the others depend on; the window lists them all ticked, so you can untick
+one you do not want. Folders you had installed by hand are moved aside once as
+`<Name>.replaced` — the companion too, because it is somebody's files as well.
+
+A folder you already unpacked works the same way (**Folder…**), and is **copied** rather
+than linked, because a link into Downloads vanishes when Downloads is tidied; `--link`
+links it instead.
+
+**A folder with only per-client `.toc`s is an addon.** `QuestieDB` ships
+`QuestieDB_Forever.toc`, `QuestieDB_Vanilla.toc` and so on, and no plain `QuestieDB.toc`.
+A modern client loads the one with its own suffix, but the scan called the folder broken
+and advised renaming it after one of them — which would have broken it — and a zip holding
+it installed everything except it.
+
 ## New in v1.1.0
 
 **Private repositories.** An addon repository you have not made public was invisible to
