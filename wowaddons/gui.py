@@ -1678,6 +1678,9 @@ class App(ttk.Frame):
         # {addon: keep a copy first} for saved variables somebody asked to have
         # deleted, held until the install they belong to has succeeded.
         self._pending_saved: dict[str, bool] = {}
+        # What the Downloads folder offers, read on Rescan: {row name: ZipOffer}.
+        # Not saved -- the folder is the record, and it changes under us.
+        self.zip_offers: dict = {}
 
         # The version belongs where a user can read it off without hunting: a
         # GUI has no --version, and "which build are you running?" is the first
@@ -1766,6 +1769,13 @@ class App(ttk.Frame):
         self.github_label = ttk.Label(top, text="checking…", foreground="grey")
         self.github_label.grid(row=2, column=1, sticky="w", padx=8)
         ttk.Button(top, text="Sign in…", command=self.sign_in).grid(row=2, column=2)
+
+        # Where downloaded zips land. Rescan reads it and offers each newer
+        # download as a suggestion; Update asks about each one before using it.
+        ttk.Label(top, text="Downloads:").grid(row=3, column=0, sticky="w")
+        self.zips_label = ttk.Label(top, text="(not set)", foreground="grey")
+        self.zips_label.grid(row=3, column=1, sticky="w", padx=8)
+        ttk.Button(top, text="Choose…", command=self.choose_zips_folder).grid(row=3, column=2)
 
         table = ttk.Frame(self)
         table.grid(row=1, column=0, sticky="nsew")
@@ -1909,6 +1919,11 @@ class App(ttk.Frame):
             text=core.tilde(directory) if directory else "(not set)",
             foreground="" if directory else "grey",
         )
+        zips = core.zips_dir(self.install())
+        self.zips_label.configure(
+            text=core.tilde(str(zips)) if zips else "(not set) — a folder of downloaded zips",
+            foreground="" if zips else "grey",
+        )
 
         selected = set(self.tree.selection())
         self.tree.delete(*self.tree.get_children())
@@ -1949,10 +1964,31 @@ class App(ttk.Frame):
                 ),
                 tags=tags,
             )
+        self._show_zip_offers()
         for name in selected:
             if self.tree.exists(name):
                 self.tree.selection_add(name)
         self._sync_buttons()
+
+    def _show_zip_offers(self) -> None:
+        """Put each download the Downloads folder offers on its row.
+
+        An addon already in the table gets the zip's version in Latest and a
+        suggestion in Status. One that is not installed gets a row of its own,
+        named `zip:<Addon>` underneath, until it is installed or turned down.
+        """
+        for name, offer in self.zip_offers.items():
+            if self.tree.exists(name):
+                self.tree.set(name, "latest", offer.version or "?")
+                self.tree.set(name, "status", f"newer download: {offer.path.name}"
+                              if offer.action == core.UPDATE else f"download: {offer.path.name}")
+                self.tree.item(name, tags=["suggested"])
+            else:
+                self.tree.insert(
+                    "", "end", iid=f"zip:{name}", text=name,
+                    values=(f"download: {offer.path.name}", "", offer.version or "", "new download"),
+                    tags=["suggested"],
+                )
 
     def _toggle_no_api(self) -> None:
         core.set_checks_without_api(self.install(), self.no_api.get())
@@ -2130,11 +2166,41 @@ class App(ttk.Frame):
         gone = f" {forgotten} deleted addon(s) dropped." if forgotten else ""
         problems = self._unloadable(core.addons_dir(install))
         skipped = f" {len(problems)} folder(s) the game cannot load." if problems else ""
+        offered = self._read_zips()
+        downloads = f" {offered} download(s) to offer." if offered else ""
         self.say(
             f"{installed} addon folder(s); {guessed} with a source found or suggested."
-            f"{gone}{skipped}"
+            f"{gone}{skipped}{downloads}"
         )
         self._report_unloadable(problems)
+
+    def _read_zips(self) -> int:
+        """Read the Downloads folder for newer zips. Returns how many are offered.
+
+        Only what is worth asking about: a newer version, a version that cannot
+        be compared, or an addon not installed yet -- and never a download that
+        was already turned down.
+        """
+        self.zip_offers = {}
+        folder, root = core.zips_dir(self.install()), self.root_dir()
+        if folder is not None and root is not None and folder.is_dir():
+            outcome = self.guard(lambda: core.zip_offers(folder, core.addons_dir(self.install())))
+            for offer in (outcome or ([], []))[0]:
+                if offer.action in (core.UPDATE, core.UNSURE, core.NEW) \
+                        and not core.declined_zip(self.install(), offer):
+                    self.zip_offers[offer.name] = offer
+        self.refresh()
+        return len(self.zip_offers)
+
+    def choose_zips_folder(self) -> None:
+        chosen = filedialog.askdirectory(title="The folder your downloaded addon zips are in",
+                                         parent=self)
+        if not chosen:
+            return
+        core.set_zips_dir(self.install(), Path(chosen))
+        core.save(self.state)
+        offered = self._read_zips()
+        self.say(f"{offered} download(s) to offer." if offered else "No newer downloads in that folder.")
 
     def _unloadable(self, root: Path) -> dict:
         """Folders that hold an addon and still will not load. Never fatal."""
@@ -2176,6 +2242,10 @@ class App(ttk.Frame):
             self.say("Set your WoW folder first.")
             return
         name = names[0]
+        if name.startswith("zip:"):
+            # A download, not an addon yet: Update is how it becomes one.
+            self.say("That is a download, not an installed addon -- press Update to install it.")
+            return
         entry = self.entries().setdefault(name, core.new_entry(name))
         dialog = SourceDialog(self.master, name, entry, root,
                               no_api=core.checks_without_api(self.install()))
@@ -2272,10 +2342,53 @@ class App(ttk.Frame):
         self.say(f"{taken} source(s) accepted." if taken else "Nothing suggested for that selection.")
 
     def update_selected(self) -> None:
-        self.start(self.selection())
+        self._start_with_downloads(self.selection())
 
     def update_all(self) -> None:
-        self.start(core.display_order(self.entries()))
+        self._start_with_downloads(core.display_order(self.entries())
+                                   + [f"zip:{name}" for name in self.zip_offers])
+
+    def _start_with_downloads(self, names: list[str]) -> None:
+        """Ask about each offered download among these rows, then update.
+
+        One question per download, so a zip is never swapped in unseen. Yes
+        binds the row to that zip and installs it with the rest; No turns this
+        download down for good (a newer one is offered again); Cancel stops
+        the whole run and decides nothing.
+        """
+        rows = [name[len("zip:"):] if name.startswith("zip:") else name for name in names]
+        taken = []
+        for name in [n for n in dict.fromkeys(rows) if n in self.zip_offers]:
+            offer = self.zip_offers[name]
+            before = offer.installed if offer.installed is not None else "not installed"
+            answer = messagebox.askyesnocancel(
+                "Use the new download?",
+                f"{name}: {before or 'no version'} → {offer.version or 'no version'}\n\n"
+                f"Install it from {offer.path.name}?\n\n"
+                "Yes installs it. No skips this download and stops suggesting it.\n"
+                "Cancel stops here and decides nothing.",
+                parent=self,
+            )
+            if answer is None:
+                self.refresh()
+                self.say("Stopped; nothing decided.")
+                return
+            if answer:
+                plan = self.guard(lambda o=offer: core.offer_source(o))
+                if plan is None:
+                    continue
+                row, source = plan
+                if self.guard(lambda r=row, s=source: core.set_source(self.install(), r, s)) is None:
+                    continue
+                taken.append(row)
+            else:
+                core.decline_zip(self.install(), offer)
+            del self.zip_offers[name]
+        core.save(self.state)
+        self.refresh()
+        wanted = [n for n in rows if n in self.entries()] + [n for n in taken if n not in rows]
+        if wanted:
+            self.start(list(dict.fromkeys(wanted)))
 
     def check_all(self) -> None:
         """Ask every bound addon what the latest version is. Download nothing.

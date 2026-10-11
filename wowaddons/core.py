@@ -558,11 +558,19 @@ def folder_problem(folder: Path) -> str | None:
     return None
 
 
+BACKUP_NAME = re.compile(r"\.replaced\d*$")
+
+
 def scan_problems(root: Path) -> dict[str, str]:
     """Folders in AddOns that look like an addon and are not one, and why."""
     problems: dict[str, str] = {}
     for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
         if not child.is_dir() or find_toc(child) is not None:
+            continue
+        if BACKUP_NAME.search(child.name):
+            # A copy this tool moved aside on purpose. The game not loading it
+            # is the point, and calling it a problem after every install from
+            # a zip made a working update look like a broken one.
             continue
         reason = folder_problem(child)
         if reason:
@@ -3255,6 +3263,40 @@ def zip_offers(downloads: Path, root: Path) -> tuple[list[ZipOffer], list[tuple[
         offers.append(ZipOffer(here.name, path, version, now, action, passed))
     offers.sort(key=lambda o: o.name.lower())
     return offers, unreadable
+
+
+def zips_dir(install: dict) -> Path | None:
+    """The folder this install's downloaded zips are read from, if one is set."""
+    directory = install.get("zips_dir")
+    return Path(directory) if directory else None
+
+
+def set_zips_dir(install: dict, directory: Path | None) -> None:
+    if directory is None:
+        install.pop("zips_dir", None)
+    else:
+        install["zips_dir"] = str(directory.expanduser().resolve())
+
+
+def zip_identity(path: Path) -> str:
+    """One download, told apart from every other: its name and its bytes."""
+    return zip_version(path, path.read_bytes())
+
+
+def declined_zip(install: dict, offer: ZipOffer) -> bool:
+    """Was THIS download of the addon turned down? A newer one is offered again."""
+    said_no = install.get("zips_declined", {}).get(offer.name.lower())
+    return said_no is not None and said_no == zip_identity(offer.path)
+
+
+def decline_zip(install: dict, offer: ZipOffer) -> None:
+    install.setdefault("zips_declined", {})[offer.name.lower()] = zip_identity(offer.path)
+
+
+def offer_source(offer: ZipOffer) -> tuple[str, str]:
+    """The (row, source) that installs an offer: the zip whole, as `install <zip>` does."""
+    found = read_on_disk(offer.path)
+    return disk_install_plan(found, found.picks)
 
 
 def install_local_tree(

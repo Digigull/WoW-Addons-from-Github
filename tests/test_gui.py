@@ -1869,3 +1869,91 @@ class SigningInToGitHub(WindowHarness):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class DownloadsFolder(WindowHarness):
+    """Rescan offers the newer zips in the Downloads folder; Update asks about each.
+
+    Yes binds the row to that zip and installs it; No turns that download down
+    for good, so the next Rescan does not offer it again; Cancel decides nothing.
+    """
+
+    def setUp(self):
+        super().setUp()
+        import zipfile
+        self.downloads = pathlib.Path(self.tmp.name) / "zips"
+        self.downloads.mkdir()
+        journal = self.addons / "ForeverDungeonJournal"
+        journal.mkdir()
+        (journal / "ForeverDungeonJournal.toc").write_text("## Version: 1.6.2\n")
+        for name, files in {
+            "ForeverDungeonJournal-1.6.2.zip": {"ForeverDungeonJournal/ForeverDungeonJournal.toc": "## Version: 1.6.2\n"},
+            "ForeverDungeonJournal1.6.3.zip": {"ForeverDungeonJournal/ForeverDungeonJournal.toc": "## Version: 1.6.3\n"},
+            "MuteNotInGroup.zip": {"MuteNotInGroup/MuteNotInGroup.toc": "## Version: 1.0\n"},
+        }.items():
+            with zipfile.ZipFile(self.downloads / name, "w") as archive:
+                for inner, body in files.items():
+                    archive.writestr(inner, body)
+        core.set_zips_dir(self.app.install(), self.downloads)
+        self.app.rescan()
+        self.pump()
+
+    def answering(self, answers: dict):
+        """Stand in for the Yes/No/Cancel prompt, answering by addon name."""
+        asked = []
+        real = gui.messagebox.askyesnocancel
+
+        def ask(title, message, **k):
+            name = message.split(":")[0]
+            asked.append(name)
+            return answers[name]
+
+        gui.messagebox.askyesnocancel = ask
+        self.addCleanup(setattr, gui.messagebox, "askyesnocancel", real)
+        return asked
+
+    def finish(self):
+        for _ in range(400):
+            self.pump(1)
+            if self.app.worker is None:
+                return
+        self.fail("the worker never finished")
+
+    def test_rescan_offers_the_newest_download_and_a_new_addon(self):
+        self.assertEqual(self.app.tree.set("ForeverDungeonJournal", "latest"), "1.6.3")
+        self.assertIn("ForeverDungeonJournal1.6.3.zip", self.status_of("ForeverDungeonJournal"))
+        self.assertTrue(self.app.tree.exists("zip:MuteNotInGroup"))
+        # An offer is not a binding: nothing changes until Update is answered.
+        self.assertEqual(self.app.entries()["ForeverDungeonJournal"]["source"], "unmanaged")
+
+    def test_yes_installs_the_download_and_no_stops_suggesting_it(self):
+        asked = self.answering({"ForeverDungeonJournal": True, "MuteNotInGroup": False})
+        self.app.update_all()
+        self.finish()
+        self.assertEqual(sorted(asked), ["ForeverDungeonJournal", "MuteNotInGroup"])
+        toc = self.addons / "ForeverDungeonJournal" / "ForeverDungeonJournal.toc"
+        self.assertIn("1.6.3", toc.read_text())
+        self.assertTrue(self.app.entries()["ForeverDungeonJournal"]["source"].startswith("zip:"))
+        self.assertFalse((self.addons / "MuteNotInGroup").exists())
+
+        self.app.rescan()
+        self.pump()
+        self.assertEqual(self.app.zip_offers, {})
+        self.assertFalse(self.app.tree.exists("zip:MuteNotInGroup"))
+
+    def test_cancel_decides_nothing(self):
+        self.answering({"ForeverDungeonJournal": None})
+        self.app.update_all()
+        self.pump()
+        self.assertIsNone(self.app.worker)
+        self.assertIn("1.6.2", (self.addons / "ForeverDungeonJournal" / "ForeverDungeonJournal.toc").read_text())
+        self.assertEqual(sorted(self.app.zip_offers), ["ForeverDungeonJournal", "MuteNotInGroup"])
+
+    def test_update_selected_asks_only_about_the_selected_download(self):
+        asked = self.answering({"MuteNotInGroup": True})
+        self.app.tree.selection_set("zip:MuteNotInGroup")
+        self.app.update_selected()
+        self.finish()
+        self.assertEqual(asked, ["MuteNotInGroup"])
+        self.assertTrue((self.addons / "MuteNotInGroup" / "MuteNotInGroup.toc").is_file())
+        self.assertIn("ForeverDungeonJournal", self.app.zip_offers)

@@ -3675,6 +3675,12 @@ class AFolderOfDownloadedZips(unittest.TestCase):
         self.assertEqual([o.name for o in offers], ["Baganator"])
         self.assertEqual([p.name for p, _why in unreadable], ["notes.zip"])
 
+    def test_a_folder_moved_aside_is_not_reported_as_a_problem(self):
+        backup = self.root / "ForeverDungeonJournal.replaced"
+        backup.mkdir()
+        (backup / "ForeverDungeonJournal.toc").write_text("## Version: 1.6.2\n")
+        self.assertEqual(addons.scan_problems(self.root), {})
+
     def test_the_command_installs_only_what_was_answered_yes(self):
         from wowaddons import cli
         self.installed("ForeverDungeonJournal", "1.6.2")

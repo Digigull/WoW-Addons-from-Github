@@ -30,8 +30,18 @@ with what is in AddOns. Two downloads of one addon count once: only the newest i
 and the older one is listed as passed over. Then it asks, one addon at a time: a newer
 version `[Y/n]`, an addon you do not have yet `[y/N]`, and a version it cannot compare
 `[y/N]`. Up to date and older zips are listed and not asked about. A yes installs exactly as
-`install <zip>` does; `--check` only lists, and `--yes` takes everything listed. Terminal
-only for now.
+`install <zip>` does; `--check` only lists, and `--yes` takes everything listed.
+
+**The same, in the window.** Set **Downloads:** under the WoW folder once. Every **Rescan**
+reads it: an installed addon with a newer zip shows the zip's version under *Latest* and
+`newer download: <file>` in *Status*, and an addon you do not have gets a `new download` row.
+**Update all** and **Update selected** ask about each download in turn: **Yes** installs it,
+**No** skips that download and stops suggesting it (a newer one is offered again), and
+**Cancel** stops and decides nothing.
+
+**A folder moved aside is not a problem.** After an install replaced a hand-installed
+folder, Rescan reported its `<Name>.replaced` backup as a folder the game will not load.
+It no longer does.
 
 ## New in v1.2.0
 

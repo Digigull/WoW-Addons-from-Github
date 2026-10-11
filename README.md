@@ -295,6 +295,20 @@ addon at a time:
 Up to date and older zips are listed and not asked about. A yes installs exactly as
 `install <zip>` does. `--check` only lists; `--yes` answers yes to everything listed.
 
+**In the window**, set **Downloads:** (under the WoW folder) to that folder once. Every
+**Rescan** then reads it: an installed addon with a newer zip shows the zip's version under
+*Latest* and `newer download: <file>` in *Status*, and an addon you do not have gets its own
+`new download` row. Nothing changes until **Update all** or **Update selected**, which asks
+about each download in turn:
+
+- **Yes** binds the row to that zip and installs it with the rest of the update.
+- **No** skips that download and stops suggesting it. A newer download of the same addon
+  is offered again.
+- **Cancel** stops the update and decides nothing.
+
+A folder the tool moved aside (`<Name>.replaced`) is no longer reported as a folder the
+game will not load: it is a backup, and not loading it is the point.
+
 A folder you already unpacked works the same way (**Folder…**), and is **copied** rather
 than linked, because a link into Downloads vanishes when Downloads is tidied. `--link`
 links it instead.
