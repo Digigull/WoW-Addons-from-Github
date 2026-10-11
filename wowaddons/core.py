@@ -3151,6 +3151,112 @@ def zip_version(path: Path, blob: bytes) -> str:
     return f"{path.stem} · {hashlib.sha256(blob).hexdigest()[:7]}"
 
 
+# ── a folder of downloads: which zip updates what ────────────────────────────
+#
+# Downloading a batch of updates leaves a folder of zips, some of them two
+# versions of one addon (ForeverDungeonJournal-1.6.2.zip beside 1.6.3), named
+# however each site names them. Naming each zip to `install` is the chore this
+# saves: every zip is read for the addon it installs as, matched against what
+# AddOns holds, and only the newest zip per addon is offered.
+
+
+@dataclass
+class ZipOffer:
+    """What one addon's newest zip in a downloads folder would do."""
+
+    name: str                 # the row it installs as: the addon the others depend on
+    path: Path                # the newest zip for it
+    version: str              # that zip's .toc version, "" when it names none
+    installed: str | None     # the version in AddOns now; None when it is not installed
+    action: str               # UPDATE, NEW, CURRENT, OLDER, or UNSURE (versions not comparable)
+    passed_over: list[Path] = field(default_factory=list)   # older zips of the same addon
+
+
+UPDATE, NEW, CURRENT, OLDER, UNSURE = "update", "new", "current", "older", "unsure"
+
+
+def toc_version(folder: Path) -> str:
+    """The ## Version a folder's .tocs give, "" when none does.
+
+    The .toc the game loads first, then the others: Questie's base .toc is a
+    stub for clients it does not support, and its version is only in the
+    per-client ones beside it.
+    """
+    first = find_toc(folder)
+    try:
+        others = sorted(p for p in folder.iterdir() if p.suffix.lower() == ".toc" and p.is_file())
+    except OSError:
+        others = []
+    for toc in ([first] if first else []) + others:
+        version = read_toc(toc).get("version", "")
+        if version:
+            return version
+    return ""
+
+
+def version_key(text: str) -> tuple[int, ...] | None:
+    """The numbers in a version, for ordering: 'v4.11.23' -> (4, 11, 23).
+
+    Words are dropped: '0.5.3-beta' and '0.5.3' compare equal, which is the
+    honest answer for two names of one release. None when there are no numbers
+    to compare.
+    """
+    numbers = re.findall(r"\d+", text or "")
+    return tuple(int(n) for n in numbers) if numbers else None
+
+
+def zip_offers(downloads: Path, root: Path) -> tuple[list[ZipOffer], list[tuple[Path, str]]]:
+    """Read every zip in a folder and say what each addon's newest one would do.
+
+    Returns the offers, sorted by name, and the zips that could not be read,
+    each with the reason. Nothing is installed: deciding is the caller's.
+    """
+    downloads = downloads.expanduser().resolve()
+    if not downloads.is_dir():
+        die(f"no such folder: {downloads}")
+    by_addon: dict[str, list[tuple[Path, str, str]]] = {}
+    unreadable: list[tuple[Path, str]] = []
+    for path in sorted(downloads.iterdir(), key=lambda p: p.name.lower()):
+        if not path.is_file() or not is_zip_name(path.name):
+            continue
+        try:
+            found = read_on_disk(path)
+            if found.client_choice:
+                unreadable.append((path, "one addon with a .toc per client -- "
+                                         f"install it by name: install {path.name} --folder <the .toc>"))
+                continue
+            name = main_addon(found.picks, found.requires)
+            folders = {n.lower(): f for f, n in addon_dirs_in(peek_zip(path))}
+            version = toc_version(folders[name.lower()]) if name.lower() in folders else ""
+        except (Fail, OSError, zipfile.BadZipFile) as exc:
+            unreadable.append((path, str(exc)))
+            continue
+        by_addon.setdefault(name.lower(), []).append((path, name, version))
+
+    installed = {child.name.lower(): child for child in root.iterdir()
+                 if child.is_dir() and find_toc(child) is not None} if root.is_dir() else {}
+    offers = []
+    for key, zips in by_addon.items():
+        # Newest by version; a version that cannot be read loses to one that
+        # can, and the download time breaks a tie.
+        zips.sort(key=lambda z: (version_key(z[2]) or (), z[0].stat().st_mtime))
+        path, name, version = zips[-1]
+        passed = [z[0] for z in zips[:-1]]
+        here = installed.get(key)
+        if here is None:
+            offers.append(ZipOffer(name, path, version, None, NEW, passed))
+            continue
+        now = toc_version(here)
+        new_key, old_key = version_key(version), version_key(now)
+        if new_key is not None and old_key is not None:
+            action = UPDATE if new_key > old_key else CURRENT if new_key == old_key else OLDER
+        else:
+            action = CURRENT if version and version == now else UNSURE
+        offers.append(ZipOffer(here.name, path, version, now, action, passed))
+    offers.sort(key=lambda o: o.name.lower())
+    return offers, unreadable
+
+
 def install_local_tree(
     tree: Path, folder: str, target: Path, mode: str, dry_run: bool, *,
     backup: bool = True, entry: dict | None = None, report=None,

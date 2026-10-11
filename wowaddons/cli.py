@@ -18,6 +18,7 @@ EPILOG = """\
     addons.py scan
     addons.py install owner/repo
     addons.py install ~/Downloads/Questie-v11.0.0.zip
+    addons.py zips ~/Downloads
     addons.py set GnomeWorks local:.
     addons.py set SomeAddon github:owner/repo
     addons.py set OneOfMany github:owner/repo#OneOfMany
@@ -39,6 +40,7 @@ HOW IT FITS TOGETHER
   scan     reads every addon already installed there and writes them into the
            manifest, guessing a source from each .toc where it can
   install  fetches an addon you do NOT have yet, and binds it
+  zips     reads a folder of downloaded zips and offers each update it holds
   set      binds one addon you DO have to where its updates should come from
   update   brings every bound addon up to date
 
@@ -320,6 +322,74 @@ def install_from_disk(args, state: dict, install: dict, root: Path) -> None:
     run_install(args, state, install, root, [plan], force=True)
 
 
+def cmd_zips(args, state: dict) -> None:
+    """Offer every update a folder of downloaded zips holds, one question each.
+
+    No zip is named: each one is read for the addon it installs, the newest
+    zip per addon is matched against AddOns, and only a newer version (or an
+    addon not installed yet) is asked about. Yes installs it exactly as
+    `install <zip>` would.
+    """
+    install = selected(args, state)
+    root = core.addons_dir(install)
+    folder = Path(args.folder).expanduser()
+    step(f"Reading the zips in {core.tilde(str(folder.resolve()))}")
+    offers, unreadable = core.zip_offers(folder, root)
+    for path, why in unreadable:
+        warn(f"{path.name}: {why}")
+    if not offers:
+        note("no addon zips here")
+        return
+
+    for offer in offers:
+        old = offer.installed if offer.installed is not None else "not installed"
+        verdict = {
+            core.UPDATE: f"{old or '?'} -> {offer.version or '?'}",
+            core.NEW: f"not installed -- {offer.version or 'no version'}",
+            core.CURRENT: f"up to date ({offer.version})",
+            core.OLDER: f"{offer.version} is older than the installed {old}",
+            core.UNSURE: f"cannot compare {old or 'no version'} with {offer.version or 'no version'}",
+        }[offer.action]
+        note(f"{offer.name:24s} {verdict}   {DIM}{offer.path.name}{RESET}")
+        for passed in offer.passed_over:
+            note(f"{'':24s} {DIM}passing over the older {passed.name}{RESET}")
+
+    asked = [o for o in offers if o.action in (core.UPDATE, core.UNSURE, core.NEW)]
+    if not asked:
+        note("")
+        note("nothing to update")
+        return
+    if args.check:
+        return
+
+    taken = []
+    for offer in asked:
+        if args.yes:
+            yes = True
+        else:
+            question = {
+                core.UPDATE: f"Update {offer.name} from {offer.path.name}? [Y/n] ",
+                core.UNSURE: f"Install {offer.path.name} over {offer.name}? [y/N] ",
+                core.NEW: f"{offer.name} is not installed. Install it from {offer.path.name}? [y/N] ",
+            }[offer.action]
+            try:
+                answer = input(f"   {question}").strip().lower()
+            except EOFError:
+                answer = "n"
+            yes = answer in ("y", "yes") or (not answer and offer.action == core.UPDATE)
+        if yes:
+            taken.append(offer)
+
+    for offer in taken:
+        install_from_disk(
+            argparse.Namespace(repo=str(offer.path), folder=[], link=False, install=args.install,
+                               no_api=False, reset_settings=False, no_settings_backup=False),
+            state, install, root,
+        )
+    if not taken:
+        note("nothing installed")
+
+
 def run_install(args, state: dict, install: dict, root: Path, plan, *, force: bool = False) -> None:
     # The same run `update` does, rather than a second copy of it that could
     # come to disagree about backups, pacing or what counts as a failure.
@@ -554,6 +624,13 @@ def build_parser(prog: str = "addons.py", epilog: str | None = None) -> argparse
     p.add_argument("--no-api", action="store_true",
                    help="ask git and codeload instead of the GitHub API")
     p.set_defaults(func=cmd_install)
+
+    p = targeted("zips", help="offer the updates a folder of downloaded zips holds")
+    p.add_argument("folder", help="the folder the zips were downloaded to")
+    p.add_argument("--check", action="store_true", help="only list what each zip would do")
+    p.add_argument("--yes", action="store_true",
+                   help="install every update and new addon listed, without asking")
+    p.set_defaults(func=cmd_zips)
 
     p = sub.add_parser("where", help="print the manifest and AddOns paths")
     p.set_defaults(func=cmd_where)

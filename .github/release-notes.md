@@ -21,6 +21,18 @@ script:
 "WoW Addons from GitHub.exe" update --check
 ```
 
+## New in v1.3.0
+
+**Hand over a folder of downloads instead of each zip.** After downloading a batch of
+updates, `addons.py zips ~/Downloads/addon-zips` reads every zip in the folder for the
+addon it installs as, whatever the file is called, and compares the version in its `.toc`
+with what is in AddOns. Two downloads of one addon count once: only the newest is offered,
+and the older one is listed as passed over. Then it asks, one addon at a time: a newer
+version `[Y/n]`, an addon you do not have yet `[y/N]`, and a version it cannot compare
+`[y/N]`. Up to date and older zips are listed and not asked about. A yes installs exactly as
+`install <zip>` does; `--check` only lists, and `--yes` takes everything listed. Terminal
+only for now.
+
 ## New in v1.2.0
 
 **Install a zip you downloaded yourself.** Some addons are only published on sites this

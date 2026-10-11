@@ -19,6 +19,7 @@ whose failure would be silent:
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import io
 import json
@@ -31,6 +32,7 @@ import time
 import unittest
 import urllib.error
 import zipfile
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
@@ -3583,3 +3585,112 @@ class AFolderWithOnlyPerClientTocs(unittest.TestCase):
                 "QuestieDB/QuestieDB_Vanilla.toc": "x",
             }), pathlib.Path(tmp), dry_run=False)
             self.assertEqual(sorted(landed), ["Questie", "QuestieDB"])
+
+
+class AFolderOfDownloadedZips(unittest.TestCase):
+    """`zips <folder>`: which of a batch of downloads updates what.
+
+    The owner's downloads folder held two ForeverDungeonJournal zips (1.6.2 and
+    1.6.3), Questie with its companion, an addon not installed at all, and
+    several already up to date -- named however each site names a download.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = pathlib.Path(self.tmp.name)
+        self.root = self.base / "AddOns"
+        self.root.mkdir()
+        self.downloads = self.base / "zips"
+        self.downloads.mkdir()
+
+    def installed(self, name: str, version: str, toc: str | None = None) -> None:
+        folder = self.root / name
+        folder.mkdir()
+        (folder / (toc or f"{name}.toc")).write_text(f"## Title: {name}\n## Version: {version}\n")
+
+    def download(self, zip_name: str, files: dict) -> pathlib.Path:
+        path = self.downloads / zip_name
+        path.write_bytes(mkzip(files))
+        return path
+
+    def offers(self) -> dict:
+        offers, unreadable = addons.zip_offers(self.downloads, self.root)
+        self.assertEqual(unreadable, [])
+        return {offer.name: offer for offer in offers}
+
+    def test_the_newest_of_two_zips_is_offered_as_the_update(self):
+        self.installed("ForeverDungeonJournal", "1.6.2")
+        old = self.download("ForeverDungeonJournal-1.6.2.zip",
+                            {"ForeverDungeonJournal/ForeverDungeonJournal.toc": "## Version: 1.6.2\n"})
+        new = self.download("ForeverDungeonJournal1.6.3.zip",
+                            {"ForeverDungeonJournal/ForeverDungeonJournal.toc": "## Version: 1.6.3\n"})
+        offer = self.offers()["ForeverDungeonJournal"]
+        self.assertEqual((offer.action, offer.installed, offer.version), (addons.UPDATE, "1.6.2", "1.6.3"))
+        self.assertEqual(offer.path.name, new.name)
+        self.assertEqual([p.name for p in offer.passed_over], [old.name])
+
+    def test_versions_compare_as_numbers_not_text(self):
+        self.installed("Leatrix_Maps", "1.60.9")
+        self.download("Leatrix_Maps-1.60.20-forever.zip",
+                      {"Leatrix_Maps/Leatrix_Maps.toc": "## Version: 1.60.20\n"})
+        self.assertEqual(self.offers()["Leatrix_Maps"].action, addons.UPDATE)
+
+    def test_the_same_version_is_up_to_date_and_an_older_one_is_not_offered(self):
+        self.installed("Baganator", "836")
+        self.installed("GearQuestForever", "0.5.3-beta")
+        self.download("Baganator-836.zip", {"Baganator/Baganator.toc": "## Version: 836\n"})
+        self.download("GearQuestForever-v0.3.0-beta.zip",
+                      {"GearQuestForever/GearQuestForever.toc": "## Version: 0.3.0-beta\n"})
+        offers = self.offers()
+        self.assertEqual(offers["Baganator"].action, addons.CURRENT)
+        self.assertEqual(offers["GearQuestForever"].action, addons.OLDER)
+
+    def test_an_addon_with_companions_is_one_offer_named_after_the_addon(self):
+        # Questie's own .toc is a stub; its version is only in the per-client ones.
+        self.installed("Questie", "11.9.0", toc="Questie_Camelot.toc")
+        self.download("Questie-v12.0.4+v1.0.5.zip", {
+            "Questie/Questie.toc": "## Interface: 00000\n## Title: Questie\n",
+            "Questie/Questie_Camelot.toc": "## Version: 12.0.4\n",
+            "QuestieDB/QuestieDB_Camelot.toc": "## Version: 1.0.5\n## Dependencies: Questie\n",
+        })
+        offers = self.offers()
+        self.assertEqual(sorted(offers), ["Questie"])
+        self.assertEqual((offers["Questie"].action, offers["Questie"].version), (addons.UPDATE, "12.0.4"))
+
+    def test_an_addon_not_installed_is_offered_as_new(self):
+        self.download("MuteNotInGroup.zip", {"MuteNotInGroup/MuteNotInGroup.toc": "## Version: 1.0\n"})
+        offer = self.offers()["MuteNotInGroup"]
+        self.assertEqual((offer.action, offer.installed), (addons.NEW, None))
+
+    def test_a_version_that_cannot_be_compared_is_said_so(self):
+        self.installed("Kerzo", "")
+        self.download("Kerzo.zip", {"Kerzo/Kerzo.toc": "## Version: 4.3\n"})
+        self.assertEqual(self.offers()["Kerzo"].action, addons.UNSURE)
+
+    def test_a_zip_holding_no_addon_is_reported_not_fatal(self):
+        self.download("notes.zip", {"readme.txt": "hello"})
+        self.download("Baganator-836.zip", {"Baganator/Baganator.toc": "## Version: 836\n"})
+        offers, unreadable = addons.zip_offers(self.downloads, self.root)
+        self.assertEqual([o.name for o in offers], ["Baganator"])
+        self.assertEqual([p.name for p, _why in unreadable], ["notes.zip"])
+
+    def test_the_command_installs_only_what_was_answered_yes(self):
+        from wowaddons import cli
+        self.installed("ForeverDungeonJournal", "1.6.2")
+        self.download("ForeverDungeonJournal1.6.3.zip",
+                      {"ForeverDungeonJournal/ForeverDungeonJournal.toc": "## Version: 1.6.3\n"})
+        self.download("MuteNotInGroup.zip", {"MuteNotInGroup/MuteNotInGroup.toc": "## Version: 1.0\n"})
+        config = self.base / "config"
+        saved = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = str(config)
+        self.addCleanup(lambda: os.environ.__setitem__("XDG_CONFIG_HOME", saved) if saved
+                        else os.environ.pop("XDG_CONFIG_HOME", None))
+        answers = iter(["", "n"])        # Enter takes the update; the new addon is declined
+        with mock.patch("builtins.input", lambda _q: next(answers)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            cli.main(["init", str(self.root)])
+            cli.main(["zips", str(self.downloads)])
+        toc = self.root / "ForeverDungeonJournal" / "ForeverDungeonJournal.toc"
+        self.assertIn("1.6.3", toc.read_text())
+        self.assertFalse((self.root / "MuteNotInGroup").exists())

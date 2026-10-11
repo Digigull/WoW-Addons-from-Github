@@ -101,6 +101,7 @@ Running from a checkout instead needs **Python 3.9 or newer**, and that is the w
 | `init <path>` | Remember where the client is. Accepts your WoW folder, its `Interface` folder, or `Interface/AddOns` itself. |
 | `scan` | Read every addon already installed and record it, guessing a source from each `.toc` where it can. Drops unmanaged rows whose folder you have deleted; keeps bound ones, flagged *not installed*. |
 | `install <repo>` | Fetch an addon you do **not** have yet and bind it in one step. Takes `owner/repo`, `owner/repo#Folder`, any github.com link, or a `.zip` / folder on your disk ([An addon you downloaded yourself](#an-addon-you-downloaded-yourself)); `--folder` (repeatable) picks addons out of a repository that holds several — or the `.toc` out of one that ships several, `--folder NotPlater-3.3.5.toc` — and `--branch` follows a branch instead of releases. `--reset-settings` also deletes that addon's saved variables (account and every character) once it has installed, keeping a copy of each unless you add `--no-settings-backup`. |
+| `zips <folder>` | Read a folder of downloaded zips and offer each update it holds, newest zip per addon, one question each ([A folder of downloads](#a-folder-of-downloads)). `--check` lists only; `--yes` takes everything. |
 | `list` | Every addon, its source, and its installed version. Bound addons first, then the rest, each alphabetically. |
 | `set <Addon> <source>` | Bind one addon to where its updates come from. |
 | `accept` | Take every source that `scan` suggested, in one go. |
@@ -272,6 +273,27 @@ To update, download the newer zip and install that one: the row is re-pointed at
 replaced. The version shown is the zip's name plus a short digest of its bytes, so the same
 zip twice is *up to date* and a different one is not. Deleting the zip afterwards is fine —
 **Update all** says the row was installed from a zip that is gone, rather than failing.
+
+### A folder of downloads
+
+After downloading a batch of updates, hand over the folder instead of each zip:
+
+```
+addons.py zips ~/Downloads/addon-zips
+```
+
+Every zip in it is read for the addon it installs as, whatever the file is called, and
+matched against what is in AddOns by the version in its `.toc`. Two downloads of one addon
+(`ForeverDungeonJournal-1.6.2.zip` beside `ForeverDungeonJournal1.6.3.zip`) count once:
+only the newest is offered, and the older one is listed as passed over. Then it asks, one
+addon at a time:
+
+- **a newer version** of an installed addon: `Update ...? [Y/n]`
+- **an addon you do not have**: `... is not installed. Install it? [y/N]`
+- **a version it cannot compare** (a `.toc` with no version): `[y/N]`
+
+Up to date and older zips are listed and not asked about. A yes installs exactly as
+`install <zip>` does. `--check` only lists; `--yes` answers yes to everything listed.
 
 A folder you already unpacked works the same way (**Folder…**), and is **copied** rather
 than linked, because a link into Downloads vanishes when Downloads is tidied. `--link`
